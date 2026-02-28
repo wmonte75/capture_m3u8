@@ -43,7 +43,8 @@ You can create a `config.json` file in the script directory to set default paths
   "tv_dir": "D:/Media/TV Shows",
   "download_speed": "10M",
   "min_cooldown": 10,
-  "max_cooldown": 25
+  "max_cooldown": 25,
+  "subtitle_langs": "en,eng,en-forced"
 }
 ```
 

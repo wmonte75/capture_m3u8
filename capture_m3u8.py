@@ -104,6 +104,9 @@ class MasterM3U8Finder:
             '--retry-sleep', 'fragment:5',
             '--hls-prefer-native',
             '--limit-rate', self.download_speed if hasattr(self, 'download_speed') else DOWNLOAD_SPEED,
+            '--write-subs',
+            '--all-subs',
+            '--sub-langs', CONFIG['subtitle_langs'] if 'CONFIG' in globals() and 'subtitle_langs' in CONFIG else 'all',
             '--user-agent', USER_AGENT,
             '-o', output_file,
         ]
@@ -159,7 +162,7 @@ class MasterM3U8Finder:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=headless,
-                viewport={'width': 1920, 'height': 1080} if not headless else {'width': 1280, 'height': 720},
+                viewport=None if not headless else {'width': 1280, 'height': 720},
                 user_agent=USER_AGENT,
                 bypass_csp=True,
                 args=[
@@ -168,6 +171,9 @@ class MasterM3U8Finder:
                     '--autoplay-policy=no-user-gesture-required',
                     '--disable-blink-features=AutomationControlled',
                     '--start-minimized',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
+                    '--disable-background-timer-throttling',
                 ],
                 ignore_default_args=["--enable-automation"]
             )
@@ -537,7 +543,8 @@ def load_config():
         "tv_dir": "",
         "download_speed": DOWNLOAD_SPEED,
         "min_cooldown": COOLDOWN_RANGE[0],
-        "max_cooldown": COOLDOWN_RANGE[1]
+        "max_cooldown": COOLDOWN_RANGE[1],
+        "subtitle_langs": "all"
     }
     
     if os.path.exists(config_file):
