@@ -167,6 +167,7 @@ class MasterM3U8Finder:
                     '--disable-features=IsolateOrigins,site-per-process',
                     '--autoplay-policy=no-user-gesture-required',
                     '--disable-blink-features=AutomationControlled',
+                    '--start-minimized',
                 ],
                 ignore_default_args=["--enable-automation"]
             )
@@ -348,34 +349,40 @@ async def process_video(url, headless=True, auto_mode=True, output_dir=None):
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             txt_filename = os.path.join(output_dir, f"{safe_title}.txt")
-            filename = os.path.join(output_dir, f"{safe_title}.mkv")
+            final_filename = os.path.join(output_dir, f"{safe_title}.mkv")
         else:
             os.makedirs(safe_title, exist_ok=True)
             txt_filename = os.path.join(safe_title, f"{safe_title}.txt")
-            filename = os.path.join(safe_title, f"{safe_title}.mkv")
+            final_filename = os.path.join(safe_title, f"{safe_title}.mkv")
+            
+        # Setup Temp Directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        temp_dir = os.path.join(script_dir, "temp_downloads")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_filename = os.path.join(temp_dir, f"{safe_title}.mkv")
             
         with open(txt_filename, 'w', encoding='utf-8') as f:
             f.write(f"Title: {title}\n")
             f.write(f"URL: {master_url}\n")
-            f.write(f"Filename: {filename}\n")
-            f.write(f"Command: yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{filename}\" \"{master_url}\"\n")
+            f.write(f"Filename: {final_filename}\n")
+            f.write(f"Command: yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{final_filename}\" \"{master_url}\"\n")
         print(f"\n💾 Details saved to {txt_filename}")
         
         if ytdlp_path:
             print(f"\n🛠️  yt-dlp found: {ytdlp_path}")
             
-            if os.path.exists(filename):
-                print(f"\n⚠️  File '{filename}' already exists.")
+            if os.path.exists(final_filename):
+                print(f"\n⚠️  File '{final_filename}' already exists.")
                 if auto_mode:
                     print("   Auto-mode: Saving as new file to avoid overwrite.")
-                    base, ext = os.path.splitext(filename)
-                    filename = f"{base}_new{ext}"
+                    base, ext = os.path.splitext(final_filename)
+                    final_filename = f"{base}_new{ext}"
                 else:
                     choice = input("   Overwrite? (y/n): ").lower()
                     if choice != 'y':
-                        base, ext = os.path.splitext(filename)
-                        filename = f"{base}_new{ext}"
-                        print(f"   Will save as: {filename}")
+                        base, ext = os.path.splitext(final_filename)
+                        final_filename = f"{base}_new{ext}"
+                        print(f"   Will save as: {final_filename}")
             
             if auto_mode:
                 choice = 'y'
@@ -383,24 +390,39 @@ async def process_video(url, headless=True, auto_mode=True, output_dir=None):
                 choice = input("\n🚀 Start download now? (y/n): ").lower()
 
             if choice == 'y':
-                success = await finder.run_ytdlp(ytdlp_path, master_url, filename)
+                # Download to temp file first
+                success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename)
                 
                 if not success:
                     print("\n⚠️  First attempt failed. Trying with browser cookies...")
-                    success = await finder.run_ytdlp(ytdlp_path, master_url, filename, use_cookies=True)
+                    success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename, use_cookies=True)
+                
+                if success:
+                    print(f"\n🚚 Moving file to final destination...")
+                    print(f"   From: {temp_filename}")
+                    print(f"   To:   {final_filename}")
+                    try:
+                        if os.path.exists(final_filename):
+                            os.remove(final_filename)
+                        shutil.move(temp_filename, final_filename)
+                        print(f"✅ Move complete.")
+                        return True
+                    except Exception as e:
+                        print(f"❌ Error moving file: {e}")
+                        return False
                 
                 if not success:
                     print("\n📋 Manual command (try running this in terminal):")
-                    print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
+                    print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
                 return success
             else:
                 print(f"\n📋 Manual command:")
-                print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
+                print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
                 return True
         else:
             print("\n❌ yt-dlp not found")
             print(f"\n📋 Save this command:")
-            print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
+            print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
             return True
         
     else:

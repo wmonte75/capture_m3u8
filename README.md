@@ -90,6 +90,7 @@ The script will:
 - **Movies**: Organized into folders (e.g., `Movie.Name/Movie.Name.mkv`).
 - **TV Series**: Organized into structure `Series.Name/Season XX/Episode.Title.mkv`.
 - A text file with stream details is also saved inside the folder.
+- **Temp Downloads**: Files are downloaded to a `temp_downloads` folder first, then moved to the final destination upon completion to prevent file locking issues with external tools (e.g., encoders).
 - **Browser Session**: Cookies and cache are saved in the `browser_session` folder to improve reliability and bypass captchas on subsequent runs.
 
 ## ❓ Troubleshooting
