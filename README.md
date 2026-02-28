@@ -7,6 +7,7 @@ A powerful Python tool to automatically detect, capture, and download M3U8 video
 - **Auto-Detection**: Sniffs network traffic to find `master.m3u8` streams.
 - **Browser Automation**: Uses a real browser (Chromium) to bypass simple anti-bot protections and render JavaScript.
 - **IMDB Support**: Automatically converts IMDB URLs (e.g., `imdb.com/title/tt1234567`) to streaming sources.
+- **TV Series Support**: Detects TV shows from IMDB links, allowing selection of specific seasons and episodes (ranges, individual, or all).
 - **Robust Downloading**: Integrates with `yt-dlp` to download streams with resume capability and error handling.
 - **Modes**:
   - **Headless**: Runs in the background.
@@ -50,6 +51,17 @@ Or with an IMDB link:
 python capture_m3u8.py "https://www.imdb.com/title/tt0133093/"
 ```
 
+### TV Series Mode
+Run with an IMDB TV series URL: 
+```bash
+python capture_m3u8.py "https://www.imdb.com/title/tt0944947/"
+```
+Follow the interactive prompts to select:
+The script will display the Total Seasons and Total Episodes, then ask you to select:
+- Season: Specific season (e.g., 1) or all.
+- Episodes: all, specific range (e.g., 1-5), specific start/end, or single episode.
+The script will generate a queue file and organize downloads into Series Name/Season XX/ folders.
+
 ### Batch / Queue Mode 
 Create a text file (e.g., queue.txt) with one URL per line. Lines starting with # are ignored. 
 ```bash
@@ -58,9 +70,24 @@ python capture_m3u8.py queue.txt
 The script will: 
 1. Process URLs one by one. 
 2. Skip URLs already listed in completed.log.
-3. Wait 5 seconds between downloads to avoid rate limits.
+3. Wait a random interval (10-25s) between downloads to avoid rate limits and appear human.
 
 ## 📂 Output
 
-- Downloads are saved as `.mp4` files in the script directory.
-- A text file (e.g., `Movie.Name.txt`) is generated with the stream details and manual `yt-dlp` command for future reference.
+- **Movies**: Organized into folders (e.g., `Movie.Name/Movie.Name.mkv`).
+- **TV Series**: Organized into structure `Series.Name/Season XX/Episode.Title.mkv`.
+- A text file with stream details is also saved inside the folder.
+- **Browser Session**: Cookies and cache are saved in the `browser_session` folder to improve reliability and bypass captchas on subsequent runs.
+
+## ❓ Troubleshooting
+
+### Cloudflare / Captcha Loops
+If you get stuck in a "Verify you are human" loop:
+1. The script automatically saves your session to the `browser_session` folder.
+2. If the session gets corrupted or flagged, delete the `browser_session` folder to start fresh.
+3. The script will automatically retry in **Visible Mode** if headless mode fails. You can manually solve the captcha in the visible window if needed.
+
+### 403 / 429 Errors
+If you see "Too Many Requests" or "Forbidden":
+- The script has a built-in random cooldown (10-25s) to prevent this.
+- If it persists, try increasing the `COOLDOWN_RANGE` in the script or changing your IP (VPN).
