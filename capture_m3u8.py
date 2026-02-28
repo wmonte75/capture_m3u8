@@ -547,6 +547,20 @@ async def main():
             with open(completed_log, 'r', encoding='utf-8') as f:
                 completed = set(line.strip() for line in f)
 
+        # Check for resume state
+        first_pending_idx = -1
+        for idx, u in enumerate(urls):
+            if u not in completed:
+                first_pending_idx = idx
+                break
+        
+        if first_pending_idx > 0:
+            print(f"\n⚠️  Found progress in completed.log ({first_pending_idx} items done).")
+            print(f"   Last file did not download: {urls[first_pending_idx]}")
+            if input("   Would you like to continue where we left off? (y/n): ").strip().lower() != 'y':
+                print("👋 Exiting.")
+                return
+
         for i, queue_url in enumerate(urls):
             print(f"\n{'='*20} Processing {i+1}/{len(urls)} {'='*20}")
             
@@ -568,7 +582,10 @@ async def main():
                         f.write(f"{queue_url}\n")
                     print(f"✅ Marked as complete.")
                 else:
-                    print(f"⚠️  Task failed or incomplete.")
+                    print(f"\n❌ Failed downloading: {queue_url}")
+                    print("🛑 Script terminating as requested to preserve queue state.")
+                    print(f"ℹ️  To resume, run: python capture_m3u8.py \"{queue_file}\"")
+                    return
                     
             except Exception as e:
                 print(f"❌ Error in queue loop: {e}")

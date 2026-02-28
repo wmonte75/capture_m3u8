@@ -56,7 +56,6 @@ Run with an IMDB TV series URL:
 ```bash
 python capture_m3u8.py "https://www.imdb.com/title/tt0944947/"
 ```
-Follow the interactive prompts to select:
 The script will display the Total Seasons and Total Episodes, then ask you to select:
 - Season: Specific season (e.g., 1) or all.
 - Episodes: all, specific range (e.g., 1-5), specific start/end, or single episode.
