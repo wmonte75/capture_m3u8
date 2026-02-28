@@ -14,6 +14,7 @@ A powerful Python tool to automatically detect, capture, and download M3U8 video
   - **Visible**: Shows the browser window for debugging or manual interaction.
   - **Queue System**: Process multiple URLs sequentially from a text file with resume capability.
 - **Auto-Start**: Can be run with a URL argument for automated batch processing.
+- **Configurable**: Set custom download folders and speed limits via `config.json`.
 
 ## 🛠️ Prerequisites
 
@@ -32,6 +33,19 @@ A powerful Python tool to automatically detect, capture, and download M3U8 video
    playwright install chromium
    ```
 4. Download yt-dlp.exe and place it in this folder.
+
+## ⚙️ Configuration
+
+You can create a `config.json` file in the script directory to set default paths and options:
+```json
+{
+  "movies_dir": "D:/Media/Movies",
+  "tv_dir": "D:/Media/TV Shows",
+  "download_speed": "10M",
+  "min_cooldown": 10,
+  "max_cooldown": 25
+}
+```
 
 ## 🎮 Usage
 

@@ -5,6 +5,7 @@ import os
 import sys
 import shutil
 import subprocess
+import json
 import random
 
 # Define common User-Agent to match browser and yt-dlp to avoid 403/429 errors
@@ -102,7 +103,7 @@ class MasterM3U8Finder:
             '--fragment-retries', '10',
             '--retry-sleep', 'fragment:5',
             '--hls-prefer-native',
-            '--limit-rate', DOWNLOAD_SPEED,  # Limit speed to avoid 429 Too Many Requests
+            '--limit-rate', self.download_speed if hasattr(self, 'download_speed') else DOWNLOAD_SPEED,
             '--user-agent', USER_AGENT,
             '-o', output_file,
         ]
@@ -297,6 +298,9 @@ class MasterM3U8Finder:
             
             return self.master_url, self.title, start_url
 
+    def set_download_speed(self, speed):
+        self.download_speed = speed
+
 async def process_video(url, headless=True, auto_mode=True, output_dir=None):
     if not url.startswith('http'):
         url = 'https://' + url
@@ -318,6 +322,10 @@ async def process_video(url, headless=True, auto_mode=True, output_dir=None):
         headless = (choice == "1")
     
     finder = MasterM3U8Finder()
+    # Pass global config speed if available
+    if 'CONFIG' in globals() and 'download_speed' in CONFIG:
+        finder.set_download_speed(CONFIG['download_speed'])
+        
     master_url, title, referer = await finder.capture(url, headless=headless)
     
     safe_title = finder.sanitize_filename(title)
@@ -344,7 +352,7 @@ async def process_video(url, headless=True, auto_mode=True, output_dir=None):
             f.write(f"Title: {title}\n")
             f.write(f"URL: {master_url}\n")
             f.write(f"Filename: {filename}\n")
-            f.write(f"Command: yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{filename}\" \"{master_url}\"\n")
+            f.write(f"Command: yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{filename}\" \"{master_url}\"\n")
         print(f"\n💾 Details saved to {txt_filename}")
         
         if ytdlp_path:
@@ -377,16 +385,16 @@ async def process_video(url, headless=True, auto_mode=True, output_dir=None):
                 
                 if not success:
                     print("\n📋 Manual command (try running this in terminal):")
-                    print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
+                    print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
                 return success
             else:
                 print(f"\n📋 Manual command:")
-                print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
+                print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
                 return True
         else:
             print("\n❌ yt-dlp not found")
             print(f"\n📋 Save this command:")
-            print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
+            print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
             return True
         
     else:
@@ -494,7 +502,38 @@ async def get_season_episodes(imdb_id, season):
             await browser.close()
             return 0
 
+def load_config():
+    config_file = "config.json"
+    default_config = {
+        "movies_dir": "",
+        "tv_dir": "",
+        "download_speed": DOWNLOAD_SPEED,
+        "min_cooldown": COOLDOWN_RANGE[0],
+        "max_cooldown": COOLDOWN_RANGE[1]
+    }
+    
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                user_config = json.load(f)
+                default_config.update(user_config)
+                print("⚙️  Loaded config.json")
+        except Exception as e:
+            print(f"⚠️  Error loading config.json: {e}")
+    else:
+        # Optional: Create default config if missing
+        # with open(config_file, 'w') as f:
+        #     json.dump(default_config, f, indent=4)
+        pass
+        
+    return default_config
+
 async def main():
+    global CONFIG
+    CONFIG = load_config()
+    global COOLDOWN_RANGE
+    COOLDOWN_RANGE = (CONFIG['min_cooldown'], CONFIG['max_cooldown'])
+
     # Default settings
     url = None
     auto_mode = False
@@ -571,6 +610,11 @@ async def main():
             try:
                 # Determine Season folder from URL
                 target_dir = base_dir
+                
+                if CONFIG['tv_dir'] and os.path.exists(CONFIG['tv_dir']):
+                    # If using global TV dir, we need to reconstruct the path structure
+                    pass # For queue files, we usually stick to the queue file's location or relative paths
+
                 season_match = re.search(r'[?&]season=(\d+)', queue_url)
                 if season_match:
                     target_dir = os.path.join(base_dir, f"Season {int(season_match.group(1)):02d}")
@@ -654,9 +698,13 @@ async def main():
                     # Save Queue
                     finder = MasterM3U8Finder()
                     safe_title = finder.sanitize_filename(meta['title'])
-                    
+
                     # Create Series Folder
-                    series_dir = safe_title
+                    if CONFIG['tv_dir']:
+                        series_dir = os.path.join(CONFIG['tv_dir'], safe_title)
+                    else:
+                        series_dir = safe_title
+                        
                     os.makedirs(series_dir, exist_ok=True)
                     queue_filename = os.path.join(series_dir, f"{safe_title}.txt")
                     
@@ -677,7 +725,12 @@ async def main():
                     return
 
         if url:
-            await process_video(url, headless=headless, auto_mode=auto_mode)
+            # Single movie download
+            if CONFIG['movies_dir']:
+                # If we have a movies dir, pass it as the base output_dir
+                await process_video(url, headless=headless, auto_mode=auto_mode, output_dir=CONFIG['movies_dir'])
+            else:
+                await process_video(url, headless=headless, auto_mode=auto_mode)
 
 if __name__ == "__main__":
     try:
