@@ -10,7 +10,7 @@ import subprocess
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 # Download speed limit to avoid 429 "Too Many Requests" errors (e.g., '10M', '15M', '20M')
-DOWNLOAD_SPEED = '15M'
+DOWNLOAD_SPEED = '7M'
 
 class MasterM3U8Finder:
     def __init__(self):
@@ -197,6 +197,13 @@ class MasterM3U8Finder:
                 print(f"   ⚠️ Page load warning: {str(e)[:100]}")
                 print("   Continuing scan...")
             
+            if self.master_url:
+                if self.title == "Unknown":
+                    self.title = await self.extract_title(page)
+                print(f"   ⚡ Master URL found early. Skipping iframe scan.")
+                await browser.close()
+                return self.master_url, self.title, start_url
+            
             self.title = await self.extract_title(page)
             title_found = True
             print(f"📝 Page Title: {self.title}")
@@ -261,16 +268,7 @@ class MasterM3U8Finder:
             
             return self.master_url, self.title, start_url
 
-async def main():
-    if len(sys.argv) > 1:
-        url = sys.argv[1].strip()
-        auto_mode = True
-        print(f"🚀 Auto-starting with URL: {url}")
-        headless = True
-    else:
-        url = input("Enter URL: ").strip()
-        auto_mode = False
-
+async def process_video(url, headless=True, auto_mode=True):
     if not url.startswith('http'):
         url = 'https://' + url
     
@@ -304,6 +302,14 @@ async def main():
         
         ytdlp_path = finder.find_ytdlp()
         
+        txt_filename = f"{safe_title}.txt"
+        with open(txt_filename, 'w', encoding='utf-8') as f:
+            f.write(f"Title: {title}\n")
+            f.write(f"URL: {master_url}\n")
+            f.write(f"Filename: {safe_title}.mp4\n")
+            f.write(f"Command: yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{safe_title}.mp4\" \"{master_url}\"\n")
+        print(f"\n💾 Details saved to {txt_filename}")
+        
         if ytdlp_path:
             print(f"\n🛠️  yt-dlp found: {ytdlp_path}")
             filename = f"{safe_title}.mp4"
@@ -334,25 +340,100 @@ async def main():
                 if not success:
                     print("\n📋 Manual command (try running this in terminal):")
                     print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
+                return success
             else:
                 print(f"\n📋 Manual command:")
                 print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
+                return True
         else:
             print("\n❌ yt-dlp not found")
             filename = f"{safe_title}.mp4"
             print(f"\n📋 Save this command:")
             print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{filename}" "{master_url}"')
-        
-        txt_filename = f"{safe_title}.txt"
-        with open(txt_filename, 'w', encoding='utf-8') as f:
-            f.write(f"Title: {title}\n")
-            f.write(f"URL: {master_url}\n")
-            f.write(f"Filename: {safe_title}.mp4\n")
-            f.write(f"Command: yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{safe_title}.mp4\" \"{master_url}\"\n")
-        print(f"\n💾 Details saved to {txt_filename}")
+            return True
         
     else:
         print("❌ FAILED - No master.m3u8 found")
+        return False
+
+async def main():
+    # Default settings
+    url = None
+    auto_mode = False
+    headless = False
+    queue_mode = False
+    queue_file = None
+
+    # 1. Handle Arguments
+    if len(sys.argv) > 1:
+        input_arg = sys.argv[1].strip()
+        if input_arg.endswith('.txt'):
+            queue_mode = True
+            queue_file = input_arg
+            auto_mode = True
+            headless = True
+        else:
+            url = input_arg
+            auto_mode = True
+            headless = True
+            print(f"🚀 Auto-starting with URL: {url}")
+    else:
+        # 2. Interactive Input
+        input_arg = input("Enter URL or path to queue.txt: ").strip()
+        if input_arg.endswith('.txt'):
+            queue_mode = True
+            queue_file = input_arg
+            auto_mode = True
+            headless = True
+        else:
+            url = input_arg
+            auto_mode = False
+
+    # 3. Execution
+    if queue_mode:
+        if not os.path.exists(queue_file):
+            print(f"❌ File not found: {queue_file}")
+            return
+
+        print(f"📂 Loading queue from: {queue_file}")
+        with open(queue_file, 'r', encoding='utf-8') as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        
+        print(f"📊 Found {len(urls)} items.")
+        
+        completed_log = "completed.log"
+        completed = set()
+        if os.path.exists(completed_log):
+            with open(completed_log, 'r', encoding='utf-8') as f:
+                completed = set(line.strip() for line in f)
+
+        for i, queue_url in enumerate(urls):
+            print(f"\n{'='*20} Processing {i+1}/{len(urls)} {'='*20}")
+            
+            if queue_url in completed:
+                print(f"⏭️  Skipping (already completed): {queue_url}")
+                continue
+            
+            try:
+                success = await process_video(queue_url, headless=True, auto_mode=True)
+                
+                if success:
+                    with open(completed_log, 'a', encoding='utf-8') as f:
+                        f.write(f"{queue_url}\n")
+                    print(f"✅ Marked as complete.")
+                else:
+                    print(f"⚠️  Task failed or incomplete.")
+                    
+            except Exception as e:
+                print(f"❌ Error in queue loop: {e}")
+            
+            if i < len(urls) - 1:
+                print("⏳ Cooling down (5s)...")
+                await asyncio.sleep(5)
+
+    else:
+        if url:
+            await process_video(url, headless=headless, auto_mode=auto_mode)
 
 if __name__ == "__main__":
     try:

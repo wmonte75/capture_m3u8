@@ -11,6 +11,7 @@ A powerful Python tool to automatically detect, capture, and download M3U8 video
 - **Modes**:
   - **Headless**: Runs in the background.
   - **Visible**: Shows the browser window for debugging or manual interaction.
+  - **Queue System**: Process multiple URLs sequentially from a text file with resume capability.
 - **Auto-Start**: Can be run with a URL argument for automated batch processing.
 
 ## 🛠️ Prerequisites
@@ -48,6 +49,16 @@ Or with an IMDB link:
 ```bash
 python capture_m3u8.py "https://www.imdb.com/title/tt0133093/"
 ```
+
+### Batch / Queue Mode 
+Create a text file (e.g., queue.txt) with one URL per line. Lines starting with # are ignored. 
+```bash
+python capture_m3u8.py queue.txt
+```
+The script will: 
+1. Process URLs one by one. 
+2. Skip URLs already listed in completed.log.
+3. Wait 5 seconds between downloads to avoid rate limits.
 
 ## 📂 Output
 
