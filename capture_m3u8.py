@@ -178,6 +178,12 @@ class MasterM3U8Finder:
             async def handle_route(route, request):
                 url = request.url
                 if 'master.m3u8' in url.lower():
+                    if self.master_url:
+                        if url not in self.candidates:
+                            self.candidates.append(url)
+                        await route.continue_()
+                        return
+
                     print(f"🎯 MASTER FOUND: {url}")
                     self.master_url = url
                     self.candidates.append(url)
