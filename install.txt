@@ -1,0 +1,20 @@
+INSTALLATION GUIDE
+==================
+
+1. INSTALL PYTHON
+   - Download Python 3.8 or newer from https://www.python.org/
+   - Check "Add Python to PATH" during installation.
+
+2. INSTALL DEPENDENCIES
+   - Open a terminal/command prompt in this folder.
+   - Run: pip install -r requirements.txt
+
+3. INSTALL BROWSER ENGINE
+   - In the same terminal, run: playwright install chromium
+
+4. SETUP YT-DLP
+   - Download yt-dlp.exe from: https://github.com/yt-dlp/yt-dlp/releases
+   - Place yt-dlp.exe in this folder (next to capture_m3u8.py).
+
+5. RUN
+   - Double-click 'run.bat' or run 'python capture_m3u8.py' in terminal.
