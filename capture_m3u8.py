@@ -121,7 +121,7 @@ class MasterM3U8Finder:
         print(f"\n⬇️  Starting download with yt-dlp...")
         print(f"   Output: {output_file}")
         print(f"   Anti-bot: Enabled")
-        print(f"   DEBUG Command: {cmd}")
+        # print(f"   DEBUG Command: {cmd}")
         
         try:
             # Run internally using asyncio subprocess
@@ -452,9 +452,36 @@ async def get_imdb_info(imdb_id):
             title = await page.title()
             title = re.sub(r'\s*[-|]\s*IMDb.*', '', title).strip()
             
+            # Fallback if title is empty
+            if not title:
+                title = await page.locator('h1').first.inner_text()
+            
+            # Extract Year
+            year = ""
+            try:
+                # Get metadata items text (Year is usually 1st or 2nd item)
+                meta_items = await page.locator('[data-testid="hero-title-block__metadata"] li').all_inner_texts()
+                for text in meta_items[:3]:
+                    match = re.search(r'\b(19|20)\d{2}\b', text)
+                    if match:
+                        year = match.group(0)
+                        break
+            except:
+                pass
+            
+            if year and year not in title:
+                title = f"{title} ({year})"
+            
             is_tv = False
+            # Wait for potential dynamic content
+            try:
+                await page.wait_for_load_state('networkidle', timeout=5000)
+            except:
+                pass
+
             if await page.locator('text=Episode Guide').count() > 0 or \
-               await page.locator('a[href*="episodes"]').count() > 0:
+               await page.locator('a[href*="episodes"]').count() > 0 or \
+               await page.locator('[data-testid="hero-subnav-bar-season-episode-picker"]').count() > 0:
                 is_tv = True
             
             if not is_tv:
@@ -706,7 +733,7 @@ async def main():
                     print(f"\n📺 Series: {meta['title']}")
                     print(f"   Total Seasons: {meta['seasons']:02d} | Total Episodes: {meta['total_episodes']}")
                     
-                    season_input = input(f"Select Season (1-{meta['seasons']}) or 'all': ").strip().lower()
+                    season_input = input(f"Select Season (1-{meta['seasons']}) or 'all' [default: 1]: ").strip().lower() or "1"
                     
                     queue_list = []
                     
@@ -723,7 +750,7 @@ async def main():
                             ep_count = await get_season_episodes(imdb_id, s)
                             print(f"\nSeason {s} has {ep_count} episodes.")
                             
-                            ep_input = input("Select Episodes ('all', '1-5', 'start: 3, end: 8'): ").strip().lower()
+                            ep_input = input("Select Episodes ('all', '1-5', 'start: 3, end: 8') [default: all]: ").strip().lower() or "all"
                             
                             start_ep = 1
                             end_ep = ep_count
@@ -771,7 +798,7 @@ async def main():
                     print(f"\n✅ Queue saved to: {queue_filename}")
                     print(f"   Contains {len(queue_list)} items.")
                     
-                    run_now = input("🚀 Start processing this queue now? (y/n): ").strip().lower()
+                    run_now = input("🚀 Start processing this queue now? (y/n) [default: y]: ").strip().lower() or 'y'
                     if run_now == 'y':
                         print(f"\n🚀 Starting Batch Process for {queue_filename}...")
                         # Restart script with the new queue file
