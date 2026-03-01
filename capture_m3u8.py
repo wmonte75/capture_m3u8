@@ -536,6 +536,19 @@ async def get_season_episodes(imdb_id, season):
             await browser.close()
             return 0
 
+def clear_session(reason=""):
+    if os.path.exists("browser_session"):
+        message = f"\n🧹 Clearing browser session"
+        if reason:
+            message += f" ({reason})"
+        message += "..."
+        print(message)
+        try:
+            shutil.rmtree("browser_session")
+            print("   ✅ Session cleared.")
+        except Exception as e:
+            print(f"   ⚠️ Failed to clear session: {e}")
+
 def load_config():
     config_file = "config.json"
     default_config = {
@@ -544,7 +557,8 @@ def load_config():
         "download_speed": DOWNLOAD_SPEED,
         "min_cooldown": COOLDOWN_RANGE[0],
         "max_cooldown": COOLDOWN_RANGE[1],
-        "subtitle_langs": "all"
+        "subtitle_langs": "all",
+        "session_reset_count": 5
     }
     
     if os.path.exists(config_file):
@@ -635,6 +649,8 @@ async def main():
                 print("👋 Exiting.")
                 return
 
+        session_count = 0
+
         for i, queue_url in enumerate(urls):
             print(f"\n{'='*20} Processing {i+1}/{len(urls)} {'='*20}")
             
@@ -665,6 +681,11 @@ async def main():
                     print("🛑 Script terminating as requested to preserve queue state.")
                     print(f"ℹ️  To resume, run: python capture_m3u8.py \"{queue_file}\"")
                     return
+                
+                # Session Reset Logic
+                session_count += 1
+                if CONFIG['session_reset_count'] > 0 and session_count % CONFIG['session_reset_count'] == 0:
+                    clear_session(reason=f"periodic reset after {session_count} items")
                     
             except Exception as e:
                 print(f"❌ Error in queue loop: {e}")
@@ -772,4 +793,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n\n⚠️  Interrupted by user")
-        sys.exit(0)
+    finally:
+        clear_session(reason="shutdown")

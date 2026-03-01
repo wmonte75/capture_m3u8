@@ -44,7 +44,8 @@ You can create a `config.json` file in the script directory to set default paths
   "download_speed": "10M",
   "min_cooldown": 10,
   "max_cooldown": 25,
-  "subtitle_langs": "en,eng,en-forced"
+  "subtitle_langs": "en,eng,en-forced",
+  "session_reset_count": 5
 }
 ```
 
