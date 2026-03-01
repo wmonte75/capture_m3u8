@@ -226,6 +226,11 @@ class MasterM3U8Finder:
             title_found = True
             print(f"📝 Page Title: {self.title}")
             
+            if "404" in self.title or "Not Found" in self.title:
+                print("   ❌ 404 Not Found detected.")
+                await context.close()
+                return None, self.title, start_url, "404"
+            
             await asyncio.sleep(1)
             
             print("Step 2: Scanning for video iframes...")
@@ -309,12 +314,36 @@ class MasterM3U8Finder:
             
             await context.close()
             
-            return self.master_url, self.title, start_url
+            return self.master_url, self.title, start_url, "success"
 
     def set_download_speed(self, speed):
         self.download_speed = speed
 
-async def process_video(url, headless=True, auto_mode=True, output_dir=None):
+def get_output_paths(title, url):
+    finder = MasterM3U8Finder()
+    safe_title = finder.sanitize_filename(title)
+    
+    season_match = re.search(r'[?&]season=(\d+)', url)
+    episode_match = re.search(r'[?&]episode=(\d+)', url)
+    
+    if season_match:
+        # TV Series
+        base_dir = CONFIG['tv_dir'] if 'CONFIG' in globals() and CONFIG['tv_dir'] else "."
+        season_num = int(season_match.group(1))
+        episode_num = int(episode_match.group(1)) if episode_match else 0
+        
+        series_dir = os.path.join(base_dir, safe_title)
+        final_dir = os.path.join(series_dir, f"Season {season_num:02d}")
+        filename = f"{safe_title}.S{season_num:02d}E{episode_num:02d}.mkv"
+    else:
+        # Movie
+        base_dir = CONFIG['movies_dir'] if 'CONFIG' in globals() and CONFIG['movies_dir'] else "."
+        final_dir = os.path.join(base_dir, safe_title)
+        filename = f"{safe_title}.mkv"
+        
+    return final_dir, filename
+
+async def process_video(url, headless=True, auto_mode=True):
     if not url.startswith('http'):
         url = 'https://' + url
     
@@ -339,7 +368,11 @@ async def process_video(url, headless=True, auto_mode=True, output_dir=None):
     if 'CONFIG' in globals() and 'download_speed' in CONFIG:
         finder.set_download_speed(CONFIG['download_speed'])
         
-    master_url, title, referer = await finder.capture(url, headless=headless)
+    master_url, title, referer, status = await finder.capture(url, headless=headless)
+    
+    if status == "404":
+        print(f"❌ FAILED - 404 Not Found: {url}")
+        return "404"
     
     safe_title = finder.sanitize_filename(title)
     
@@ -352,14 +385,11 @@ async def process_video(url, headless=True, auto_mode=True, output_dir=None):
         
         ytdlp_path = finder.find_ytdlp()
         
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-            txt_filename = os.path.join(output_dir, f"{safe_title}.txt")
-            final_filename = os.path.join(output_dir, f"{safe_title}.mkv")
-        else:
-            os.makedirs(safe_title, exist_ok=True)
-            txt_filename = os.path.join(safe_title, f"{safe_title}.txt")
-            final_filename = os.path.join(safe_title, f"{safe_title}.mkv")
+        final_dir, filename = get_output_paths(title, url)
+        os.makedirs(final_dir, exist_ok=True)
+        
+        txt_filename = os.path.join(final_dir, f"{safe_title}.txt")
+        final_filename = os.path.join(final_dir, filename)
             
         # Setup Temp Directory
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -434,7 +464,7 @@ async def process_video(url, headless=True, auto_mode=True, output_dir=None):
     else:
         if headless:
             print("\n⚠️  Headless capture failed. Retrying in visible mode to bypass Cloudflare...")
-            return await process_video(url, headless=False, auto_mode=auto_mode, output_dir=output_dir)
+            return await process_video(url, headless=False, auto_mode=auto_mode)
             
         print("❌ FAILED - No master.m3u8 found")
         return False
@@ -604,6 +634,67 @@ def load_config():
         
     return default_config
 
+async def scrape_imdb_chart(chart_type):
+    if chart_type == 'movie':
+        url = "https://www.imdb.com/chart/top/"
+        output_file = "imdb_top_250_movies.txt"
+        label = "Top 250 Movies"
+    else:
+        url = "https://www.imdb.com/chart/toptv/"
+        output_file = "imdb_top_250_tv.txt"
+        label = "Top 250 TV Shows"
+    
+    print(f"🚀 Starting scrape of: {label}")
+    print(f"   URL: {url}")
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(user_agent=USER_AGENT)
+        
+        try:
+            await page.goto(url, timeout=60000)
+            print("   Page loaded. Scanning list...")
+            
+            try:
+                await page.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
+            except:
+                pass
+            
+            # Extract links
+            links = await page.locator('.ipc-metadata-list-summary-item a.ipc-title-link-wrapper').all()
+            count = len(links)
+            print(f"   Found {count} items.")
+            
+            if count > 0:
+                limit_input = input(f"   How many items to scrape? (1-{count}) [default: 10]: ").strip()
+                limit = int(limit_input) if limit_input.isdigit() else 10
+                
+                links = links[:limit]
+                
+                urls = []
+                for link in links:
+                    href = await link.get_attribute('href')
+                    if href:
+                        clean_url = "https://www.imdb.com" + href.split('?')[0]
+                        urls.append(clean_url)
+                
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    for u in urls:
+                        f.write(f"{u}\n")
+                
+                print(f"✅ Saved {len(urls)} links to {output_file}")
+                
+                run_now = input(f"🚀 Start downloading {label} now? (y/n) [default: y]: ").strip().lower() or 'y'
+                if run_now == 'y':
+                    subprocess.run([sys.executable, "capture_m3u8.py", output_file])
+            else:
+                print("❌ No items found. IMDB layout might have changed.")
+                
+        except Exception as e:
+            print(f"❌ Error during scrape: {e}")
+        finally:
+            await browser.close()
+
 async def main():
     global CONFIG
     CONFIG = load_config()
@@ -620,7 +711,13 @@ async def main():
     # 1. Handle Arguments
     if len(sys.argv) > 1:
         input_arg = sys.argv[1].strip()
-        if input_arg.endswith('.txt'):
+        if input_arg == 'scrapemovie':
+            await scrape_imdb_chart('movie')
+            return
+        elif input_arg == 'scrapetv':
+            await scrape_imdb_chart('tv')
+            return
+        elif input_arg.endswith('.txt'):
             queue_mode = True
             queue_file = input_arg
             auto_mode = True
@@ -677,6 +774,7 @@ async def main():
                 return
 
         session_count = 0
+        not_found_report = []
 
         for i, queue_url in enumerate(urls):
             print(f"\n{'='*20} Processing {i+1}/{len(urls)} {'='*20}")
@@ -686,23 +784,22 @@ async def main():
                 continue
             
             try:
-                # Determine Season folder from URL
-                target_dir = base_dir
+                result = await process_video(queue_url, headless=True, auto_mode=True)
                 
-                if CONFIG['tv_dir'] and os.path.exists(CONFIG['tv_dir']):
-                    # If using global TV dir, we need to reconstruct the path structure
-                    pass # For queue files, we usually stick to the queue file's location or relative paths
-
-                season_match = re.search(r'[?&]season=(\d+)', queue_url)
-                if season_match:
-                    target_dir = os.path.join(base_dir, f"Season {int(season_match.group(1)):02d}")
-                
-                success = await process_video(queue_url, headless=True, auto_mode=True, output_dir=target_dir)
-                
-                if success:
+                if result is True:
                     with open(completed_log, 'a', encoding='utf-8') as f:
                         f.write(f"{queue_url}\n")
                     print(f"✅ Marked as complete.")
+                elif result == "404":
+                    print(f"⏭️  Skipping 404 item...")
+                    
+                    # Critical Failure Check: If S01E01 is missing, likely the whole series is gone.
+                    if "season=1" in queue_url and "episode=1" in queue_url:
+                        print("🛑 Critical Failure: Season 1 Episode 1 is 404. Aborting series download.")
+                        return
+
+                    not_found_report.append(queue_url)
+                    # Do not terminate, continue to next item
                 else:
                     print(f"\n❌ Failed downloading: {queue_url}")
                     print("🛑 Script terminating as requested to preserve queue state.")
@@ -721,6 +818,12 @@ async def main():
                 wait_time = random.randint(COOLDOWN_RANGE[0], COOLDOWN_RANGE[1])
                 print(f"⏳ Cooling down ({wait_time}s)...")
                 await asyncio.sleep(wait_time)
+        
+        if not_found_report:
+            print(f"\n{'='*20} Summary of 404 Not Found Items {'='*20}")
+            for item in not_found_report:
+                print(f"❌ {item}")
+            print("="*60)
 
     else:
         if url and "imdb.com/title/" in url:
@@ -809,11 +912,7 @@ async def main():
 
         if url:
             # Single movie download
-            if CONFIG['movies_dir']:
-                # If we have a movies dir, pass it as the base output_dir
-                await process_video(url, headless=headless, auto_mode=auto_mode, output_dir=CONFIG['movies_dir'])
-            else:
-                await process_video(url, headless=headless, auto_mode=auto_mode)
+            await process_video(url, headless=headless, auto_mode=auto_mode)
 
 if __name__ == "__main__":
     try:
