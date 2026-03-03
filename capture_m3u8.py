@@ -18,6 +18,13 @@ DOWNLOAD_SPEED = '6M'
 COOLDOWN_RANGE = (10, 25)
 
 class MasterM3U8Finder:
+    """
+    Main class responsible for:
+    1. Launching a browser (Playwright).
+    2. Intercepting network requests to find 'master.m3u8'.
+    3. Handling iframes and clicking play buttons to trigger streams.
+    4. Downloading the stream using yt-dlp.
+    """
     def __init__(self):
         self.master_url = None
         self.candidates = []
@@ -143,6 +150,7 @@ class MasterM3U8Finder:
         cmd = [
             ytdlp_path,
             '--ignore-errors',
+            '--no-warnings',
             '--fixup', 'detect_or_warn',
             '--fragment-retries', '10',
             '--retry-sleep', 'fragment:5',
@@ -194,6 +202,13 @@ class MasterM3U8Finder:
             return False
 
     async def capture(self, start_url, headless=False):
+        """
+        The core logic:
+        - Opens the URL.
+        - Listens for network traffic matching .m3u8.
+        - Scans iframes if not found immediately.
+        - Returns the master URL and page title.
+        """
         print(f"🔍 Hunting for master.m3u8 at: {start_url}")
         mode = "hidden" if headless else "visible"
         print(f"🖥️  Browser mode: {mode}\n")
@@ -416,6 +431,14 @@ def get_output_paths(title, url):
     return final_dir, filename
 
 async def process_video(url, headless=True, auto_mode=True):
+    """
+    Orchestrates the download process for a single URL:
+    1. Converts IMDB URLs if needed.
+    2. Runs MasterM3U8Finder to get the stream.
+    3. Saves metadata to a .txt file.
+    4. Runs yt-dlp to download.
+    5. Moves the file to the final destination on success.
+    """
     if not url.startswith('http'):
         url = 'https://' + url
     
@@ -473,7 +496,7 @@ async def process_video(url, headless=True, auto_mode=True):
             f.write(f"Title: {title}\n")
             f.write(f"URL: {master_url}\n")
             f.write(f"Filename: {final_filename}\n")
-            f.write(f"Command: yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{final_filename}\" \"{master_url}\"\n")
+            f.write(f"Command: yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{final_filename}\" \"{master_url}\"\n")
         print(f"\n💾 Details saved to {txt_filename}")
         
         if ytdlp_path:
@@ -535,16 +558,16 @@ async def process_video(url, headless=True, auto_mode=True):
                 
                 if not success:
                     print("\n📋 Manual command (try running this in terminal):")
-                    print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                    print(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG["download_speed"] if "CONFIG" in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
                 return success
             else:
                 print(f"\n📋 Manual command:")
-                print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                print(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG["download_speed"] if "CONFIG" in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
                 return True
         else:
             print("\n❌ yt-dlp not found")
             print(f"\n📋 Save this command:")
-            print(f'yt-dlp --ignore-errors --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+            print(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG["download_speed"] if "CONFIG" in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
             return True
         
     else:
@@ -721,6 +744,11 @@ def load_config():
     return default_config
 
 async def scrape_imdb_chart(chart_type):
+    """
+    Scrapes IMDB Top 250 lists (Movies or TV).
+    - Extracts links.
+    - Saves them to a text file for batch processing.
+    """
     if chart_type == 'movie':
         url = "https://www.imdb.com/chart/top/"
         output_file = "imdb_top_250_movies.txt"
@@ -782,6 +810,12 @@ async def scrape_imdb_chart(chart_type):
             await browser.close()
 
 async def main():
+    """
+    Entry point:
+    - Loads config.
+    - Handles command line arguments (scraping, queue files, or single URLs).
+    - Manages the queue loop and cooldowns.
+    """
     global CONFIG
     CONFIG = load_config()
     global COOLDOWN_RANGE
