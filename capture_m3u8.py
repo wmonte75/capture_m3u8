@@ -21,6 +21,7 @@ class MasterM3U8Finder:
     def __init__(self):
         self.master_url = None
         self.candidates = []
+        self.bad_candidates = set()
         self.title = "Unknown"
         
     def find_ytdlp(self):
@@ -90,6 +91,49 @@ class MasterM3U8Finder:
             safe = safe[:50]
         return safe.strip('.')
 
+    async def save_cookies(self, context):
+        """Save session cookies to Netscape format for yt-dlp"""
+        try:
+            cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+            cookies = await context.cookies()
+            with open(cookie_file, 'w', encoding='utf-8') as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                for c in cookies:
+                    domain = c['domain']
+                    flag = 'TRUE' if domain.startswith('.') else 'FALSE'
+                    path = c['path']
+                    secure = 'TRUE' if c['secure'] else 'FALSE'
+                    expires = int(c['expires']) if 'expires' in c and c['expires'] != -1 else 0
+                    name = c['name']
+                    value = c['value']
+                    f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+        except Exception as e:
+            print(f"   ⚠️ Failed to save cookies: {e}")
+
+    async def get_working_url(self, context):
+        """Test candidates and return the first working one"""
+        for url in self.candidates:
+            if url in self.bad_candidates:
+                continue
+            
+            if url == self.master_url:
+                return url
+
+            print(f"   🧪 Testing candidate: {url[:80]}...")
+            try:
+                # Use Playwright's APIRequestContext to test the link
+                response = await context.request.get(url, timeout=5000)
+                if response.ok:
+                    print(f"   ✅ Verified working: {url[:80]}")
+                    return url
+                else:
+                    print(f"   ❌ Failed ({response.status}): {url[:80]}")
+                    self.bad_candidates.add(url)
+            except Exception as e:
+                print(f"   ❌ Error testing candidate: {str(e)[:50]}")
+                self.bad_candidates.add(url)
+        return None
+
     async def run_ytdlp(self, ytdlp_path, master_url, output_file, use_cookies=False):
         """Execute yt-dlp download internally"""
         if not output_file.endswith('.mkv'):
@@ -107,14 +151,16 @@ class MasterM3U8Finder:
             '--write-subs',
             '--all-subs',
             '--sub-langs', CONFIG['subtitle_langs'] if 'CONFIG' in globals() and 'subtitle_langs' in CONFIG else 'all',
-            '--user-agent', USER_AGENT,
             '-o', output_file,
         ]
         
         # Optional: Use cookies from browser if available (helps with some sites)
         if use_cookies:
-            print("   🍪 Trying with browser cookies...")
-            cmd.extend(['--cookies-from-browser', 'chrome'])
+            cmd.extend(['--user-agent', USER_AGENT])
+            cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+            if os.path.exists(cookie_file):
+                print("   🍪 Using captured browser cookies...")
+                cmd.extend(['--cookies', cookie_file])
         
         cmd.append(master_url)
         
@@ -185,15 +231,9 @@ class MasterM3U8Finder:
             async def handle_route(route, request):
                 url = request.url
                 if 'master.m3u8' in url.lower():
-                    if self.master_url:
-                        if url not in self.candidates:
-                            self.candidates.append(url)
-                        await route.continue_()
-                        return
-
-                    print(f"🎯 MASTER FOUND: {url}")
-                    self.master_url = url
-                    self.candidates.append(url)
+                    if url not in self.candidates:
+                        print(f"   🔎 Candidate found: {url[:80]}")
+                        self.candidates.append(url)
                     
                     nonlocal title_found
                     if not title_found:
@@ -210,17 +250,26 @@ class MasterM3U8Finder:
             
             print("Step 1: Loading main page...")
             try:
-                await page.goto(start_url, wait_until="load", timeout=60000)
+                await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
                 print(f"   ⚠️ Page load warning: {str(e)[:100]}")
                 print("   Continuing scan...")
+            
+            # Smart wait: Check for master URL immediately, max 2s wait
+            for _ in range(20):
+                verified = await self.get_working_url(context)
+                if verified:
+                    self.master_url = verified
+                    break
+                await asyncio.sleep(0.1)
             
             if self.master_url:
                 if self.title == "Unknown":
                     self.title = await self.extract_title(page)
                 print(f"   ⚡ Master URL found early. Skipping iframe scan.")
+                await self.save_cookies(context)
                 await context.close()
-                return self.master_url, self.title, start_url
+                return self.master_url, self.title, start_url, "success"
             
             self.title = await self.extract_title(page)
             title_found = True
@@ -242,7 +291,7 @@ class MasterM3U8Finder:
                     url = frame.url
                     if url and url != start_url and 'about:blank' not in url:
                         # Filter out Cloudflare/Turnstile/Captcha iframes
-                        if any(x in url for x in ['cloudflare', 'turnstile', 'recaptcha']):
+                        if any(x in url.lower() for x in ['cloudflare', 'turnstile', 'recaptcha']):
                             continue
                             
                         print(f"   Found iframe: {url[:80]}")
@@ -257,7 +306,7 @@ class MasterM3U8Finder:
                     if headless:
                         print(f"⚠️  Multiple sources detected ({len(iframe_urls)}) in headless mode. Switching to visible...")
                         await context.close()
-                        return None, self.title, start_url
+                        return None, self.title, start_url, "retry"
 
                     print(f"\n⚠️  Multiple sources detected ({len(iframe_urls)}). Needs human input.")
                     for i, url in enumerate(iframe_urls):
@@ -281,6 +330,9 @@ class MasterM3U8Finder:
                         timeout = 10000 if headless else 15000
                         await page.goto(iframe_url, wait_until="networkidle", timeout=timeout)
                         
+                        if headless and self.master_url:
+                            break
+                        
                         iframe_title = await self.extract_title(page)
                         if iframe_title != "Unknown" and self.title == "Unknown":
                             self.title = iframe_title
@@ -296,8 +348,15 @@ class MasterM3U8Finder:
                             if (btn) btn.click();
                         }""")
                         
-                        wait_time = 2 if headless else 5
-                        await asyncio.sleep(wait_time)
+                        if headless:
+                            for _ in range(20): # Max 2s wait, check every 0.1s
+                                verified = await self.get_working_url(context)
+                                if verified:
+                                    self.master_url = verified
+                                    break
+                                await asyncio.sleep(0.1)
+                        else:
+                            await asyncio.sleep(5)
                         
                     except Exception as e:
                         print(f"      Error: {str(e)[:60]}")
@@ -308,10 +367,15 @@ class MasterM3U8Finder:
                 content = await page.content()
                 matches = re.findall(r'https?://[^\s"\']+master\.m3u8[^\s"\']*', content, re.IGNORECASE)
                 for match in matches:
-                    print(f"   Found in HTML: {match}")
-                    self.candidates.append(match)
-                    self.master_url = match
+                    if match not in self.candidates:
+                        print(f"   Found in HTML: {match}")
+                        self.candidates.append(match)
+                
+                verified = await self.get_working_url(context)
+                if verified:
+                    self.master_url = verified
             
+            await self.save_cookies(context)
             await context.close()
             
             return self.master_url, self.title, start_url, "success"
@@ -332,9 +396,17 @@ def get_output_paths(title, url):
         season_num = int(season_match.group(1))
         episode_num = int(episode_match.group(1)) if episode_match else 0
         
-        series_dir = os.path.join(base_dir, safe_title)
+        # Clean the title to remove existing Season/Episode info
+        # This prevents redundancy like "Series.S01E01.S01E01.mkv"
+        clean_title = safe_title
+        clean_title = re.sub(r'\.S\d+E\d+.*', '', clean_title, flags=re.IGNORECASE)
+        clean_title = re.sub(r'\.S\d+\.?$', '', clean_title, flags=re.IGNORECASE)
+        clean_title = re.sub(r'\.Season\.\d+.*', '', clean_title, flags=re.IGNORECASE)
+        clean_title = clean_title.strip('.')
+        
+        series_dir = os.path.join(base_dir, clean_title)
         final_dir = os.path.join(series_dir, f"Season {season_num:02d}")
-        filename = f"{safe_title}.S{season_num:02d}E{episode_num:02d}.mkv"
+        filename = f"{clean_title}.S{season_num:02d}E{episode_num:02d}.mkv"
     else:
         # Movie
         base_dir = CONFIG['movies_dir'] if 'CONFIG' in globals() and CONFIG['movies_dir'] else "."
@@ -433,6 +505,13 @@ async def process_video(url, headless=True, auto_mode=True):
                     print("\n⚠️  First attempt failed. Trying with browser cookies...")
                     success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename, use_cookies=True)
                 
+                cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+                if os.path.exists(cookie_file):
+                    try:
+                        os.remove(cookie_file)
+                    except:
+                        pass
+                
                 if success:
                     print(f"\n🚚 Moving file to final destination...")
                     print(f"   From: {temp_filename}")
@@ -442,6 +521,13 @@ async def process_video(url, headless=True, auto_mode=True):
                             os.remove(final_filename)
                         shutil.move(temp_filename, final_filename)
                         print(f"✅ Move complete.")
+                        
+                        if os.path.exists(txt_filename):
+                            try:
+                                os.remove(txt_filename)
+                            except:
+                                pass
+                                
                         return True
                     except Exception as e:
                         print(f"❌ Error moving file: {e}")
@@ -711,7 +797,17 @@ async def main():
     # 1. Handle Arguments
     if len(sys.argv) > 1:
         input_arg = sys.argv[1].strip()
-        if input_arg == 'scrapemovie':
+        if input_arg == '-U':
+            print("🔄 Checking for yt-dlp updates...")
+            finder = MasterM3U8Finder()
+            ytdlp_path = finder.find_ytdlp()
+            if ytdlp_path:
+                print(f"   Found yt-dlp at: {ytdlp_path}")
+                subprocess.run([ytdlp_path, '-U'])
+            else:
+                print("❌ yt-dlp executable not found.")
+            return
+        elif input_arg == 'scrapemovie':
             await scrape_imdb_chart('movie')
             return
         elif input_arg == 'scrapetv':
@@ -769,7 +865,7 @@ async def main():
         if first_pending_idx > 0:
             print(f"\n⚠️  Found progress in completed.log ({first_pending_idx} items done).")
             print(f"   Last file did not download: {urls[first_pending_idx]}")
-            if input("   Would you like to continue where we left off? (y/n): ").strip().lower() != 'y':
+            if (input("   Would you like to continue where we left off? (y/n) [default: y]: ").strip().lower() or 'y') != 'y':
                 print("👋 Exiting.")
                 return
 
@@ -818,6 +914,20 @@ async def main():
                 wait_time = random.randint(COOLDOWN_RANGE[0], COOLDOWN_RANGE[1])
                 print(f"⏳ Cooling down ({wait_time}s)...")
                 await asyncio.sleep(wait_time)
+        
+        # Auto-delete queue file if it was a generated list and completed successfully
+        try:
+            if queue_file and os.path.exists(queue_file):
+                q_name = os.path.basename(queue_file)
+                q_dir_name = os.path.basename(os.path.dirname(os.path.abspath(queue_file)))
+                
+                # Delete if it's a Top 250 list OR a Series list (filename matches folder name)
+                if q_name in ["imdb_top_250_movies.txt", "imdb_top_250_tv.txt"] or \
+                   (os.path.splitext(q_name)[0] == q_dir_name):
+                    os.remove(queue_file)
+                    print(f"\n🗑️  Auto-deleted completed queue file: {q_name}")
+        except:
+            pass
         
         if not_found_report:
             print(f"\n{'='*20} Summary of 404 Not Found Items {'='*20}")
