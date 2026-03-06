@@ -5,7 +5,7 @@ import re
 # Configuration: Set path to your ffmpeg binary here
 # If added to system PATH, just "ffmpeg" works.
 # Otherwise, use full path: r"C:\Tools\ffmpeg\bin\ffmpeg.exe"
-FFMPEG_BINARY = r"C:\YTLink\mpv\output\ffmpeg_libfdk_aac_1.exe"
+FFMPEG_BINARY = ffmpeg
 
 def process(file_path):
     """
@@ -57,9 +57,9 @@ def process(file_path):
         "-map", "[direct]",
         "-map", "0:s?",
         "-c:v", "copy",
-        "-c:a", "libfdk_aac",
+        "-c:a", "aac",
         "-ar", "48000",
-        "-q:a", "0.8",
+        "-b:a", "192k",
         "-ac", "6",
         "-metadata:s:a:0", "title=Normalized 5.1",
         "-metadata:s:a:1", "title=Direct 5.1",
@@ -87,4 +87,5 @@ def process(file_path):
             
     except Exception as e:
         print(f"   ❌ Upmix failed: {e}")
+
         return file_path
