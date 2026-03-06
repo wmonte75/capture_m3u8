@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import json
 import random
+import importlib.util
 
 # Define common User-Agent to match browser and yt-dlp to avoid 403/429 errors
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -16,6 +17,45 @@ DOWNLOAD_SPEED = '6M'
 
 # Random cooldown range between queue items (min_seconds, max_seconds)
 COOLDOWN_RANGE = (10, 25)
+
+class PluginManager:
+    def __init__(self):
+        self.plugins_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
+
+    def run_plugins(self, file_path):
+        """
+        Scans 'plugins' folder and executes .py files sequentially.
+        Each plugin must have a process(file_path) function.
+        """
+        if not os.path.exists(self.plugins_dir):
+            return file_path
+        
+        files = sorted([f for f in os.listdir(self.plugins_dir) if f.endswith(".py") and not f.startswith("_")])
+        if not files:
+            return file_path
+
+        print(f"\n🔌 Scanning plugins in: {self.plugins_dir}")
+        current_path = file_path
+
+        for filename in files:
+            plugin_path = os.path.join(self.plugins_dir, filename)
+            try:
+                print(f"   Running plugin: {filename}...")
+                spec = importlib.util.spec_from_file_location(filename[:-3], plugin_path)
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    
+                    if hasattr(module, "process"):
+                        new_path = module.process(current_path)
+                        if new_path and os.path.exists(new_path):
+                            current_path = new_path
+                    else:
+                        print(f"   ⚠️  Skipping {filename}: No 'process' function found.")
+            except Exception as e:
+                print(f"   ❌ Plugin {filename} failed: {e}")
+        
+        return current_path
 
 class MasterM3U8Finder:
     """
@@ -265,13 +305,13 @@ class MasterM3U8Finder:
             
             print("Step 1: Loading main page...")
             try:
-                await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(start_url, wait_until="commit", timeout=60000)
             except Exception as e:
                 print(f"   ⚠️ Page load warning: {str(e)[:100]}")
                 print("   Continuing scan...")
             
-            # Smart wait: Check for master URL immediately, max 2s wait
-            for _ in range(20):
+            # Smart wait: Check for master URL immediately, max 15s wait
+            for _ in range(150):
                 verified = await self.get_working_url(context)
                 if verified:
                     self.master_url = verified
@@ -343,7 +383,7 @@ class MasterM3U8Finder:
                         # Set Referer to bypass hotlink protection
                         await page.set_extra_http_headers({'Referer': start_url})
                         timeout = 10000 if headless else 15000
-                        await page.goto(iframe_url, wait_until="networkidle", timeout=timeout)
+                        await page.goto(iframe_url, wait_until="domcontentloaded", timeout=timeout)
                         
                         if headless and self.master_url:
                             break
@@ -536,6 +576,16 @@ async def process_video(url, headless=True, auto_mode=True):
                         pass
                 
                 if success:
+                    # Run Plugins
+                    plugin_manager = PluginManager()
+                    temp_filename = plugin_manager.run_plugins(temp_filename)
+                    
+                    # Update final filename extension if plugin changed it
+                    _, ext_temp = os.path.splitext(temp_filename)
+                    base_final, ext_final = os.path.splitext(final_filename)
+                    if ext_temp.lower() != ext_final.lower():
+                        final_filename = f"{base_final}{ext_temp}"
+
                     print(f"\n🚚 Moving file to final destination...")
                     print(f"   From: {temp_filename}")
                     print(f"   To:   {final_filename}")
