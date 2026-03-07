@@ -5,7 +5,7 @@ import re
 # Configuration: Set path to your ffmpeg binary here
 # If added to system PATH, just "ffmpeg" works.
 # Otherwise, use full path: r"C:\Tools\ffmpeg\bin\ffmpeg.exe"
-FFMPEG_BINARY = ffmpeg
+FFMPEG_BINARY = "ffmpeg"
 
 def process(file_path):
     """
@@ -89,3 +89,4 @@ def process(file_path):
         print(f"   ❌ Upmix failed: {e}")
 
         return file_path
+
