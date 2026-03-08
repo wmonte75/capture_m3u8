@@ -44,8 +44,8 @@ You can create a `config.json` file in the script directory to set default paths
   "movies_dir": "D:/Media/Movies",
   "tv_dir": "D:/Media/TV Shows",
   "download_speed": "10M",
-  "min_cooldown": 10,
-  "max_cooldown": 25,
+  "min_cooldown": 44,
+  "max_cooldown": 87,
   "subtitle_langs": "en,eng,en-forced",
   "session_reset_count": 5
 }
@@ -174,4 +174,5 @@ If you get stuck in a "Verify you are human" loop:
 ### 403 / 429 Errors
 If you see "Too Many Requests" or "Forbidden":
 - The script has a built-in random cooldown (10-25s) to prevent this.
+
 - If it persists, try increasing the `COOLDOWN_RANGE` in the script or changing your IP (VPN).
