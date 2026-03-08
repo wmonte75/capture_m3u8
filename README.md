@@ -9,6 +9,7 @@ A powerful Python tool to automatically detect, capture, and download M3U8 video
 - **IMDB Support**: Automatically converts IMDB URLs (e.g., `imdb.com/title/tt1234567`) to streaming sources.
 - **TV Series Support**: Detects TV shows from IMDB links, allowing selection of specific seasons and episodes (ranges, individual, or all).
 - **Robust Downloading**: Integrates with `yt-dlp` to download streams with resume capability and error handling.
+- **Smart Resume**: Checks both `completed.log` and the filesystem for existing files to prevent re-downloads. Automatically "self-heals" the log if files are found on disk.
 - **Modes**:
   - **Headless**: Runs in the background.
   - **Visible**: Shows the browser window for debugging or manual interaction.
@@ -44,8 +45,8 @@ You can create a `config.json` file in the script directory to set default paths
   "movies_dir": "D:/Media/Movies",
   "tv_dir": "D:/Media/TV Shows",
   "download_speed": "10M",
-  "min_cooldown": 44,
-  "max_cooldown": 87,
+  "min_cooldown": 10,
+  "max_cooldown": 25,
   "subtitle_langs": "en,eng,en-forced",
   "session_reset_count": 5
 }
@@ -86,10 +87,51 @@ python capture_m3u8.py queue.txt
 ```
 The script will: 
 1. Process URLs one by one. 
-2. Skip URLs already listed in completed.log.
+2. Skip URLs if they are found in `completed.log` or if the video file already exists on disk.
 3. Wait a random interval (10-25s) between downloads to avoid rate limits and appear human.
 
-## 📂 Output
+## 🖥️ GUI Application
+
+For users who prefer a visual interface, run:
+```bash
+python capture_m3u8_gui.py
+```
+
+### Running in Background (No Terminal)
+
+**Windows:**
+Use `pythonw` instead of `python` to launch without a console window:
+```powershell
+pythonw capture_m3u8_gui.py
+```
+
+**Linux:**
+Use `nohup` to detach the process from the terminal:
+```bash
+nohup python3 capture_m3u8_gui.py > /dev/null 2>&1 &
+```
+
+### Interface Guide
+
+1.  **Input Section**
+    -   **URL Field**: Paste a video URL or an IMDB link. Supports a right-click context menu (Cut/Copy/Paste).
+    -   **Start / Analyze**: Begins the detection and download process.
+    -   **Stop**: Immediately halts the active download or search.
+
+2.  **Configuration Panel**
+    -   **Movies / TV Folders**: Browse and select where to save your downloads.
+    -   **Cooldown**: Set a random delay range (in seconds) between episodes. Settings are saved automatically.
+    -   **Speed**: Limit download bandwidth (e.g., 6M, 10M, Unlimited) to prevent network congestion.
+    -   **Headless Mode**:
+        -   ✅ **Checked**: Runs the browser in the background (invisible).
+        -   ⬜ **Unchecked**: Shows the browser window. Use this if you need to manually solve a CAPTCHA.
+
+3.  **TV Series Selection**
+    -   When you paste an IMDB TV Series link and click **Start**, a popup will appear.
+    -   **Season**: Enter a specific number (e.g., `1`) or type `all` to grab every season.
+    -   **Episodes**: Optional. Enter start and end episode numbers. Leave the end blank to download to the last episode of the season.
+
+##  Output
 
 - **Movies**: Organized into folders (e.g., `Movie.Name/Movie.Name.mkv`).
 - **TV Series**: Organized into structure `Series.Name/Season XX/Episode.Title.mkv`.
@@ -115,6 +157,7 @@ Here is a complete, working example. This plugin uses **FFmpeg** to convert ster
 ```python
 import os
 import subprocess
+import sys
 
 # Configuration: Set path to your ffmpeg binary here
 # If added to system PATH, just "ffmpeg" works.
@@ -151,8 +194,13 @@ def process(file_path):
     
     # 4. Run FFmpeg
     try:
+        creation_flags = 0
+        if sys.platform == 'win32':
+            # This flag hides the console window on Windows
+            creation_flags = subprocess.CREATE_NO_WINDOW
+            
         # Run silently (stdout/stderr to DEVNULL) to keep console clean
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creation_flags)
         
         if os.path.exists(output_path):
             print(f"   ✅ Upmix complete: {os.path.basename(output_path)}")
@@ -174,5 +222,4 @@ If you get stuck in a "Verify you are human" loop:
 ### 403 / 429 Errors
 If you see "Too Many Requests" or "Forbidden":
 - The script has a built-in random cooldown (10-25s) to prevent this.
-
 - If it persists, try increasing the `COOLDOWN_RANGE` in the script or changing your IP (VPN).

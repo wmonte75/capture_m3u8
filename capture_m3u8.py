@@ -8,6 +8,8 @@ import subprocess
 import json
 import random
 import importlib.util
+import io
+from contextlib import redirect_stdout
 
 # Define common User-Agent to match browser and yt-dlp to avoid 403/429 errors
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -17,6 +19,36 @@ DOWNLOAD_SPEED = '6M'
 
 # Random cooldown range between queue items (min_seconds, max_seconds)
 COOLDOWN_RANGE = (10, 25)
+
+# --- GUI / EXTERNAL INTERFACE HELPERS ---
+LOG_CALLBACK = None
+INPUT_CALLBACK = None
+STATUS_CALLBACK = None
+STOP_CALLBACK = None
+CONFIG = {}
+
+def setup_interface(config_data=None, log_cb=None, input_cb=None, status_cb=None, stop_cb=None):
+    global CONFIG, LOG_CALLBACK, INPUT_CALLBACK, STATUS_CALLBACK, STOP_CALLBACK
+    if config_data: CONFIG.update(config_data)
+    if log_cb: LOG_CALLBACK = log_cb
+    if input_cb: INPUT_CALLBACK = input_cb
+    if status_cb: STATUS_CALLBACK = status_cb
+    if stop_cb: STOP_CALLBACK = stop_cb
+
+def log(msg, end="\n"):
+    if LOG_CALLBACK: LOG_CALLBACK(str(msg) + end)
+    else: print(msg, end=end)
+
+def get_user_input(prompt):
+    if INPUT_CALLBACK: return INPUT_CALLBACK(prompt)
+    return input(prompt)
+
+def report_status(msg):
+    if STATUS_CALLBACK: STATUS_CALLBACK(msg)
+
+def check_stop():
+    if STOP_CALLBACK and STOP_CALLBACK():
+        raise Exception("Stopped by user")
 
 class PluginManager:
     def __init__(self):
@@ -34,26 +66,49 @@ class PluginManager:
         if not files:
             return file_path
 
-        print(f"\n🔌 Scanning plugins in: {self.plugins_dir}")
+        log(f"\n🔌 Scanning plugins in: {self.plugins_dir}")
         current_path = file_path
 
         for filename in files:
             plugin_path = os.path.join(self.plugins_dir, filename)
             try:
-                print(f"   Running plugin: {filename}...")
                 spec = importlib.util.spec_from_file_location(filename[:-3], plugin_path)
                 if spec and spec.loader:
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
                     
                     if hasattr(module, "process"):
-                        new_path = module.process(current_path)
-                        if new_path and os.path.exists(new_path):
+                        # Capture stdout to a buffer
+                        output_buffer = io.StringIO()
+                        new_path = None
+                        
+                        try:
+                            with redirect_stdout(output_buffer):
+                                new_path = module.process(current_path)
+                        except Exception as e:
+                            # If plugin fails during execution, log everything
+                            log(f"   ❌ Plugin {filename} failed during execution:")
+                            # Log any output it produced before crashing
+                            captured_output = output_buffer.getvalue()
+                            if captured_output:
+                                log(captured_output, end="")
+                            log(f"      Error: {e}")
+                            continue # Move to the next plugin
+
+                        # Check if the plugin did something (path changed)
+                        if new_path and new_path != current_path and os.path.exists(new_path):
+                            log(f"   Running plugin: {filename}...")
+                            # Log the captured output from the successful plugin
+                            captured_output = output_buffer.getvalue()
+                            if captured_output:
+                                # We use print() inside plugins, so we need to pass the whole block to log()
+                                log(captured_output, end="")
                             current_path = new_path
+                        # If the path is the same, the plugin skipped, and we silently discard its output.
                     else:
-                        print(f"   ⚠️  Skipping {filename}: No 'process' function found.")
+                        log(f"   ⚠️  Skipping {filename}: No 'process' function found.")
             except Exception as e:
-                print(f"   ❌ Plugin {filename} failed: {e}")
+                log(f"   ❌ Plugin {filename} failed to load: {e}")
         
         return current_path
 
@@ -155,7 +210,7 @@ class MasterM3U8Finder:
                     value = c['value']
                     f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
         except Exception as e:
-            print(f"   ⚠️ Failed to save cookies: {e}")
+            log(f"   ⚠️ Failed to save cookies: {e}")
 
     async def get_working_url(self, context):
         """Test candidates and return the first working one"""
@@ -166,23 +221,28 @@ class MasterM3U8Finder:
             if url == self.master_url:
                 return url
 
-            print(f"   🧪 Testing candidate: {url[:80]}...")
+            log(f"   🧪 Testing candidate: {url[:80]}...")
             try:
                 # Use Playwright's APIRequestContext to test the link
                 response = await context.request.get(url, timeout=5000)
                 if response.ok:
-                    print(f"   ✅ Verified working: {url[:80]}")
+                    log(f"   ✅ Verified working: {url[:80]}")
                     return url
                 else:
-                    print(f"   ❌ Failed ({response.status}): {url[:80]}")
+                    log(f"   ❌ Failed ({response.status}): {url[:80]}")
                     self.bad_candidates.add(url)
             except Exception as e:
-                print(f"   ❌ Error testing candidate: {str(e)[:50]}")
+                log(f"   ❌ Error testing candidate: {str(e)[:50]}")
                 self.bad_candidates.add(url)
         return None
 
-    async def run_ytdlp(self, ytdlp_path, master_url, output_file, use_cookies=False):
+    async def run_ytdlp(self, ytdlp_path, master_url, output_file, use_cookies=False, status_prefix=""):
         """Execute yt-dlp download internally"""
+        creation_flags = 0
+        if sys.platform == 'win32':
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
+        check_stop()
         if not output_file.endswith('.mkv'):
             output_file += '.mkv'
         
@@ -207,38 +267,93 @@ class MasterM3U8Finder:
             cmd.extend(['--user-agent', USER_AGENT])
             cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
             if os.path.exists(cookie_file):
-                print("   🍪 Using captured browser cookies...")
+                log("   🍪 Using captured browser cookies...")
                 cmd.extend(['--cookies', cookie_file])
         
         cmd.append(master_url)
         
-        print(f"\n⬇️  Starting download with yt-dlp...")
-        print(f"   Output: {output_file}")
-        print(f"   Anti-bot: Enabled")
-        # print(f"   DEBUG Command: {cmd}")
+        # Check if we need to capture output for GUI
+        capture_output = (LOG_CALLBACK is not None)
+        if capture_output:
+            cmd.insert(1, '--newline')
+
+        report_status(f"{status_prefix}Downloading...")
+        log(f"\n⬇️  Starting download with yt-dlp...")
+        log(f"   Output: {output_file}")
+        log(f"   Anti-bot: Enabled")
+        # log(f"   DEBUG Command: {cmd}")
         
         try:
             # Run internally using asyncio subprocess
-            process = await asyncio.create_subprocess_exec(*cmd)
-            
-            try:
+            if capture_output:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    creationflags=creation_flags
+                )
+                
+                while True:
+                    check_stop()
+                    try:
+                        line = await asyncio.wait_for(process.stdout.readline(), timeout=0.1)
+                        if not line: break
+                        text = line.decode('utf-8', errors='replace').strip()
+                        if text:
+                            if '[download]' in text and 'ETA' in text:
+                                match = re.search(r'(\d+\.?\d*)%', text)
+                                if match:
+                                    report_status(f"{status_prefix}Downloading {match.group(1)}%")
+                            elif "HTTP Error 429" in text:
+                                pass
+                            elif "Downloading fragment" in text:
+                                pass
+                            else:
+                                log(text)
+                    except asyncio.TimeoutError:
+                        if process.returncode is not None: break
+                        continue
+                
                 await process.wait()
-            except asyncio.CancelledError:
-                print("\n🛑 Stopping download process...")
-                process.terminate()
-                await process.wait()
-                raise
+            else:
+                process = await asyncio.create_subprocess_exec(*cmd, creationflags=creation_flags)
+                try:
+                    # Poll for stop signal while waiting for process
+                    while process.returncode is None:
+                        check_stop()
+                        try:
+                            await asyncio.wait_for(process.wait(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            continue
+                    
+                    # Check return code after wait
+                    if process.returncode != 0 and process.returncode is not None:
+                        # If we captured output, the error is already logged. 
+                        # If not, it might be on stderr which we didn't capture in CLI mode (inherited).
+                        pass
+                except Exception as e:
+                    if "Stopped by user" in str(e):
+                        log("\n🛑 Process stopped by user.")
+                        process.terminate()
+                        await process.wait()
+                    raise e # Re-raise to be handled by the calling function
+                except asyncio.CancelledError:
+                    log("\n🛑 Stopping download process...")
+                    process.terminate()
+                    await process.wait()
+                    raise
 
             if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                print(f"\n✅ Download complete: {output_file}")
+                report_status(f"{status_prefix}Downloading 100%")
+                log(f"\n✅ Download complete: {output_file}")
                 size = os.path.getsize(output_file) / (1024*1024)
-                print(f"   File size: {size:.1f} MB")
+                log(f"   File size: {size:.1f} MB")
                 return True
             else:
-                print(f"\n❌ Download failed (File not found). Exit code: {process.returncode}")
+                log(f"\n❌ Download failed (File not found). Exit code: {process.returncode}")
                 return False
         except Exception as e:
-            print(f"\n❌ Error running yt-dlp: {e}")
+            log(f"\n❌ Error running yt-dlp: {e}")
             return False
 
     async def capture(self, start_url, headless=False):
@@ -249,9 +364,11 @@ class MasterM3U8Finder:
         - Scans iframes if not found immediately.
         - Returns the master URL and page title.
         """
-        print(f"🔍 Hunting for master.m3u8 at: {start_url}")
+        check_stop()
+        report_status("Hunting...")
+        log(f"🔍 Hunting for master.m3u8 at: {start_url}")
         mode = "hidden" if headless else "visible"
-        print(f"🖥️  Browser mode: {mode}\n")
+        log(f"🖥️  Browser mode: {mode}\n")
         
         # Use a persistent user data directory to save cookies/session
         user_data_dir = os.path.abspath("browser_session")
@@ -287,7 +404,7 @@ class MasterM3U8Finder:
                 url = request.url
                 if 'master.m3u8' in url.lower():
                     if url not in self.candidates:
-                        print(f"   🔎 Candidate found: {url[:80]}")
+                        log(f"   🔎 Candidate found: {url[:80]}")
                         self.candidates.append(url)
                     
                     nonlocal title_found
@@ -295,7 +412,7 @@ class MasterM3U8Finder:
                         try:
                             self.title = await self.extract_title(page)
                             title_found = True
-                            print(f"📝 Title identified: {self.title}")
+                            log(f"📝 Title identified: {self.title}")
                         except:
                             pass
                             
@@ -303,15 +420,16 @@ class MasterM3U8Finder:
             
             await page.route("**/*", handle_route)
             
-            print("Step 1: Loading main page...")
+            log("Step 1: Loading main page...")
             try:
                 await page.goto(start_url, wait_until="commit", timeout=60000)
             except Exception as e:
-                print(f"   ⚠️ Page load warning: {str(e)[:100]}")
-                print("   Continuing scan...")
+                log(f"   ⚠️ Page load warning: {str(e)[:100]}")
+                log("   Continuing scan...")
             
             # Smart wait: Check for master URL immediately, max 15s wait
             for _ in range(150):
+                check_stop()
                 verified = await self.get_working_url(context)
                 if verified:
                     self.master_url = verified
@@ -321,27 +439,28 @@ class MasterM3U8Finder:
             if self.master_url:
                 if self.title == "Unknown":
                     self.title = await self.extract_title(page)
-                print(f"   ⚡ Master URL found early. Skipping iframe scan.")
+                log(f"   ⚡ Master URL found early. Skipping iframe scan.")
                 await self.save_cookies(context)
                 await context.close()
                 return self.master_url, self.title, start_url, "success"
             
             self.title = await self.extract_title(page)
             title_found = True
-            print(f"📝 Page Title: {self.title}")
+            log(f"📝 Page Title: {self.title}")
             
             if "404" in self.title or "Not Found" in self.title:
-                print("   ❌ 404 Not Found detected.")
+                log("   ❌ 404 Not Found detected.")
                 await context.close()
                 return None, self.title, start_url, "404"
             
             await asyncio.sleep(1)
             
-            print("Step 2: Scanning for video iframes...")
+            log("Step 2: Scanning for video iframes...")
             frames = page.frames
             iframe_urls = []
             
             for frame in frames:
+                check_stop()
                 try:
                     url = frame.url
                     if url and url != start_url and 'about:blank' not in url:
@@ -349,36 +468,37 @@ class MasterM3U8Finder:
                         if any(x in url.lower() for x in ['cloudflare', 'turnstile', 'recaptcha']):
                             continue
                             
-                        print(f"   Found iframe: {url[:80]}")
+                        log(f"   Found iframe: {url[:80]}")
                         iframe_urls.append(url)
                 except:
                     pass
             
             if not self.master_url and iframe_urls:
-                print(f"\nStep 3: Checking {len(iframe_urls)} iframe(s)...")
+                log(f"\nStep 3: Checking {len(iframe_urls)} iframe(s)...")
                 
                 if len(iframe_urls) > 1:
                     if headless:
-                        print(f"⚠️  Multiple sources detected ({len(iframe_urls)}) in headless mode. Switching to visible...")
+                        log(f"⚠️  Multiple sources detected ({len(iframe_urls)}) in headless mode. Switching to visible...")
                         await context.close()
                         return None, self.title, start_url, "retry"
 
-                    print(f"\n⚠️  Multiple sources detected ({len(iframe_urls)}). Needs human input.")
+                    log(f"\n⚠️  Multiple sources detected ({len(iframe_urls)}). Needs human input.")
                     for i, url in enumerate(iframe_urls):
-                        print(f"   {i+1}: {url}")
+                        log(f"   {i+1}: {url}")
                     
-                    choice = input(f"\nSelect source (1-{len(iframe_urls)}) or Press Enter to scan all: ").strip()
+                    choice = get_user_input(f"\nSelect source (1-{len(iframe_urls)}) or Press Enter to scan all: ").strip()
                     if choice.isdigit():
                         idx = int(choice) - 1
                         if 0 <= idx < len(iframe_urls):
                             iframe_urls = [iframe_urls[idx]]
-                            print(f"   ✅ Selected: {iframe_urls[0]}")
+                            log(f"   ✅ Selected: {iframe_urls[0]}")
 
                 for iframe_url in iframe_urls:
+                    check_stop()
                     if self.master_url:
                         break
                         
-                    print(f"   Navigating to: {iframe_url[:80]}...")
+                    log(f"   Navigating to: {iframe_url[:80]}...")
                     try:
                         # Set Referer to bypass hotlink protection
                         await page.set_extra_http_headers({'Referer': start_url})
@@ -391,7 +511,7 @@ class MasterM3U8Finder:
                         iframe_title = await self.extract_title(page)
                         if iframe_title != "Unknown" and self.title == "Unknown":
                             self.title = iframe_title
-                            print(f"   📝 Iframe Title: {self.title}")
+                            log(f"   📝 Iframe Title: {self.title}")
                         
                         await page.evaluate("""() => {
                             const video = document.querySelector('video');
@@ -414,16 +534,16 @@ class MasterM3U8Finder:
                             await asyncio.sleep(5)
                         
                     except Exception as e:
-                        print(f"      Error: {str(e)[:60]}")
+                        log(f"      Error: {str(e)[:60]}")
                         continue
             
             if not self.master_url:
-                print("Step 4: Checking page source...")
+                log("Step 4: Checking page source...")
                 content = await page.content()
                 matches = re.findall(r'https?://[^\s"\']+master\.m3u8[^\s"\']*', content, re.IGNORECASE)
                 for match in matches:
                     if match not in self.candidates:
-                        print(f"   Found in HTML: {match}")
+                        log(f"   Found in HTML: {match}")
                         self.candidates.append(match)
                 
                 verified = await self.get_working_url(context)
@@ -447,7 +567,7 @@ def get_output_paths(title, url):
     
     if season_match:
         # TV Series
-        base_dir = CONFIG['tv_dir'] if 'CONFIG' in globals() and CONFIG['tv_dir'] else "."
+        base_dir = CONFIG.get('tv_dir', ".")
         season_num = int(season_match.group(1))
         episode_num = int(episode_match.group(1)) if episode_match else 0
         
@@ -464,7 +584,7 @@ def get_output_paths(title, url):
         filename = f"{clean_title}.S{season_num:02d}E{episode_num:02d}.mkv"
     else:
         # Movie
-        base_dir = CONFIG['movies_dir'] if 'CONFIG' in globals() and CONFIG['movies_dir'] else "."
+        base_dir = CONFIG.get('movies_dir', ".")
         final_dir = os.path.join(base_dir, safe_title)
         filename = f"{safe_title}.mkv"
         
@@ -479,6 +599,8 @@ async def process_video(url, headless=True, auto_mode=True):
     4. Runs yt-dlp to download.
     5. Moves the file to the final destination on success.
     """
+    check_stop()
+    report_status("Analyzing...")
     if not url.startswith('http'):
         url = 'https://' + url
     
@@ -487,36 +609,36 @@ async def process_video(url, headless=True, auto_mode=True):
         match = re.search(r'(tt\d+)', url)
         if match:
             imdb_id = match.group(1)
-            print(f"\nℹ️  Detected IMDB URL. ID: {imdb_id}")
+            log(f"\nℹ️  Detected IMDB URL. ID: {imdb_id}")
             url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
-            print(f"   Converted to: {url}")
+            log(f"   Converted to: {url}")
 
     if not auto_mode:
-        print("\nBrowser visibility options:")
-        print("1. Hidden (headless) - Runs in background")
-        print("2. Visible (normal) - Shows browser window")
-        choice = input("\nSelect mode [1/2] (default: 1): ").strip() or "1"
+        log("\nBrowser visibility options:")
+        log("1. Hidden (headless) - Runs in background")
+        log("2. Visible (normal) - Shows browser window")
+        choice = get_user_input("\nSelect mode [1/2] (default: 1): ").strip() or "1"
         headless = (choice == "1")
     
     finder = MasterM3U8Finder()
     # Pass global config speed if available
-    if 'CONFIG' in globals() and 'download_speed' in CONFIG:
+    if CONFIG.get('download_speed'):
         finder.set_download_speed(CONFIG['download_speed'])
         
     master_url, title, referer, status = await finder.capture(url, headless=headless)
     
     if status == "404":
-        print(f"❌ FAILED - 404 Not Found: {url}")
+        log(f"❌ FAILED - 404 Not Found: {url}")
         return "404"
     
     safe_title = finder.sanitize_filename(title)
     
-    print("\n" + "="*70)
+    log("\n" + "="*70)
     if master_url:
-        print("✅ SUCCESS!")
-        print("="*70)
-        print(f"\n🎬 Title: {title}")
-        print(f"🔗 URL: {master_url[:80]}...")
+        log("✅ SUCCESS!")
+        log("="*70)
+        log(f"\n🎬 Title: {title}")
+        log(f"🔗 URL: {master_url[:80]}...")
         
         ytdlp_path = finder.find_ytdlp()
         
@@ -536,37 +658,46 @@ async def process_video(url, headless=True, auto_mode=True):
             f.write(f"Title: {title}\n")
             f.write(f"URL: {master_url}\n")
             f.write(f"Filename: {final_filename}\n")
-            f.write(f"Command: yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG['download_speed'] if 'CONFIG' in globals() else DOWNLOAD_SPEED} --user-agent \"{USER_AGENT}\" -o \"{final_filename}\" \"{master_url}\"\n")
-        print(f"\n💾 Details saved to {txt_filename}")
+            f.write(f"Command: yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get('download_speed', DOWNLOAD_SPEED)} --user-agent \"{USER_AGENT}\" -o \"{final_filename}\" \"{master_url}\"\n")
+        log(f"\n💾 Details saved to {txt_filename}")
         
         if ytdlp_path:
-            print(f"\n🛠️  yt-dlp found: {ytdlp_path}")
+            log(f"\n🛠️  yt-dlp found: {ytdlp_path}")
             
             if os.path.exists(final_filename):
-                print(f"\n⚠️  File '{final_filename}' already exists.")
+                log(f"\n⚠️  File '{final_filename}' already exists.")
                 if auto_mode:
-                    print("   Auto-mode: Saving as new file to avoid overwrite.")
+                    log("   Auto-mode: Saving as new file to avoid overwrite.")
                     base, ext = os.path.splitext(final_filename)
                     final_filename = f"{base}_new{ext}"
                 else:
-                    choice = input("   Overwrite? (y/n): ").lower()
+                    choice = get_user_input("   Overwrite? (y/n): ").lower()
                     if choice != 'y':
                         base, ext = os.path.splitext(final_filename)
                         final_filename = f"{base}_new{ext}"
-                        print(f"   Will save as: {final_filename}")
+                        log(f"   Will save as: {final_filename}")
             
             if auto_mode:
                 choice = 'y'
             else:
-                choice = input("\n🚀 Start download now? (y/n): ").lower()
+                choice = get_user_input("\n🚀 Start download now? (y/n): ").lower()
 
             if choice == 'y':
+                # Extract Season/Episode for status updates
+                status_prefix = ""
+                s_match = re.search(r'[?&]season=(\d+)', url)
+                e_match = re.search(r'[?&]episode=(\d+)', url)
+                if s_match:
+                    s_num = int(s_match.group(1))
+                    e_num = int(e_match.group(1)) if e_match else 0
+                    status_prefix = f"S{s_num:02d}E{e_num:02d} "
+
                 # Download to temp file first
-                success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename)
+                success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename, status_prefix=status_prefix)
                 
                 if not success:
-                    print("\n⚠️  First attempt failed. Trying with browser cookies...")
-                    success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename, use_cookies=True)
+                    log("\n⚠️  First attempt failed. Trying with browser cookies...")
+                    success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename, use_cookies=True, status_prefix=status_prefix)
                 
                 cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
                 if os.path.exists(cookie_file):
@@ -578,22 +709,41 @@ async def process_video(url, headless=True, auto_mode=True):
                 if success:
                     # Run Plugins
                     plugin_manager = PluginManager()
-                    temp_filename = plugin_manager.run_plugins(temp_filename)
+                    new_temp_filename = plugin_manager.run_plugins(temp_filename)
                     
+                    # Check if plugin moved the file out of temp_downloads
+                    # If the returned path is NOT in temp_dir, assume plugin handled the final move
+                    if not os.path.abspath(new_temp_filename).startswith(os.path.abspath(temp_dir)):
+                        log(f"\n✅ Plugin handled final move. File located at: {new_temp_filename}")
+                        # Cleanup txt file if it exists in the default location
+                        if os.path.exists(txt_filename):
+                            try:
+                                os.remove(txt_filename)
+                            except:
+                                pass
+                        # Cleanup empty default directory if we created it and it's empty
+                        try:
+                            if os.path.exists(final_dir) and not os.listdir(final_dir):
+                                os.rmdir(final_dir)
+                        except:
+                            pass
+                        return True
+                    
+                    temp_filename = new_temp_filename
                     # Update final filename extension if plugin changed it
                     _, ext_temp = os.path.splitext(temp_filename)
                     base_final, ext_final = os.path.splitext(final_filename)
                     if ext_temp.lower() != ext_final.lower():
                         final_filename = f"{base_final}{ext_temp}"
 
-                    print(f"\n🚚 Moving file to final destination...")
-                    print(f"   From: {temp_filename}")
-                    print(f"   To:   {final_filename}")
+                    log(f"\n🚚 Moving file to final destination...")
+                    log(f"   From: {temp_filename}")
+                    log(f"   To:   {final_filename}")
                     try:
                         if os.path.exists(final_filename):
                             os.remove(final_filename)
                         shutil.move(temp_filename, final_filename)
-                        print(f"✅ Move complete.")
+                        log(f"✅ Move complete.")
                         
                         if os.path.exists(txt_filename):
                             try:
@@ -603,34 +753,34 @@ async def process_video(url, headless=True, auto_mode=True):
                                 
                         return True
                     except Exception as e:
-                        print(f"❌ Error moving file: {e}")
+                        log(f"❌ Error moving file: {e}")
                         return False
                 
                 if not success:
-                    print("\n📋 Manual command (try running this in terminal):")
-                    print(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG["download_speed"] if "CONFIG" in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                    log("\n📋 Manual command (try running this in terminal):")
+                    log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
                 return success
             else:
-                print(f"\n📋 Manual command:")
-                print(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG["download_speed"] if "CONFIG" in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                log(f"\n📋 Manual command:")
+                log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
                 return True
         else:
-            print("\n❌ yt-dlp not found")
-            print(f"\n📋 Save this command:")
-            print(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG["download_speed"] if "CONFIG" in globals() else DOWNLOAD_SPEED} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+            log("\n❌ yt-dlp not found")
+            log(f"\n📋 Save this command:")
+            log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
             return True
         
     else:
         if headless:
-            print("\n⚠️  Headless capture failed. Retrying in visible mode to bypass Cloudflare...")
+            log("\n⚠️  Headless capture failed. Retrying in visible mode to bypass Cloudflare...")
             return await process_video(url, headless=False, auto_mode=auto_mode)
             
-        print("❌ FAILED - No master.m3u8 found")
+        log("❌ FAILED - No master.m3u8 found")
         return False
 
 async def get_imdb_info(imdb_id):
     url = f"https://www.imdb.com/title/{imdb_id}/"
-    print(f"🕵️  Scanning IMDB: {url}")
+    log(f"🕵️  Scanning IMDB: {url}")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -687,7 +837,7 @@ async def get_imdb_info(imdb_id):
             except:
                 pass
             
-            print("   📺 TV Series detected. Fetching season info...")
+            log("   📺 TV Series detected. Fetching season info...")
             await page.goto(f"https://www.imdb.com/title/{imdb_id}/episodes", timeout=30000)
             
             # Wait for season selector to load
@@ -721,13 +871,13 @@ async def get_imdb_info(imdb_id):
             return {'type': 'tv', 'title': title, 'seasons': total_seasons, 'total_episodes': total_episodes}
             
         except Exception as e:
-            print(f"⚠️  IMDB Scan failed: {e}")
+            log(f"⚠️  IMDB Scan failed: {e}")
             await browser.close()
             return None
 
 async def get_season_episodes(imdb_id, season):
     url = f"https://www.imdb.com/title/{imdb_id}/episodes?season={season}"
-    print(f"   📖 Fetching episode count for Season {season}...")
+    log(f"   📖 Fetching episode count for Season {season}...")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -758,15 +908,17 @@ def clear_session(reason=""):
         if reason:
             message += f" ({reason})"
         message += "..."
-        print(message)
+        log(message)
         try:
             shutil.rmtree("browser_session")
-            print("   ✅ Session cleared.")
+            log("   ✅ Session cleared.")
         except Exception as e:
-            print(f"   ⚠️ Failed to clear session: {e}")
+            log(f"   ⚠️ Failed to clear session: {e}")
 
 def load_config():
-    config_file = "config.json"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_file = os.path.join(script_dir, "config.json")
+    log_messages = []
     default_config = {
         "movies_dir": "",
         "tv_dir": "",
@@ -782,16 +934,11 @@ def load_config():
             with open(config_file, 'r') as f:
                 user_config = json.load(f)
                 default_config.update(user_config)
-                print("⚙️  Loaded config.json")
+                log_messages.append("⚙️  Loaded config.json")
         except Exception as e:
-            print(f"⚠️  Error loading config.json: {e}")
-    else:
-        # Optional: Create default config if missing
-        # with open(config_file, 'w') as f:
-        #     json.dump(default_config, f, indent=4)
-        pass
+            log_messages.append(f"⚠️  Error loading config.json: {e}")
         
-    return default_config
+    return default_config, log_messages
 
 async def scrape_imdb_chart(chart_type):
     """
@@ -866,10 +1013,13 @@ async def main():
     - Handles command line arguments (scraping, queue files, or single URLs).
     - Manages the queue loop and cooldowns.
     """
-    global CONFIG
-    CONFIG = load_config()
+    # Load config and set global
+    loaded_config, messages = load_config()
+    for msg in messages:
+        log(msg)
+    setup_interface(config_data=loaded_config)
     global COOLDOWN_RANGE
-    COOLDOWN_RANGE = (CONFIG['min_cooldown'], CONFIG['max_cooldown'])
+    COOLDOWN_RANGE = (loaded_config['min_cooldown'], loaded_config['max_cooldown'])
 
     # Default settings
     url = None
@@ -931,27 +1081,28 @@ async def main():
         with open(queue_file, 'r', encoding='utf-8') as f:
             urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         
-        print(f"📊 Found {len(urls)} items.")
+        print(f"📊 Found {len(urls)} items in queue.")
         
         completed_log = os.path.join(base_dir, "completed.log") if base_dir else "completed.log"
-        completed = set()
+        completed_urls = set()
+        completed_keys = set() # (imdb_id, season, episode)
+
         if os.path.exists(completed_log):
             with open(completed_log, 'r', encoding='utf-8') as f:
-                completed = set(line.strip() for line in f)
-
-        # Check for resume state
-        first_pending_idx = -1
-        for idx, u in enumerate(urls):
-            if u not in completed:
-                first_pending_idx = idx
-                break
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    completed_urls.add(line)
+                    
+                    # Smart matching extraction
+                    imdb_m = re.search(r'imdb=(tt\d+)', line)
+                    s_m = re.search(r'[?&]season=(\d+)', line)
+                    e_m = re.search(r'[?&]episode=(\d+)', line)
+                    if imdb_m and s_m and e_m:
+                        completed_keys.add((imdb_m.group(1), int(s_m.group(1)), int(e_m.group(1))))
         
-        if first_pending_idx > 0:
-            print(f"\n⚠️  Found progress in completed.log ({first_pending_idx} items done).")
-            print(f"   Last file did not download: {urls[first_pending_idx]}")
-            if (input("   Would you like to continue where we left off? (y/n) [default: y]: ").strip().lower() or 'y') != 'y':
-                print("👋 Exiting.")
-                return
+        if os.path.exists(completed_log):
+            print(f"\n📂 Found resume log with {len(completed_urls)} entries. Will skip completed items.")
 
         session_count = 0
         not_found_report = []
@@ -959,7 +1110,40 @@ async def main():
         for i, queue_url in enumerate(urls):
             print(f"\n{'='*20} Processing {i+1}/{len(urls)} {'='*20}")
             
-            if queue_url in completed:
+            is_completed = False
+            if queue_url in completed_urls:
+                is_completed = True
+            else:
+                imdb_m = re.search(r'imdb=(tt\d+)', queue_url)
+                s_m = re.search(r'[?&]season=(\d+)', queue_url)
+                e_m = re.search(r'[?&]episode=(\d+)', queue_url)
+                if imdb_m and s_m and e_m:
+                    if (imdb_m.group(1), int(s_m.group(1)), int(e_m.group(1))) in completed_keys:
+                        is_completed = True
+            
+            # File existence check (self-healing)
+            if not is_completed:
+                s_m = re.search(r'[?&]season=(\d+)', queue_url)
+                e_m = re.search(r'[?&]episode=(\d+)', queue_url)
+                if s_m and e_m:
+                    s_num = int(s_m.group(1))
+                    e_num = int(e_m.group(1))
+                    
+                    season_dir = os.path.join(base_dir, f"Season {s_num:02d}")
+                    if os.path.exists(season_dir):
+                        for f_name in os.listdir(season_dir):
+                            if f_name.endswith(".mkv") and f"S{s_num:02d}E{e_num:02d}" in f_name:
+                                print(f"⏭️  Skipping (file exists): {f_name}")
+                                is_completed = True
+                                try:
+                                    with open(completed_log, 'a', encoding='utf-8') as f_log:
+                                        f_log.write(f"{queue_url}\n")
+                                    completed_urls.add(queue_url)
+                                except Exception as log_e:
+                                    print(f"   ⚠️ Could not self-heal completed.log: {log_e}")
+                                break
+
+            if is_completed:
                 print(f"⏭️  Skipping (already completed): {queue_url}")
                 continue
             
@@ -1047,7 +1231,7 @@ async def main():
                             ep_count = await get_season_episodes(imdb_id, s)
                             print(f"\nSeason {s} has {ep_count} episodes.")
                             
-                            ep_input = input("Select Episodes ('all', '1-5', 'start: 3, end: 8') [default: all]: ").strip().lower() or "all"
+                            ep_input = input("Select Episodes ('all', '1-5', '5-') [default: all]: ").strip().lower() or "all"
                             
                             start_ep = 1
                             end_ep = ep_count
@@ -1056,13 +1240,12 @@ async def main():
                                 pass
                             elif '-' in ep_input:
                                 parts = ep_input.split('-')
-                                start_ep = int(parts[0].strip())
-                                end_ep = int(parts[1].strip())
-                            elif 'start' in ep_input:
-                                nums = re.findall(r'\d+', ep_input)
-                                if len(nums) >= 2:
-                                    start_ep = int(nums[0])
-                                    end_ep = int(nums[1])
+                                if parts[0].strip():
+                                    start_ep = int(parts[0].strip())
+                                if len(parts) > 1 and parts[1].strip():
+                                    end_ep = int(parts[1].strip())
+                                else:
+                                    end_ep = ep_count
                             elif ep_input.isdigit():
                                 start_ep = int(ep_input)
                                 end_ep = int(ep_input)
@@ -1086,6 +1269,54 @@ async def main():
                         series_dir = safe_title
                         
                     os.makedirs(series_dir, exist_ok=True)
+                    
+                    # Check for resume data to inform user
+                    completed_log = os.path.join(series_dir, "completed.log")
+                    skipped_count = 0
+                    resume_found = False
+                    existing_count = 0
+                    
+                    if os.path.exists(completed_log):
+                        try:
+                            resume_found = True
+                            existing_urls = set()
+                            existing_keys = set()
+                            with open(completed_log, 'r', encoding='utf-8') as f:
+                                for line in f:
+                                    line = line.strip()
+                                    if not line: continue
+                                    existing_urls.add(line)
+                                    imdb_m = re.search(r'imdb=(tt\d+)', line)
+                                    s_m = re.search(r'[?&]season=(\d+)', line)
+                                    e_m = re.search(r'[?&]episode=(\d+)', line)
+                                    if imdb_m and s_m and e_m:
+                                        existing_keys.add((imdb_m.group(1), int(s_m.group(1)), int(e_m.group(1))))
+                            existing_count = len(existing_urls)
+                            
+                            for link in queue_list:
+                                is_skipped = False
+                                if link in existing_urls:
+                                    is_skipped = True
+                                
+                                imdb_m = re.search(r'imdb=(tt\d+)', link)
+                                s_m = re.search(r'[?&]season=(\d+)', link)
+                                e_m = re.search(r'[?&]episode=(\d+)', link)
+                                if not is_skipped and imdb_m and s_m and e_m:
+                                    s_num, e_num = int(s_m.group(1)), int(e_m.group(1))
+                                    if (imdb_m.group(1), s_num, e_num) in existing_keys:
+                                        is_skipped = True
+                                    else:
+                                        season_dir_check = os.path.join(series_dir, f"Season {s_num:02d}")
+                                        if os.path.exists(season_dir_check):
+                                            for f_name in os.listdir(season_dir_check):
+                                                if f_name.endswith(".mkv") and f"S{s_num:02d}E{e_num:02d}" in f_name:
+                                                    is_skipped = True
+                                                    break
+                                if is_skipped:
+                                    skipped_count += 1
+                        except Exception as e:
+                            print(f"   ⚠️ Could not read resume data: {e}")
+
                     queue_filename = os.path.join(series_dir, f"{safe_title}.txt")
                     
                     with open(queue_filename, 'w', encoding='utf-8') as f:
@@ -1094,6 +1325,11 @@ async def main():
                             
                     print(f"\n✅ Queue saved to: {queue_filename}")
                     print(f"   Contains {len(queue_list)} items.")
+                    
+                    if resume_found:
+                        print(f"   📂 Found resume log with {existing_count} entries.")
+                        if skipped_count > 0:
+                            print(f"   ℹ️  {skipped_count} items are already in completed.log and will be skipped.")
                     
                     run_now = input("🚀 Start processing this queue now? (y/n) [default: y]: ").strip().lower() or 'y'
                     if run_now == 'y':
