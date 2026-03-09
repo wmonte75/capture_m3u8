@@ -440,6 +440,18 @@ class MasterM3U8Finder:
                 await asyncio.sleep(0.1)
             
             if self.master_url:
+                # Wait for the page title to become meaningful before extracting.
+                # On Linux, Chromium loads slower so the DOM may still be blank
+                # at this point even though the network stream was found.
+                for _ in range(12):  # poll up to 3s (12 x 250ms)
+                    try:
+                        t = await page.title()
+                        if t and t.strip() and t.lower() not in ("", "loading...", "untitled"):
+                            break
+                    except:
+                        pass
+                    await asyncio.sleep(0.25)
+
                 if self.title == "Unknown":
                     self.title = await self.extract_title(page)
                 log(f"   ⚡ Master URL found early. Skipping iframe scan.")
