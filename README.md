@@ -22,7 +22,7 @@ A powerful Python tool to automatically detect, capture, and download M3U8 video
 ## 🛠️ Prerequisites
 
 - **Python 3.8+**
-- **yt-dlp**: The tool looks for `yt-dlp.exe` in the script directory or system PATH.
+- **yt-dlp**: The tool looks for `yt-dlp.exe` or `yt-dlp` in the script directory or system PATH.
 
 ## 📦 Installation
 
@@ -114,14 +114,18 @@ nohup python3 capture_m3u8_gui.py > /dev/null 2>&1 &
 ### Interface Guide
 
 1.  **Input Section**
-    -   **URL Field**: Paste a video URL or an IMDB link. Supports a right-click context menu (Cut/Copy/Paste).
+    -   **URL Field**: Paste a video URL or an IMDB link. You can also type a movie/series name and press **Enter** to search IMDB directly. Results include full metadata and movie posters. Supports a right-click context menu (Cut/Copy/Paste).
     -   **Start / Analyze**: Begins the detection and download process.
     -   **Stop**: Immediately halts the active download or search.
+    -   **Check Availability**: Paste an IMDB link and click this button to quickly check if the title is available on the streaming source. Detects movie vs. TV automatically and shows a result popup. No download is started.
+    -   **Load Queue**: Load a `.txt` file with one URL per line to batch-process multiple titles sequentially.
+    -   **Top 250 Movies**: Scrape and download IMDB's Top 250 movie list.
 
 2.  **Configuration Panel**
     -   **Movies / TV Folders**: Browse and select where to save your downloads.
     -   **Cooldown**: Set a random delay range (in seconds) between episodes. Settings are saved automatically.
     -   **Speed**: Limit download bandwidth (e.g., 6M, 10M, Unlimited) to prevent network congestion.
+    -   **Processing Label**: Located next to the Speed dropdown. Displays `Processing file: X/Y` in real-time during batch or queue downloads, and resets to `Status: Idle` when finished.
     -   **Headless Mode**:
         -   ✅ **Checked**: Runs the browser in the background (invisible).
         -   ⬜ **Unchecked**: Shows the browser window. Use this if you need to manually solve a CAPTCHA.

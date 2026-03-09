@@ -9,7 +9,10 @@ import json
 import random
 import importlib.util
 import io
+import urllib.parse
 from contextlib import redirect_stdout
+import requests
+from bs4 import BeautifulSoup
 
 # Define common User-Agent to match browser and yt-dlp to avoid 403/429 errors
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -940,7 +943,108 @@ def load_config():
         
     return default_config, log_messages
 
-async def scrape_imdb_chart(chart_type):
+async def search_imdb(query, filter_type='all'):
+    """
+    Searches IMDB for a query and returns a list of candidates.
+    """
+    encoded_query = urllib.parse.quote(query)
+    # Exact URL format as requested
+    url = f"https://www.imdb.com/find/?q={encoded_query}"
+    
+    log(f"🔎 Searching IMDB for: {query} (Encoded: {encoded_query})")
+    log(f"   🔗 Link: {url}")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, "html.parser")
+        results = []
+        
+        # Target the 'li' items first to ensure we have the container
+        items = soup.find_all('li', class_='ipc-metadata-list-summary-item')
+
+        for item in items:
+            try:
+                # Look for the title link specifically
+                link_tag = item.find('a', class_='ipc-title-link-wrapper')
+                if not link_tag:
+                    for a in item.find_all('a'):
+                        if 'title' in a.get('href', '') and a.get_text().strip():
+                            link_tag = a
+                            break
+                            
+                img_tag = item.find('img')
+                
+                if link_tag and 'title' in link_tag.get('href', ''):
+                    title = link_tag.get_text().strip()
+                    href = link_tag.get('href').split('?')[0]
+                    
+                    if href.startswith('/'):
+                        link = "https://www.imdb.com" + href
+                    else:
+                        link = href
+                    
+                    img_url = img_tag.get('src') if img_tag else "No Image"
+                    
+                    # Log in the requested format
+                    log(f"{img_url}: {title} - {link}")
+                    
+                    match = re.search(r'(tt\d+)', link)
+                    if not match: continue
+                    imdb_id = match.group(1)
+
+                    # Get metadata (dates, etc.)
+                    meta_elements = item.find_all(lambda tag: tag.name in ['li', 'span'] and tag.get('class') and any(c in tag.get('class') for c in ['ipc-inline-list__item', 'ipc-metadata-list-summary-item__li', 'cli-title-metadata-item', 'cli-title-type-data']))
+                    meta_str = " | ".join([m.get_text().strip() for m in meta_elements]) if meta_elements else ""
+
+                    results.append({'title': title.strip(), 'meta': meta_str, 'url': link, 'id': imdb_id, 'img': img_url})
+                    
+                    if len(results) >= 20:
+                        break
+            except:
+                continue
+        
+        return results
+
+    except Exception as e:
+        log(f"❌ Search error: {e}")
+        return []
+
+def get_title_details(url):
+    """
+    Fetches details (Year) from a specific IMDB title page.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, "html.parser")
+            
+            year = ""
+            # Try to find year in metadata list
+            meta_ul = soup.find('ul', attrs={'data-testid': 'hero-title-block__metadata'})
+            if meta_ul:
+                for li in meta_ul.find_all('li'):
+                    text = li.get_text()
+                    if re.search(r'\b(19|20)\d{2}\b', text):
+                        year = text
+                        break
+            
+            return {'year': year}
+    except:
+        pass
+    return {'year': ''}
+
+async def scrape_imdb_chart(chart_type, limit=250):
     """
     Scrapes IMDB Top 250 lists (Movies or TV).
     - Extracts links.
@@ -955,8 +1059,8 @@ async def scrape_imdb_chart(chart_type):
         output_file = "imdb_top_250_tv.txt"
         label = "Top 250 TV Shows"
     
-    print(f"🚀 Starting scrape of: {label}")
-    print(f"   URL: {url}")
+    log(f"🚀 Starting scrape of: {label}")
+    log(f"   URL: {url}")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -964,7 +1068,7 @@ async def scrape_imdb_chart(chart_type):
         
         try:
             await page.goto(url, timeout=60000)
-            print("   Page loaded. Scanning list...")
+            log("   Page loaded. Scanning list...")
             
             try:
                 await page.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
@@ -974,35 +1078,32 @@ async def scrape_imdb_chart(chart_type):
             # Extract links
             links = await page.locator('.ipc-metadata-list-summary-item a.ipc-title-link-wrapper').all()
             count = len(links)
-            print(f"   Found {count} items.")
+            log(f"   Found {count} items.")
             
+            results = []
             if count > 0:
-                limit_input = input(f"   How many items to scrape? (1-{count}) [default: 10]: ").strip()
-                limit = int(limit_input) if limit_input.isdigit() else 10
+                if limit and count > limit:
+                    links = links[:limit]
                 
-                links = links[:limit]
-                
-                urls = []
                 for link in links:
                     href = await link.get_attribute('href')
+                    title = await link.inner_text()
+                    # Clean title (remove "1. " rank)
+                    title = re.sub(r'^\d+\.\s+', '', title)
+                    
                     if href:
                         clean_url = "https://www.imdb.com" + href.split('?')[0]
-                        urls.append(clean_url)
+                        results.append({'title': title, 'url': clean_url})
                 
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    for u in urls:
-                        f.write(f"{u}\n")
-                
-                print(f"✅ Saved {len(urls)} links to {output_file}")
-                
-                run_now = input(f"🚀 Start downloading {label} now? (y/n) [default: y]: ").strip().lower() or 'y'
-                if run_now == 'y':
-                    subprocess.run([sys.executable, "capture_m3u8.py", output_file])
+                log(f"✅ Scraped {len(results)} items.")
+                return results
             else:
-                print("❌ No items found. IMDB layout might have changed.")
+                log("❌ No items found. IMDB layout might have changed.")
+                return []
                 
         except Exception as e:
-            print(f"❌ Error during scrape: {e}")
+            log(f"❌ Error during scrape: {e}")
+            return []
         finally:
             await browser.close()
 
@@ -1042,10 +1143,29 @@ async def main():
                 print("❌ yt-dlp executable not found.")
             return
         elif input_arg == 'scrapemovie':
-            await scrape_imdb_chart('movie')
+            results = await scrape_imdb_chart('movie')
+            # Legacy CLI support: save to file
+            if results:
+                with open("imdb_top_250_movies.txt", 'w', encoding='utf-8') as f:
+                    for item in results:
+                        f.write(f"{item['url']}\n")
+                print(f"Saved to imdb_top_250_movies.txt")
+                
+                run_now = input(f"🚀 Start downloading Top 250 Movies now? (y/n) [default: y]: ").strip().lower() or 'y'
+                if run_now == 'y':
+                    subprocess.run([sys.executable, "capture_m3u8.py", "imdb_top_250_movies.txt"])
             return
         elif input_arg == 'scrapetv':
-            await scrape_imdb_chart('tv')
+            results = await scrape_imdb_chart('tv')
+            if results:
+                with open("imdb_top_250_tv.txt", 'w', encoding='utf-8') as f:
+                    for item in results:
+                        f.write(f"{item['url']}\n")
+                print(f"Saved to imdb_top_250_tv.txt")
+                
+                run_now = input(f"🚀 Start downloading Top 250 TV Shows now? (y/n) [default: y]: ").strip().lower() or 'y'
+                if run_now == 'y':
+                    subprocess.run([sys.executable, "capture_m3u8.py", "imdb_top_250_tv.txt"])
             return
         elif input_arg.endswith('.txt'):
             queue_mode = True
