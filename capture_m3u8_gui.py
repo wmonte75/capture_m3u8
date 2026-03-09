@@ -329,6 +329,7 @@ class M3U8DownloaderApp(ctk.CTk):
         self.stop_btn.configure(state="normal")
         self.top250_btn.configure(state="disabled")
         self.queue_btn.configure(state="disabled")
+        self.check_btn.configure(state="disabled")
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
@@ -359,9 +360,11 @@ class M3U8DownloaderApp(ctk.CTk):
             self.is_running = False
             self.stop_event.clear()
             self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
+            self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
+            self.after(0, lambda: self.stop_btn.configure(state="disabled"))
             self.after(0, lambda: self.top250_btn.configure(state="normal"))
             self.after(0, lambda: self.queue_btn.configure(state="normal"))
-            self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
+            self.after(0, lambda: self.check_btn.configure(state="normal"))
 
     async def handle_imdb_series(self, imdb_id, original_url):
         self.log_callback(f"🕵️  Analyzing IMDB Series: {imdb_id}...\n")
@@ -698,8 +701,10 @@ class M3U8DownloaderApp(ctk.CTk):
             # Start batch process
             self.is_running = True
             self.start_btn.configure(state="disabled")
+            self.stop_btn.configure(state="normal")
             self.top250_btn.configure(state="disabled")
             self.queue_btn.configure(state="disabled")
+            self.check_btn.configure(state="disabled")
             self.log_box.configure(state="normal")
             self.log_box.delete("1.0", "end")
             self.log_box.configure(state="disabled")
@@ -734,10 +739,11 @@ class M3U8DownloaderApp(ctk.CTk):
             self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
             self.is_running = False
             self.stop_event.clear()
-            self.after(0, lambda: self.start_btn.configure(state="normal"))
+            self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
+            self.after(0, lambda: self.stop_btn.configure(state="disabled"))
             self.after(0, lambda: self.top250_btn.configure(state="normal"))
             self.after(0, lambda: self.queue_btn.configure(state="normal"))
-            self.after(0, lambda: self.start_btn.configure(text="Start / Analyze"))
+            self.after(0, lambda: self.check_btn.configure(state="normal"))
 
     def load_queue(self):
         if self.is_running: return
@@ -759,8 +765,10 @@ class M3U8DownloaderApp(ctk.CTk):
             
         self.is_running = True
         self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
         self.top250_btn.configure(state="disabled")
         self.queue_btn.configure(state="disabled")
+        self.check_btn.configure(state="disabled")
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
@@ -885,10 +893,11 @@ class M3U8DownloaderApp(ctk.CTk):
             self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
             self.is_running = False
             self.stop_event.clear()
-            self.after(0, lambda: self.start_btn.configure(state="normal"))
+            self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
+            self.after(0, lambda: self.stop_btn.configure(state="disabled"))
             self.after(0, lambda: self.top250_btn.configure(state="normal"))
             self.after(0, lambda: self.queue_btn.configure(state="normal"))
-            self.after(0, lambda: self.start_btn.configure(text="Start / Analyze"))
+            self.after(0, lambda: self.check_btn.configure(state="normal"))
 
     def on_closing(self):
         self.save_settings()
