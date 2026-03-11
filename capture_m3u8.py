@@ -1,8 +1,7 @@
-import asyncio
-from playwright.async_api import async_playwright
-import re
 import os
 import sys
+import asyncio
+import re
 import shutil
 import subprocess
 import json
@@ -11,11 +10,64 @@ import importlib.util
 import io
 import urllib.parse
 from contextlib import redirect_stdout
-import requests
-from bs4 import BeautifulSoup
 
-# Define common User-Agent to match browser and yt-dlp to avoid 403/429 errors
-USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+# Dependency Check
+try:
+    from playwright.async_api import async_playwright
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError as e:
+    missing_module = str(e).split("'")[1] if "'" in str(e) else str(e)
+    print(f"\n❌ Missing required Python library: {missing_module}")
+    print("\nPlease install the missing requirements to run this script.")
+    if sys.platform.startswith('linux') or sys.platform == 'darwin':
+        print("\nRun this command in your terminal:")
+        print("    python3 -m pip install -r requirements.txt\n")
+    else:
+        print("\nRun this command in your command prompt/terminal:")
+        print("    pip install -r requirements.txt\n")
+    sys.exit(1)
+
+def get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+# Set Playwright to download and look for browsers in the local directory
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(get_base_dir(), "playwright_browsers")
+
+def ensure_playwright_browsers():
+    """Download Playwright browsers if they don't exist locally."""
+    browsers_path = os.environ["PLAYWRIGHT_BROWSERS_PATH"]
+    # Check if the folder exists and has contents (meaning browsers are downloaded)
+    if not os.path.exists(browsers_path) or not os.listdir(browsers_path):
+        os.makedirs(browsers_path, exist_ok=True)
+        browsers_to_install = ["firefox"] if sys.platform.startswith('linux') else ["chromium"]
+        
+        log(f"\n🌐 First run detected: Downloading required browser engines ({', '.join(browsers_to_install)})...")
+        log("   This may take a minute or two but only happens once.")
+        try:
+            from playwright._impl._driver import compute_driver_executable, get_driver_env
+            driver_executable, driver_cli = compute_driver_executable()
+            env = get_driver_env()
+            
+            for browser in browsers_to_install:
+                log(f"   ⬇️  Downloading {browser}...")
+                subprocess.run([driver_executable, driver_cli, "install", browser], env=env, check=True)
+                
+            log("   ✅ Browser engines downloaded successfully!\n")
+        except Exception as e:
+            log(f"   ❌ Failed to download browser engines: {e}\n")
+
+# User-Agent matched to the actual OS to avoid fingerprint mismatch detection.
+# Sites like vidsrcme.ru cross-check the UA OS against the real OS and block
+# when they don't match (e.g. Windows UA running on Linux → about:blank).
+if sys.platform.startswith('linux'):
+    USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+elif sys.platform == 'darwin':
+    USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+else:
+    USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 # Download speed limit to avoid 429 "Too Many Requests" errors (e.g., '5M', '10M', '15M', '20M')
 DOWNLOAD_SPEED = '6M'
@@ -55,7 +107,7 @@ def check_stop():
 
 class PluginManager:
     def __init__(self):
-        self.plugins_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
+        self.plugins_dir = os.path.join(get_base_dir(), "plugins")
 
     def run_plugins(self, file_path):
         """
@@ -199,7 +251,7 @@ class MasterM3U8Finder:
     async def save_cookies(self, context):
         """Save session cookies to Netscape format for yt-dlp"""
         try:
-            cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+            cookie_file = os.path.join(get_base_dir(), 'cookies.txt')
             cookies = await context.cookies()
             with open(cookie_file, 'w', encoding='utf-8') as f:
                 f.write("# Netscape HTTP Cookie File\n")
@@ -220,7 +272,13 @@ class MasterM3U8Finder:
         for url in self.candidates:
             if url in self.bad_candidates:
                 continue
-            
+
+            # Skip template placeholder URLs like https://tmstr3.{v1}/...
+            # These are unresolved JS variables found in raw page source — not real hostnames.
+            if '{' in url or '}' in url:
+                self.bad_candidates.add(url)
+                continue
+
             if url == self.master_url:
                 return url
 
@@ -262,13 +320,15 @@ class MasterM3U8Finder:
             '--write-subs',
             '--all-subs',
             '--sub-langs', CONFIG['subtitle_langs'] if 'CONFIG' in globals() and 'subtitle_langs' in CONFIG else 'all',
+            '--fragment-retries', '10',  # Don't retry forever if the stream is dead
+            '--skip-unavailable-fragments', # Skip segments that return no data blocks
             '-o', output_file,
         ]
         
         # Optional: Use cookies from browser if available (helps with some sites)
         if use_cookies:
             cmd.extend(['--user-agent', USER_AGENT])
-            cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+            cookie_file = os.path.join(get_base_dir(), 'cookies.txt')
             if os.path.exists(cookie_file):
                 log("   🍪 Using captured browser cookies...")
                 cmd.extend(['--cookies', cookie_file])
@@ -347,7 +407,7 @@ class MasterM3U8Finder:
                     raise
 
             if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                report_status(f"{status_prefix}Downloading 100%")
+                report_status(f"{status_prefix}Downloading 100.0%")
                 log(f"\n✅ Download complete: {output_file}")
                 size = os.path.getsize(output_file) / (1024*1024)
                 log(f"   File size: {size:.1f} MB")
@@ -374,54 +434,107 @@ class MasterM3U8Finder:
         log(f"🖥️  Browser mode: {mode}\n")
         
         # Use a persistent user data directory to save cookies/session
-        user_data_dir = os.path.abspath("browser_session")
+        # Use get_base_dir() so the session folder lives next to the .exe, not in CWD
+        user_data_dir = os.path.join(get_base_dir(), "browser_session")
         if not os.path.exists(user_data_dir):
             os.makedirs(user_data_dir)
 
+        # Ensure browsers are downloaded before launching
+        ensure_playwright_browsers()
+
         async with async_playwright() as p:
-            # Use launch_persistent_context to maintain state and avoid detection
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=headless,
-                viewport=None if not headless else {'width': 1280, 'height': 720},
-                user_agent=USER_AGENT,
-                bypass_csp=True,
-                args=[
-                    '--disable-web-security',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                    '--autoplay-policy=no-user-gesture-required',
-                    '--disable-blink-features=AutomationControlled',
-                    '--start-minimized',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--disable-background-timer-throttling',
-                ],
-                ignore_default_args=["--enable-automation"]
-            )
+            if sys.platform.startswith('linux'):
+                # Use Firefox on Linux — different TLS/browser fingerprint bypasses
+                # Cloudflare bot detection that blocks Chromium headless on Linux.
+                # Windows/Mac continue to use Chromium (proven working, unchanged).
+                context = await p.firefox.launch_persistent_context(
+                    user_data_dir,
+                    headless=headless,
+                    user_agent=USER_AGENT,
+                    firefox_user_prefs={
+                        # Block JS popup windows
+                        "dom.popup_allowed_events": "",
+                        "dom.disable_open_during_load": True,
+                        # Suppress alerts/confirms/prompts
+                        "dom.disable_beforeunload": True,
+                        # Allow autoplay so the video starts without a click
+                        "media.autoplay.default": 0,
+                        "media.autoplay.blocking_policy": 0,
+                        # Force all popup windows into tabs (easier to close)
+                        "browser.link.open_newwindow": 3,
+                        "browser.link.open_newwindow.restriction": 0,
+                    }
+                )
+
+                # Auto-close any ad popups or new tabs that open
+                def _close_extra_page(new_page):
+                    asyncio.ensure_future(new_page.close())
+                context.on("page", _close_extra_page)
+            else:
+                # Chromium for Windows / Mac — proven working, unchanged
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir,
+                    headless=headless,
+                    viewport=None if not headless else {'width': 1280, 'height': 720},
+                    user_agent=USER_AGENT,
+                    bypass_csp=True,
+                    args=[
+                        '--disable-web-security',
+                        '--disable-features=IsolateOrigins,site-per-process',
+                        '--autoplay-policy=no-user-gesture-required',
+                        '--disable-blink-features=AutomationControlled',
+                        # Only minimize in headless mode. In visible mode, a minimized window
+                        # prevents Cloudflare from completing its JS challenge → about:blank
+                        *(['--start-minimized'] if headless else []),
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-background-timer-throttling',
+                    ],
+                    ignore_default_args=["--enable-automation"]
+                )
             
             page = context.pages[0] if context.pages else await context.new_page()
 
-            title_found = False
-            
-            async def handle_route(route, request):
+            # Block unpkg.com across all pages/iframes in this context
+            async def block_unpkg(route):
+                await route.abort()
+            await context.route("**/*unpkg.com*", block_unpkg)
+
+            # Use a lightweight event listener instead of route interception.
+            # context.on('request') fires for ALL requests across every page,
+            # sub-iframe and popup in the session — without intercepting or
+            # slowing them down. This catches m3u8 URLs from nested iframes.
+            def on_request(request):
                 url = request.url
-                if 'master.m3u8' in url.lower():
-                    if url not in self.candidates:
-                        log(f"   🔎 Candidate found: {url[:80]}")
-                        self.candidates.append(url)
-                    
-                    nonlocal title_found
-                    if not title_found:
-                        try:
-                            self.title = await self.extract_title(page)
-                            title_found = True
-                            log(f"📝 Title identified: {self.title}")
-                        except:
-                            pass
-                            
-                await route.continue_()
-            
-            await page.route("**/*", handle_route)
+                if 'master.m3u8' in url.lower() and url not in self.candidates:
+                    log(f"   🔎 Candidate found: {url[:80]}")
+                    self.candidates.append(url)
+
+            context.on("request", on_request)
+
+            # Inject safe stealth overrides. Only the 4 known-safe properties —
+            # permissions.query and navigator.platform overrides were found to
+            # interfere with cloudnestra's player JavaScript on Windows.
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [
+                        { name: 'Chrome PDF Plugin' },
+                        { name: 'Chrome PDF Viewer' },
+                        { name: 'Native Client' }
+                    ]
+                });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
+
+                // Fix HeadlessChrome in userAgent without recursion (Linux headless)
+                try {
+                    const _origUA = Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get.call(navigator);
+                    Object.defineProperty(navigator, 'userAgent', {
+                        get: () => _origUA.replace('HeadlessChrome', 'Chrome')
+                    });
+                } catch(e) {}
+            """)
             
             log("Step 1: Loading main page...")
             try:
@@ -438,6 +551,33 @@ class MasterM3U8Finder:
                     self.master_url = verified
                     break
                 await asyncio.sleep(0.1)
+
+            # If no m3u8 yet, try clicking the iframe element on the main page
+            # to activate / wake up the embedded video player.
+            # Firefox headless requires this — the iframe stays on its loading
+            # spinner until it receives a user interaction event.
+            if not self.master_url:
+                try:
+                    iframes = page.locator('iframe')
+                    count = await iframes.count()
+                    for i in range(count):
+                        try:
+                            await iframes.nth(i).click(timeout=1000)
+                            break  # One click is enough to wake the player
+                        except:
+                            continue
+                except:
+                    pass
+
+                # Extended wait after click — give the now-activated iframe time
+                # to load the video player and make its m3u8 network request.
+                for _ in range(300):  # 30s max
+                    check_stop()
+                    verified = await self.get_working_url(context)
+                    if verified:
+                        self.master_url = verified
+                        break
+                    await asyncio.sleep(0.1)
             
             if self.master_url:
                 # Wait for the page title to become meaningful before extracting.
@@ -479,10 +619,29 @@ class MasterM3U8Finder:
                 try:
                     url = frame.url
                     if url and url != start_url and 'about:blank' not in url:
-                        # Filter out Cloudflare/Turnstile/Captcha iframes
-                        if any(x in url.lower() for x in ['cloudflare', 'turnstile', 'recaptcha']):
+                        # Skip known bot/captcha/tracking/ad domains
+                        # Firefox doesn't block these by default, so they show as iframes
+                        skip_domains = [
+                            'cloudflare', 'turnstile', 'recaptcha',
+                            'dtscout.com', 'lijit.com', 'sharethis.com',
+                            'crwdcntrl.net', 'intentiq.com', 'doubleclick.net',
+                            'googlesyndication.com', 'amazon-adsystem.com',
+                            'facebook.com/tr', 'google-analytics.com',
+                            'scorecardresearch.com', 'quantserve.com',
+                            'adnxs.com', 'rubiconproject.com', 'pubmatic.com',
+                        ]
+                        if any(x in url.lower() for x in skip_domains):
                             continue
-                            
+
+                        # Only keep iframes that look like video embeds
+                        video_patterns = [
+                            'cloudnestra', 'vidsrc', '/embed/', '/rcp/', '/prorcp/',
+                            'streamtape', 'doodstream', 'filemoon', 'mixdrop',
+                            'upstream', 'vidplay', 'mycloud', 'mp4upload',
+                        ]
+                        if not any(x in url.lower() for x in video_patterns):
+                            continue
+
                         log(f"   Found iframe: {url[:80]}")
                         iframe_urls.append(url)
                 except:
@@ -490,7 +649,7 @@ class MasterM3U8Finder:
             
             if not self.master_url and iframe_urls:
                 log(f"\nStep 3: Checking {len(iframe_urls)} iframe(s)...")
-                
+
                 if len(iframe_urls) > 1:
                     if headless:
                         log(f"⚠️  Multiple sources detected ({len(iframe_urls)}) in headless mode. Switching to visible...")
@@ -500,7 +659,7 @@ class MasterM3U8Finder:
                     log(f"\n⚠️  Multiple sources detected ({len(iframe_urls)}). Needs human input.")
                     for i, url in enumerate(iframe_urls):
                         log(f"   {i+1}: {url}")
-                    
+
                     choice = get_user_input(f"\nSelect source (1-{len(iframe_urls)}) or Press Enter to scan all: ").strip()
                     if choice.isdigit():
                         idx = int(choice) - 1
@@ -512,42 +671,65 @@ class MasterM3U8Finder:
                     check_stop()
                     if self.master_url:
                         break
-                        
+
                     log(f"   Navigating to: {iframe_url[:80]}...")
                     try:
-                        # Set Referer to bypass hotlink protection
                         await page.set_extra_http_headers({'Referer': start_url})
                         timeout = 10000 if headless else 15000
                         await page.goto(iframe_url, wait_until="domcontentloaded", timeout=timeout)
-                        
+
                         if headless and self.master_url:
                             break
-                        
+
                         iframe_title = await self.extract_title(page)
                         if iframe_title != "Unknown" and self.title == "Unknown":
                             self.title = iframe_title
                             log(f"   📝 Iframe Title: {self.title}")
-                        
-                        await page.evaluate("""() => {
-                            const video = document.querySelector('video');
-                            if (video) {
-                                video.muted = true;
-                                video.play().catch(e => {});
-                            }
-                            const btn = document.querySelector('.vjs-big-play-button, .play-button, [class*="play"]');
-                            if (btn) btn.click();
-                        }""")
-                        
+
+                        # JS evaluate click — primary method (works on Windows + non-Linux)
+                        try:
+                            await page.evaluate("""() => {
+                                const video = document.querySelector('video');
+                                if (video) { video.muted = true; video.play().catch(e => {}); }
+                                const btn = document.querySelector('.vjs-big-play-button, .play-button, [class*="play"]');
+                                if (btn) btn.click();
+                            }""")
+                        except:
+                            pass
+
+                        # Also try Playwright native click
+                        play_selectors = [
+                            '.vjs-big-play-button', '.play-button',
+                            'button[class*="play"]', '[class*="play"][role="button"]', 'video',
+                        ]
+                        for sel in play_selectors:
+                            try:
+                                if await page.locator(sel).count() > 0:
+                                    await page.locator(sel).first.click(timeout=1000)
+                                    break
+                            except:
+                                continue
+
                         if headless:
-                            for _ in range(20): # Max 2s wait, check every 0.1s
+                            for tick in range(150):  # Max 15s wait, check every 0.1s
                                 verified = await self.get_working_url(context)
                                 if verified:
                                     self.master_url = verified
                                     break
+                                if tick > 0 and tick % 30 == 0:
+                                    try:
+                                        await page.evaluate("""() => {
+                                            const video = document.querySelector('video');
+                                            if (video) { video.muted = true; video.play().catch(()=>{}); }
+                                            const btn = document.querySelector('.vjs-big-play-button, .play-button, [class*="play"]');
+                                            if (btn) btn.click();
+                                        }""")
+                                    except:
+                                        pass
                                 await asyncio.sleep(0.1)
                         else:
                             await asyncio.sleep(5)
-                        
+
                     except Exception as e:
                         log(f"      Error: {str(e)[:60]}")
                         continue
@@ -582,7 +764,10 @@ def get_output_paths(title, url):
     
     if season_match:
         # TV Series
-        base_dir = CONFIG.get('tv_dir', ".")
+        base_dir = CONFIG.get('tv_dir')
+        if not base_dir or base_dir == ".":
+            base_dir = os.path.join(get_base_dir(), "TV")
+            
         season_num = int(season_match.group(1))
         episode_num = int(episode_match.group(1)) if episode_match else 0
         
@@ -599,7 +784,10 @@ def get_output_paths(title, url):
         filename = f"{clean_title}.S{season_num:02d}E{episode_num:02d}.mkv"
     else:
         # Movie
-        base_dir = CONFIG.get('movies_dir', ".")
+        base_dir = CONFIG.get('movies_dir')
+        if not base_dir or base_dir == ".":
+            base_dir = os.path.join(get_base_dir(), "Movie")
+            
         final_dir = os.path.join(base_dir, safe_title)
         filename = f"{safe_title}.mkv"
         
@@ -664,7 +852,7 @@ async def process_video(url, headless=True, auto_mode=True):
         final_filename = os.path.join(final_dir, filename)
             
         # Setup Temp Directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = get_base_dir()
         temp_dir = os.path.join(script_dir, "temp_downloads")
         os.makedirs(temp_dir, exist_ok=True)
         temp_filename = os.path.join(temp_dir, f"{safe_title}.mkv")
@@ -714,7 +902,7 @@ async def process_video(url, headless=True, auto_mode=True):
                     log("\n⚠️  First attempt failed. Trying with browser cookies...")
                     success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename, use_cookies=True, status_prefix=status_prefix)
                 
-                cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+                cookie_file = os.path.join(get_base_dir(), 'cookies.txt')
                 if os.path.exists(cookie_file):
                     try:
                         os.remove(cookie_file)
@@ -797,18 +985,34 @@ async def get_imdb_info(imdb_id):
     url = f"https://www.imdb.com/title/{imdb_id}/"
     log(f"🕵️  Scanning IMDB: {url}")
     
+    # Ensure browsers are downloaded before launching
+    ensure_playwright_browsers()
+    
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        if sys.platform.startswith('linux'):
+            browser = await p.firefox.launch(headless=True)
+        else:
+            browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(user_agent=USER_AGENT)
         
         try:
-            await page.goto(url, timeout=30000)
+            try:
+                # Use domcontentloaded + shorter timeout for faster metadata extraction
+                # IMDB is heavy with ads/tracking that cause full 'load' to timeout.
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                log(f"   ⚠️ IMDB load warning: {str(e)[:100]}")
+                # We continue anyway as the title and basic meta might already be in the DOM
+            
             title = await page.title()
             title = re.sub(r'\s*[-|]\s*IMDb.*', '', title).strip()
             
             # Fallback if title is empty
             if not title:
-                title = await page.locator('h1').first.inner_text()
+                try:
+                    title = await page.locator('h1').first.inner_text()
+                except:
+                    title = "Unknown"
             
             # Extract Year
             year = ""
@@ -827,12 +1031,8 @@ async def get_imdb_info(imdb_id):
                 title = f"{title} ({year})"
             
             is_tv = False
-            # Wait for potential dynamic content
-            try:
-                await page.wait_for_load_state('networkidle', timeout=5000)
-            except:
-                pass
-
+            
+            # Check for series markers
             if await page.locator('text=Episode Guide').count() > 0 or \
                await page.locator('a[href*="episodes"]').count() > 0 or \
                await page.locator('[data-testid="hero-subnav-bar-season-episode-picker"]').count() > 0:
@@ -853,7 +1053,7 @@ async def get_imdb_info(imdb_id):
                 pass
             
             log("   📺 TV Series detected. Fetching season info...")
-            await page.goto(f"https://www.imdb.com/title/{imdb_id}/episodes", timeout=30000)
+            await page.goto(f"https://www.imdb.com/title/{imdb_id}/episodes", wait_until="domcontentloaded", timeout=45000)
             
             # Wait for season selector to load
             try:
@@ -895,11 +1095,14 @@ async def get_season_episodes(imdb_id, season):
     log(f"   📖 Fetching episode count for Season {season}...")
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        if sys.platform.startswith('linux'):
+            browser = await p.firefox.launch(headless=True)
+        else:
+            browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(user_agent=USER_AGENT)
         
         try:
-            await page.goto(url, timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
             try:
                 await page.wait_for_selector('.list_item, article.episode-item-wrapper, [data-testid="episodes-browse-episodes"]', timeout=5000)
             except:
@@ -931,7 +1134,7 @@ def clear_session(reason=""):
             log(f"   ⚠️ Failed to clear session: {e}")
 
 def load_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_dir = get_base_dir()
     config_file = os.path.join(script_dir, "config.json")
     log_messages = []
     default_config = {
@@ -1215,7 +1418,9 @@ async def main():
         
         print(f"📊 Found {len(urls)} items in queue.")
         
-        completed_log = os.path.join(base_dir, "completed.log") if base_dir else "completed.log"
+        # Global completed.log
+        script_dir = get_base_dir()
+        completed_log = os.path.join(script_dir, "completed.log")
         completed_urls = set()
         completed_keys = set() # (imdb_id, season, episode)
 
@@ -1395,15 +1600,17 @@ async def main():
                     safe_title = finder.sanitize_filename(meta['title'])
 
                     # Create Series Folder
-                    if CONFIG['tv_dir']:
-                        series_dir = os.path.join(CONFIG['tv_dir'], safe_title)
-                    else:
-                        series_dir = safe_title
+                    tv_dir = CONFIG.get('tv_dir')
+                    if not tv_dir or tv_dir == ".":
+                        tv_dir = os.path.join(get_base_dir(), "TV")
+                    
+                    series_dir = os.path.join(tv_dir, safe_title)
                         
                     os.makedirs(series_dir, exist_ok=True)
                     
-                    # Check for resume data to inform user
-                    completed_log = os.path.join(series_dir, "completed.log")
+                    # Global completed.log
+                    script_dir = get_base_dir()
+                    completed_log = os.path.join(script_dir, "completed.log")
                     skipped_count = 0
                     resume_found = False
                     existing_count = 0

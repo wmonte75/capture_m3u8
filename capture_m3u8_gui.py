@@ -1,4 +1,4 @@
-import customtkinter as ctk
+import sys
 import threading
 import queue
 import asyncio
@@ -10,10 +10,39 @@ import re
 import ctypes
 import tkinter
 from tkinter import filedialog, messagebox, Menu
-from PIL import Image
-import requests
-import io
-import concurrent.futures
+
+# Dependency Check
+try:
+    import customtkinter as ctk
+    from PIL import Image
+    import requests
+    import io
+    import concurrent.futures
+except ImportError as e:
+    missing_module = str(e).split("'")[1] if "'" in str(e) else str(e)
+    # Since this is a GUI script, standard print might not be seen if run without console.
+    # However, if they are missing dependencies, they are likely running it via terminal anyway to see why it fails.
+    print(f"\n❌ Missing required Python library: {missing_module}")
+    print("\nPlease install the missing requirements to run this GUI.")
+    if sys.platform.startswith('linux') or sys.platform == 'darwin':
+        print("\nRun this command in your terminal:")
+        print("    python3 -m pip install -r requirements.txt\n")
+    else:
+        print("\nRun this command in your command prompt/terminal:")
+        print("    pip install -r requirements.txt\n")
+        
+    # Also attempt a basic tkinter message box as a fallback if tkinter is available
+    try:
+        import tkinter.messagebox as mb
+        root = tkinter.Tk()
+        root.withdraw()
+        mb.showerror("Missing Requirements", 
+                     f"Missing Python library: {missing_module}\n\n"
+                     "Please run:\npip install -r requirements.txt\nin your terminal.")
+    except:
+        pass
+        
+    sys.exit(1)
 
 # Import the core logic
 import capture_m3u8
@@ -62,18 +91,128 @@ class ToolTip:
             self.tip_window.destroy()
             self.tip_window = None
 
+class MediaSaveDialog(ctk.CTkToplevel):
+    def __init__(self, parent, meta, img_url, callback):
+        super().__init__(parent)
+        self.is_tv = (meta.get('type') == 'tv')
+        self.title("Media Found" if not self.is_tv else "Save Full Series?")
+        self.callback = callback
+        self.meta = meta
+        self.img_url = img_url
+        
+        # Geometry
+        w, h = 550, 320
+        x = parent.winfo_x() + (parent.winfo_width() // 2) - (w // 2)
+        y = parent.winfo_y() + (parent.winfo_height() // 2) - (h // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        
+        # Main container
+        self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Left side: Poster
+        self.poster_frame = ctk.CTkFrame(self.main_frame, width=134, height=200, fg_color="#1a1a1a")
+        self.poster_frame.pack(side="left", padx=(0, 20))
+        self.poster_frame.pack_propagate(False)
+        self.poster_label = ctk.CTkLabel(self.poster_frame, text="Loading...")
+        self.poster_label.pack(expand=True)
+        
+        # Right side: Info
+        self.info_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.info_frame.pack(side="left", fill="both", expand=True)
+        
+        type_text = "SERIES FOUND" if self.is_tv else "MOVIE FOUND"
+        ctk.CTkLabel(self.info_frame, text=type_text, font=("Segoe UI", 10, "bold"), text_color="#3498db").pack(anchor="w")
+        ctk.CTkLabel(self.info_frame, text=meta['title'], font=("Segoe UI", 20, "bold"), wraplength=350, justify="left").pack(anchor="w", pady=(0, 10))
+        
+        if self.is_tv:
+            details_str = f"Type: TV Series | Seasons: {meta['seasons']}"
+            prompt_str = "\nWould you like to save the entire series\nas a .quu queue file for later?"
+        else:
+            details_str = f"Type: Movie"
+            prompt_str = "\nWould you like to download this movie now\nor add it to your queue file?"
+            
+        ctk.CTkLabel(self.info_frame, text=details_str, font=("Segoe UI", 12), text_color="gray").pack(anchor="w")
+        ctk.CTkLabel(self.info_frame, text=prompt_str, font=("Segoe UI", 14), justify="left").pack(anchor="w", pady=(15, 0))
+        
+        # Buttons
+        self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.btn_frame.pack(fill="x", padx=20, pady=(0, 20))
+        
+        if self.is_tv:
+            self.yes_btn = ctk.CTkButton(self.btn_frame, text="Full Series Queue", command=lambda: self.on_click("save_queue"), fg_color="#2ecc71", hover_color="#27ae60", height=40, font=("Segoe UI", 13, "bold"))
+            self.yes_btn.pack(side="right", padx=10)
+            
+            self.no_btn = ctk.CTkButton(self.btn_frame, text="Download Now", command=lambda: self.on_click("just_episode"), fg_color="#3498db", height=40, font=("Segoe UI", 13, "bold"))
+            self.no_btn.pack(side="right")
+        else:
+            self.down_btn = ctk.CTkButton(self.btn_frame, text="Download Now", command=lambda: self.on_click("download_now"), fg_color="#3498db", height=40, font=("Segoe UI", 13, "bold"))
+            self.down_btn.pack(side="right", padx=10)
+            
+            self.queue_btn = ctk.CTkButton(self.btn_frame, text="Add to Queue", command=lambda: self.on_click("add_to_queue"), fg_color="#9b59b6", hover_color="#8e44ad", height=40, font=("Segoe UI", 13, "bold"))
+            self.queue_btn.pack(side="right", padx=10)
+
+        # Cancel button for both
+        self.cancel_btn = ctk.CTkButton(self.btn_frame, text="Cancel", command=self.destroy, fg_color="transparent", border_width=1, height=40, width=80, font=("Segoe UI", 12))
+        self.cancel_btn.pack(side="left")
+        
+        # Load image in background
+        if img_url and img_url != "No Image":
+            threading.Thread(target=self.load_poster, args=(img_url,), daemon=True).start()
+        else:
+            self.show_placeholder()
+
+    def load_poster(self, url):
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = requests.get(url, headers=headers, stream=True, timeout=5)
+            if response.status_code == 200:
+                img_data = response.content
+                pil_image = Image.open(io.BytesIO(img_data))
+                ctk_image = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(134, 200))
+                self.after(0, lambda: self.poster_label.configure(image=ctk_image, text=""))
+            else:
+                self.after(0, self.show_placeholder)
+        except:
+            self.after(0, self.show_placeholder)
+
+    def show_placeholder(self):
+        self.poster_label.configure(text="No Image")
+
+    def on_click(self, action):
+        self.destroy()
+        self.callback(action)
+
 class M3U8DownloaderApp(ctk.CTk):
     def __init__(self):
-        super().__init__()
-
-        # Set AppUserModelID so the taskbar icon matches the window icon
+        # Set AppUserModelID first so the taskbar icon matches the window icon
         try:
-            myappid = 'ytlink.m3u8hunter.gui.1.0'
+            myappid = 'ytlink.m3u8hunter.gui.1.1' # Changed ID slightly to invalidate Windows cache
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
+            
+        super().__init__()
 
         self.title("M3U8 Hunter & Downloader - Beta")
+
+        # Set window icon synchronously
+        import sys
+        import os
+        try:
+            if getattr(sys, 'frozen', False):
+                # Running in a PyInstaller bundle
+                application_path = sys._MEIPASS
+            else:
+                # Running in normal Python environment
+                application_path = os.path.dirname(os.path.abspath(__file__))
+            
+            icon_path = os.path.join(application_path, 'icon2.ico')
+            self.iconbitmap(icon_path)
+        except Exception as e:
+            pass
         
         # Load geometry if available, otherwise default
         # We need to load config first to get geometry, but config loading happens later in __init__
@@ -89,6 +228,7 @@ class M3U8DownloaderApp(ctk.CTk):
         self.input_event = threading.Event()
         self.input_value = None
         self.stop_event = threading.Event()
+        self.bypass_dialog = False
         
         # --- CRITICAL CHANGE: Setup callbacks BEFORE loading config ---
         # This ensures 'load_config' messages are captured by the GUI log.
@@ -111,6 +251,10 @@ class M3U8DownloaderApp(ctk.CTk):
         if "window_geometry" in self.config:
             self.geometry(self.config["window_geometry"])
 
+        # Apply saved theme before widgets are created (avoids flash of wrong theme)
+        saved_theme = self.config.get("theme", "dark")
+        ctk.set_appearance_mode(saved_theme)
+
         # Setup Interface
         self.create_widgets()
         self.load_settings()
@@ -128,7 +272,7 @@ class M3U8DownloaderApp(ctk.CTk):
         self.add_context_menu(self.url_entry)
         ToolTip(self.url_entry, "Paste a direct video link, an IMDB URL (tt1234567),\nor type a movie/series name and press Enter to search IMDB.")
         
-        self.start_btn = ctk.CTkButton(self.input_frame, text="Start / Analyze", command=self.start_process, fg_color="green")
+        self.start_btn = ctk.CTkButton(self.input_frame, text="Start / Analyze", command=self.start_process, fg_color="green", width=220)
         self.start_btn.pack(side="right", padx=10)
 
         self.stop_btn = ctk.CTkButton(self.input_frame, text="Stop", command=self.stop_process, fg_color="red", width=60)
@@ -196,10 +340,34 @@ class M3U8DownloaderApp(ctk.CTk):
         self.headless_chk.pack(side="right", padx=10)
         self.headless_chk.select()
 
+        self.dark_mode_switch = ctk.CTkSwitch(
+            self.opts_frame, text="Dark Mode",
+            command=self.toggle_theme
+        )
+        self.dark_mode_switch.pack(side="right", padx=10)
+
         # --- Bottom Section: Logs ---
-        self.log_box = ctk.CTkTextbox(self, font=("Consolas", 12))
-        self.log_box.pack(pady=10, padx=10, fill="both", expand=True)
+        self.log_header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.log_header_frame.pack(fill="x", padx=10, pady=(5, 0))
+        
+        ctk.CTkLabel(self.log_header_frame, text="Activity Log", font=("", 13, "bold")).pack(side="left")
+        self.clear_log_btn = ctk.CTkButton(self.log_header_frame, text="Clear", width=60, height=24, fg_color="transparent", border_width=1, command=self.clear_logs)
+        self.clear_log_btn.pack(side="right")
+
+        # Segoe UI handles emojis well on Windows while keeping text/numbers compact
+        self.log_box = ctk.CTkTextbox(self, font=("Segoe UI", 11))
+        self.log_box.pack(pady=(5, 10), padx=10, fill="both", expand=True)
         self.log_box.configure(state="disabled")
+        
+        # Configure Tags for Color Coding
+        # Success: Green
+        self.log_box.tag_config("success", foreground="#2ecc71")
+        # Error: Red
+        self.log_box.tag_config("error", foreground="#e74c3c")
+        # Warning: Orange
+        self.log_box.tag_config("warning", foreground="#f39c12")
+        # Info/Search: Blue
+        self.log_box.tag_config("info", foreground="#3498db")
 
     def add_context_menu(self, widget):
         menu = Menu(widget, tearoff=0)
@@ -216,11 +384,23 @@ class M3U8DownloaderApp(ctk.CTk):
         if hasattr(widget, "_entry"):
             widget._entry.bind("<Button-3>", show_menu)
 
+    def toggle_theme(self):
+        theme = "dark" if self.dark_mode_switch.get() == 1 else "light"
+        ctk.set_appearance_mode(theme)
+        self.config["theme"] = theme
+        self.save_settings()
+
     def load_settings(self):
         self.movie_dir_entry.insert(0, self.config.get("movies_dir", ""))
         self.tv_dir_entry.insert(0, self.config.get("tv_dir", ""))
         self.min_cool.insert(0, str(self.config.get("min_cooldown", 10)))
         self.max_cool.insert(0, str(self.config.get("max_cooldown", 25)))
+
+        # Restore dark mode switch state
+        if self.config.get("theme", "dark") == "dark":
+            self.dark_mode_switch.select()
+        else:
+            self.dark_mode_switch.deselect()
         
         speed = self.config.get("download_speed", "6M")
         if speed in self.speed_opt._values:
@@ -237,14 +417,14 @@ class M3U8DownloaderApp(ctk.CTk):
         except:
             pass
         self.config["download_speed"] = self.speed_opt.get()
-        
+        self.config["theme"] = "dark" if self.dark_mode_switch.get() == 1 else "light"
         self.config["window_geometry"] = self.geometry()
         # Update core config
         capture_m3u8.setup_interface(config_data=self.config)
         
         # Save to file
         try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
+            script_dir = capture_m3u8.get_base_dir()
             config_file = os.path.join(script_dir, "config.json")
             with open(config_file, "w") as f:
                 json.dump(self.config, f, indent=4)
@@ -258,8 +438,13 @@ class M3U8DownloaderApp(ctk.CTk):
             entry_widget.insert(0, folder)
 
     def log_callback(self, message):
-        print(message, end="")
+        # We don't print to console here as the core logic's log() already does it via setup_interface
         self.log_queue.put(message)
+
+    def clear_logs(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
 
     def status_callback(self, message):
         self.after(0, lambda: self.start_btn.configure(text=message))
@@ -271,7 +456,19 @@ class M3U8DownloaderApp(ctk.CTk):
         while not self.log_queue.empty():
             msg = self.log_queue.get()
             self.log_box.configure(state="normal")
-            self.log_box.insert("end", str(msg))
+            
+            # Simple color mapping based on icons
+            tag = None
+            if any(x in msg for x in ["✅", "💾", "Success"]): tag = "success"
+            elif any(x in msg for x in ["❌", "FAILED", "Error"]): tag = "error"
+            elif any(x in msg for x in ["⚠️", "Warning"]): tag = "warning"
+            elif any(x in msg for x in ["🔍", "🕵️", "⚡", "📝"]): tag = "info"
+            
+            if tag:
+                self.log_box.insert("end", str(msg), tag)
+            else:
+                self.log_box.insert("end", str(msg))
+                
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
         self.after(100, self.process_log_queue)
@@ -342,13 +539,18 @@ class M3U8DownloaderApp(ctk.CTk):
 
     def run_logic(self, url):
         try:
-            # Check for IMDB Series
-            if "imdb.com/title/" in url:
+            # Check for IMDB Links (Series or Movie)
+            if "imdb.com/title/" in url and not self.bypass_dialog:
                 match = re.search(r'(tt\d+)', url)
                 if match:
-                    imdb_id = match.group(1)
-                    asyncio.run(self.handle_imdb_series(imdb_id, url))
+                    # Clear search images since we are technically starting a "search" logic
+                    self.search_images = []
+                    # Trigger the unified dialog check
+                    self.check_for_media_save(url)
                     return
+            
+            # Reset bypass for the next run
+            self.bypass_dialog = False
 
             # Normal Single Video
             headless = self.headless_chk.get() == 1
@@ -428,7 +630,10 @@ class M3U8DownloaderApp(ctk.CTk):
         # Setup Resume Logic
         finder = capture_m3u8.MasterM3U8Finder()
         safe_title = finder.sanitize_filename(meta['title'])
-        tv_dir = self.config.get('tv_dir') or "."
+        tv_dir = self.config.get('tv_dir')
+        if not tv_dir or tv_dir == ".":
+            tv_dir = os.path.join(capture_m3u8.get_base_dir(), "TV")
+            
         series_dir = os.path.join(tv_dir, safe_title)
         
         if not os.path.exists(series_dir):
@@ -437,7 +642,9 @@ class M3U8DownloaderApp(ctk.CTk):
             except:
                 pass
                 
-        completed_log = os.path.join(series_dir, "completed.log")
+        # Global completed.log
+        script_dir = capture_m3u8.get_base_dir()
+        completed_log = os.path.join(script_dir, "completed.log")
         completed_urls = set()
         completed_episodes = set() # Store (season, episode) tuples
 
@@ -487,6 +694,12 @@ class M3U8DownloaderApp(ctk.CTk):
             if skipped_count > 0:
                 self.log_callback(f"   {skipped_count} of the currently selected episodes will be skipped.\n")
         
+        # --- Offer to save the queue for later resuming ---
+        self.input_value = None
+        self.input_event.clear()
+        self.after(0, lambda: self._ask_save_queue(queue_list, meta['title']))
+        self.input_event.wait()  # Result stored in self.input_value but we don't need it here
+
         self.log_callback(f"🚀 Queued {len(queue_list)} episodes. Starting batch...\n")
         # Process Queue
         headless = self.headless_chk.get() == 1
@@ -549,6 +762,30 @@ class M3U8DownloaderApp(ctk.CTk):
                 self.log_callback(f"⏳ Cooling down for {wait} seconds...\n")
                 capture_m3u8.report_status(f"Cooling down {wait}s...")
                 await asyncio.sleep(wait)
+
+    def _ask_save_queue(self, queue_list, series_title):
+        """Prompt user to optionally save the queue as a .quu file."""
+        answer = messagebox.askyesno(
+            "Save Queue?",
+            f"Save {len(queue_list)} episodes as a .quu queue file for later resuming?"
+        )
+        if answer:
+            safe_title = series_title.replace(':', '-').replace('/', '-').replace('\\', '-')
+            default_name = f"{safe_title}.quu"
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".quu",
+                initialfile=default_name,
+                filetypes=[("Queue Files", "*.quu"), ("All Files", "*.*")]
+            )
+            if filename:
+                try:
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(queue_list))
+                    self.log_callback(f"💾 Queue saved to: {os.path.basename(filename)}\n")
+                except Exception as e:
+                    self.log_callback(f"⚠️ Failed to save queue: {e}\n")
+        self.input_value = True
+        self.input_event.set()
 
     def show_series_dialog(self, meta):
         # A custom Toplevel window for selection
@@ -748,7 +985,9 @@ class M3U8DownloaderApp(ctk.CTk):
     def load_queue(self):
         if self.is_running: return
         
-        filename = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt")])
+        filename = filedialog.askopenfilename(
+            filetypes=[("Queue Files", "*.quu *.txt"), ("Queue Files (.quu)", "*.quu"), ("Text Files", "*.txt"), ("All Files", "*.*")]
+        )
         if not filename:
             return
             
@@ -785,12 +1024,16 @@ class M3U8DownloaderApp(ctk.CTk):
         series_dir = None
         
         if urls:
-            match = re.search(r'imdb=(tt\d+)', urls[0])
-            if match:
-                potential_imdb_id = match.group(1)
-                if all(potential_imdb_id in u for u in urls[1:]):
+            # Check if all links in the queue belong to the same TV series
+            id_matches = [re.search(r'imdb=(tt\d+)', u) for u in urls]
+            ids = [m.group(1) for m in id_matches if m]
+            
+            # It's a TV queue if: All links have the same ID AND all links are TV-specific
+            if len(ids) == len(urls) and len(set(ids)) == 1:
+                potential_id = ids[0]
+                if all(("/tv" in u or ("season=" in u and "episode=" in u)) for u in urls):
                     is_tv_queue = True
-                    series_imdb_id = potential_imdb_id
+                    series_imdb_id = potential_id
 
         if is_tv_queue:
             self.log_callback(f"ℹ️  Detected TV Series queue for IMDB ID: {series_imdb_id}\n")
@@ -798,7 +1041,10 @@ class M3U8DownloaderApp(ctk.CTk):
             if meta and meta['type'] == 'tv':
                 finder = capture_m3u8.MasterM3U8Finder()
                 safe_title = finder.sanitize_filename(meta['title'])
-                tv_dir = self.config.get('tv_dir') or "."
+                tv_dir = self.config.get('tv_dir')
+                if not tv_dir or tv_dir == ".":
+                    tv_dir = os.path.join(capture_m3u8.get_base_dir(), "TV")
+                    
                 series_dir = os.path.join(tv_dir, safe_title)
                 base_dir = series_dir 
             else:
@@ -808,7 +1054,9 @@ class M3U8DownloaderApp(ctk.CTk):
         else:
             base_dir = os.path.dirname(filename)
 
-        completed_log = os.path.join(base_dir, "completed.log")
+        # Global completed.log
+        script_dir = capture_m3u8.get_base_dir()
+        completed_log = os.path.join(script_dir, "completed.log")
         
         completed_urls = set()
         completed_episodes = set()
@@ -1004,10 +1252,12 @@ class M3U8DownloaderApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(dialog)
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
         
-        def select_item(url):
+        def select_item(url, img_url=None):
             self.url_entry.delete(0, "end")
             self.url_entry.insert(0, url)
             dialog.destroy()
+            # Background check media type to offer save/queue dialog
+            threading.Thread(target=self.check_for_media_save, args=(url, img_url), daemon=True).start()
             
         self.search_images = []
 
@@ -1026,7 +1276,7 @@ class M3U8DownloaderApp(ctk.CTk):
             btn = ctk.CTkButton(
                 frame, 
                 text=btn_text, 
-                command=lambda u=item['url']: select_item(u), 
+                command=lambda u=item['url'], i=item.get('img'): select_item(u, i), 
                 anchor="w", 
                 compound="left",
                 image=placeholder_img,
@@ -1039,25 +1289,138 @@ class M3U8DownloaderApp(ctk.CTk):
             if item.get('img') and item['img'] != "No Image":
                 threading.Thread(target=self.load_and_display_image, args=(item['img'], btn), daemon=True).start()
 
+    def check_for_media_save(self, url, img_url=None):
+        """Background check if the selected URL is a series or movie and offer save options."""
+        if "imdb.com/title/" not in url:
+            return
+            
+        match = re.search(r'(tt\d+)', url)
+        if not match:
+            return
+            
+        imdb_id = match.group(1)
+        
+        try:
+            meta = asyncio.run(capture_m3u8.get_imdb_info(imdb_id))
+            if not meta:
+                return
+                
+            def on_dialog_close(action):
+                if action == "save_queue":
+                    threading.Thread(target=self.run_full_series_queue_save, args=(imdb_id, meta), daemon=True).start()
+                elif action == "add_to_queue":
+                    # For movies, add to a .quu file (append)
+                    movie_url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
+                    threading.Thread(target=self.run_movie_append, args=(movie_url, meta), daemon=True).start()
+                elif action == "download_now" or action == "just_episode":
+                    # Already in the entry, just click Start with bypass
+                    self.bypass_dialog = True
+                    self.after(0, self.start_process)
+            
+            self.after(0, lambda: MediaSaveDialog(self, meta, img_url, on_dialog_close))
+            
+        except Exception:
+            pass
+
+    def run_movie_append(self, movie_url, meta):
+        """Append a movie URL to a .quu file."""
+        self.after(0, lambda: self.progress_lbl.configure(text="Status: Queueing..."))
+        
+        def pick_and_append():
+            finder = capture_m3u8.MasterM3U8Finder()
+            safe_title = finder.sanitize_filename(meta['title'])
+            
+            filename = filedialog.asksaveasfilename(
+                title="Select Queue File to Append To",
+                defaultextension=".quu",
+                initialfile="Movie_Queue.quu",
+                filetypes=[("Queue Files", "*.quu"), ("All Files", "*.*")]
+            )
+            
+            if filename:
+                try:
+                    # Check if file ends with newline to avoid joining URLs
+                    mode = 'a' if os.path.exists(filename) else 'w'
+                    with open(filename, mode, encoding='utf-8') as f:
+                        if mode == 'a':
+                            # Read last byte to see if newline needed
+                            with open(filename, 'rb') as fr:
+                                fr.seek(0, 2)
+                                if fr.tell() > 0:
+                                    fr.seek(-1, 2)
+                                    if fr.read(1) != b'\n':
+                                        f.write('\n')
+                        f.write(movie_url + '\n')
+                    
+                    self.log_callback(f"💾 Added '{meta['title']}' to: {os.path.basename(filename)}\n")
+                except Exception as e:
+                    self.log_callback(f"⚠️ Failed to append to queue: {e}\n")
+            
+            self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
+            
+        self.after(0, pick_and_append)
+
+    def run_full_series_queue_save(self, imdb_id, meta):
+        """Fetch all episodes and save to .quu file."""
+        try:
+            self.log_callback(f"📝 Building full series queue for: {meta['title']}...\n")
+            
+            async def fetch_all():
+                q = []
+                for s in range(1, meta['seasons'] + 1):
+                    # Update status
+                    self.after(0, lambda s_num=s: self.progress_lbl.configure(text=f"Fetching S{s_num:02d}..."))
+                    ep_count = await capture_m3u8.get_season_episodes(imdb_id, s)
+                    for e in range(1, ep_count + 1):
+                        link = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season={s}&episode={e}"
+                        q.append(link)
+                return q
+            
+            queue_list = asyncio.run(fetch_all())
+            
+            if not queue_list:
+                self.log_callback("❌ Failed to build queue.\n")
+                return
+                
+            def prompt_save():
+                self.progress_lbl.configure(text="Status: Idle")
+                finder = capture_m3u8.MasterM3U8Finder()
+                safe_title = finder.sanitize_filename(meta['title'])
+                default_name = f"{safe_title}_Full.quu"
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".quu",
+                    initialfile=default_name,
+                    filetypes=[("Queue Files", "*.quu"), ("All Files", "*.*")]
+                )
+                if filename:
+                    try:
+                        with open(filename, 'w', encoding='utf-8') as f:
+                            f.write('\n'.join(queue_list))
+                        self.log_callback(f"💾 Full series queue saved to: {os.path.basename(filename)}\n")
+                    except Exception as e:
+                        self.log_callback(f"⚠️ Failed to save queue: {e}\n")
+                        
+            self.after(0, prompt_save)
+            
+        except Exception as e:
+            self.log_callback(f"❌ Error building series queue: {e}\n")
+
     def load_and_display_image(self, url, widget):
         try:
-            with open("img_trace.log", "a") as f: f.write(f"Loading {url}\n")
             headers = {"User-Agent": "Mozilla/5.0"}
             response = requests.get(url, headers=headers, stream=True, timeout=5)
-            with open("img_trace.log", "a") as f: f.write(f"Status {response.status_code}\n")
             if response.status_code == 200:
                 img_data = response.content
                 pil_image = Image.open(io.BytesIO(img_data))
                 ctk_image = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(67, 100))
                 
                 def update_ui():
-                    with open("img_trace.log", "a") as f: f.write(f"Configuring UI for {url}\n")
                     widget.configure(image=ctk_image)
                     self.search_images.append(ctk_image)
                 
                 self.after(0, update_ui)
         except Exception as e:
-            with open("img_trace.log", "a") as f: f.write(f"Image load error for {url}: {e}\n")
+            pass
 
 if __name__ == "__main__":
     app = M3U8DownloaderApp()
