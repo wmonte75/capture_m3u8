@@ -1012,6 +1012,13 @@ class M3U8DownloaderApp(ctk.CTk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
         
+        # Clear the internal log queue to prevent "ghost" messages from previous runs
+        while not self.log_queue.empty():
+            try:
+                self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+        
         threading.Thread(target=self.run_queue_batch, args=(urls, filename), daemon=True).start()
 
     def run_queue_batch(self, urls, filename):
@@ -1060,6 +1067,7 @@ class M3U8DownloaderApp(ctk.CTk):
         
         completed_urls = set()
         completed_episodes = set()
+        completed_movies = set()
         
         if os.path.exists(completed_log):
             try:
@@ -1068,11 +1076,19 @@ class M3U8DownloaderApp(ctk.CTk):
                         line = line.strip()
                         if not line: continue
                         completed_urls.add(line)
-                        if is_tv_queue:
-                            s_match = re.search(r'[?&]season=(\d+)', line)
-                            e_match = re.search(r'[?&]episode=(\d+)', line)
+                        
+                        imdb_m = re.search(r'(tt\d{7,})', line)
+                        s_match = re.search(r'[?&]season=(\d+)', line)
+                        e_match = re.search(r'[?&]episode=(\d+)', line)
+                        
+                        if imdb_m:
+                            imdb_id = imdb_m.group(1)
                             if s_match and e_match:
-                                completed_episodes.add((int(s_match.group(1)), int(e_match.group(1))))
+                                # TV Episode
+                                completed_episodes.add((imdb_id, int(s_match.group(1)), int(e_match.group(1))))
+                            else:
+                                # Movie
+                                completed_movies.add(imdb_id)
                 self.log_callback(f"📂 Found resume log with {len(completed_urls)} entries.\n")
             except Exception as e:
                 self.log_callback(f"⚠️ Error reading completed.log: {e}\n")
@@ -1091,27 +1107,40 @@ class M3U8DownloaderApp(ctk.CTk):
                 if url in completed_urls:
                     is_completed = True
                     skip_reason = "in completed.log"
-                elif is_tv_queue and series_dir:
+                else:
+                    # Robust check using IMDB ID
+                    curr_imdb_m = re.search(r'(tt\d{7,})', url)
+                    curr_s_match = re.search(r'[?&]season=(\d+)', url)
+                    curr_e_match = re.search(r'[?&]episode=(\d+)', url)
+                    
+                    if curr_imdb_m:
+                        imdb_id = curr_imdb_m.group(1)
+                        if curr_s_match and curr_e_match:
+                            s_num, e_num = int(curr_s_match.group(1)), int(curr_e_match.group(1))
+                            if (imdb_id, s_num, e_num) in completed_episodes:
+                                is_completed = True
+                                skip_reason = f"in completed.log (Identified S{s_num:02d}E{e_num:02d})"
+                        elif imdb_id in completed_movies:
+                            is_completed = True
+                            skip_reason = f"in completed.log (Movie IMDB: {imdb_id})"
+
+                if not is_completed and is_tv_queue and series_dir:
                     s_match = re.search(r'[?&]season=(\d+)', url)
                     e_match = re.search(r'[?&]episode=(\d+)', url)
                     if s_match and e_match:
                         s_num, e_num = int(s_match.group(1)), int(e_match.group(1))
-                        if (s_num, e_num) in completed_episodes:
-                            is_completed = True
-                            skip_reason = f"in completed.log (S{s_num:02d}E{e_num:02d})"
-                        else:
-                            season_dir_check = os.path.join(series_dir, f"Season {s_num:02d}")
-                            if os.path.exists(season_dir_check):
-                                for f_name in os.listdir(season_dir_check):
-                                    if f_name.endswith(".mkv") and f"S{s_num:02d}E{e_num:02d}" in f_name:
-                                        is_completed = True
-                                        skip_reason = f"file exists ({f_name})"
-                                        try:
-                                            with open(completed_log, 'a', encoding='utf-8') as f_log:
-                                                f_log.write(f"{url}\n")
-                                            completed_urls.add(url)
-                                        except: pass
-                                        break
+                        season_dir_check = os.path.join(series_dir, f"Season {s_num:02d}")
+                        if os.path.exists(season_dir_check):
+                            for f_name in os.listdir(season_dir_check):
+                                if f_name.endswith(".mkv") and f"S{s_num:02d}E{e_num:02d}" in f_name:
+                                    is_completed = True
+                                    skip_reason = f"file exists ({f_name})"
+                                    try:
+                                        with open(completed_log, 'a', encoding='utf-8') as f_log:
+                                            f_log.write(f"{url}\n")
+                                        completed_urls.add(url)
+                                    except: pass
+                                    break
                 
                 if is_completed:
                     self.log_callback(f"⏭️  Skipping ({skip_reason}): {url}\n")
@@ -1133,7 +1162,8 @@ class M3U8DownloaderApp(ctk.CTk):
                     wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])
                     self.log_callback(f"⏳ Cooling down for {wait} seconds...\n")
                     capture_m3u8.report_status(f"Cooling down {wait}s...")
-                    time.sleep(wait)
+                    # Interruptible sleep
+                    self.stop_event.wait(wait)
                     
         except Exception as e:
             self.log_callback(f"\n❌ Queue Error: {e}\n")

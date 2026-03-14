@@ -204,9 +204,10 @@ class MasterM3U8Finder:
         return None
     
     async def extract_title(self, page):
-        """Extract video title from page with multiple fallback strategies"""
+        """Extract video title from page with fast timeouts"""
         try:
-            og_title = await page.locator('meta[property="og:title"]').get_attribute('content')
+            # 2s timeout to prevent hanging on missing tags
+            og_title = await page.locator('meta[property="og:title"]').get_attribute('content', timeout=2000)
             if og_title and len(og_title) > 2:
                 return og_title.strip()
         except:
@@ -221,15 +222,18 @@ class MasterM3U8Finder:
             pass
             
         try:
-            h1 = await page.locator('h1').first.inner_text()
+            h1 = await page.locator('h1').first.inner_text(timeout=2000)
             if h1 and len(h1) > 2:
                 return h1.strip()
         except:
             pass
             
         try:
-            json_scripts = await page.locator('script[type="application/ld+json"]').all_inner_texts()
-            for script in json_scripts:
+            # Quick check for JSON-LD without a long wait
+            scripts = page.locator('script[type="application/ld+json"]')
+            count = await scripts.count()
+            for i in range(count):
+                script = await scripts.nth(i).inner_text(timeout=1000)
                 if '"name"' in script:
                     match = re.search(r'"name"\s*:\s*"([^"]+)"', script)
                     if match:
@@ -268,34 +272,34 @@ class MasterM3U8Finder:
             log(f"   ⚠️ Failed to save cookies: {e}")
 
     async def get_working_url(self, context):
-        """Test candidates and return the first working one"""
-        for url in self.candidates:
-            if url in self.bad_candidates:
-                continue
+        """Test all new candidates in parallel and return the first working one."""
+        new_candidates = [u for u in self.candidates if u not in self.bad_candidates and u != self.master_url]
+        if not new_candidates:
+            return self.master_url if self.master_url else None
 
-            # Skip template placeholder URLs like https://tmstr3.{v1}/...
-            # These are unresolved JS variables found in raw page source — not real hostnames.
+        async def check_url(url):
             if '{' in url or '}' in url:
                 self.bad_candidates.add(url)
-                continue
-
-            if url == self.master_url:
-                return url
-
-            log(f"   🧪 Testing candidate: {url[:80]}...")
+                return None
             try:
-                # Use Playwright's APIRequestContext to test the link
-                response = await context.request.get(url, timeout=5000)
+                # 2s timeout for fast rejection
+                response = await context.request.get(url, timeout=2000)
                 if response.ok:
-                    log(f"   ✅ Verified working: {url[:80]}")
                     return url
-                else:
-                    log(f"   ❌ Failed ({response.status}): {url[:80]}")
-                    self.bad_candidates.add(url)
-            except Exception as e:
-                log(f"   ❌ Error testing candidate: {str(e)[:50]}")
                 self.bad_candidates.add(url)
-        return None
+            except:
+                self.bad_candidates.add(url)
+            return None
+
+        log(f"   🧪 Testing {len(new_candidates)} candidate(s) in parallel...")
+        results = await asyncio.gather(*[check_url(u) for u in new_candidates])
+        
+        for r in results:
+            if r:
+                log(f"   ✅ Verified working: {r[:80]}")
+                return r
+        
+        return self.master_url if self.master_url else None
 
     async def run_ytdlp(self, ytdlp_path, master_url, output_file, use_cookies=False, status_prefix=""):
         """Execute yt-dlp download internally"""
@@ -495,10 +499,21 @@ class MasterM3U8Finder:
             
             page = context.pages[0] if context.pages else await context.new_page()
 
-            # Block unpkg.com across all pages/iframes in this context
-            async def block_unpkg(route):
-                await route.abort()
-            await context.route("**/*unpkg.com*", block_unpkg)
+            # Optimzed Ad-blocking: Block images/media natively, and only check scripts for ads
+            ad_regex = re.compile(r'googlesyndication|doubleclick|adnxs|ads-twitter|facebook|quantserve|taboola|outbrain|advertising|mathtag|dtscout|amazon-adsystem', re.IGNORECASE)
+            
+            async def block_junk(route):
+                request = route.request
+                if request.resource_type in ["image", "media", "font"]:
+                    return await route.abort()
+                
+                url = request.url.lower()
+                if "unpkg.com" in url or ad_regex.search(url):
+                    return await route.abort()
+                
+                await route.continue_()
+            
+            await context.route("**/*", block_junk)
 
             # Use a lightweight event listener instead of route interception.
             # context.on('request') fires for ALL requests across every page,
@@ -536,65 +551,70 @@ class MasterM3U8Finder:
                 } catch(e) {}
             """)
             
-            log("Step 1: Loading main page...")
-            try:
-                await page.goto(start_url, wait_until="commit", timeout=60000)
-            except Exception as e:
-                log(f"   ⚠️ Page load warning: {str(e)[:100]}")
-                log("   Continuing scan...")
+            log("Step 1: Hunting for master.m3u8...")
+            # Optimization: Load page concurrently with proactive link sniffing and interaction.
+            goto_task = asyncio.create_task(page.goto(start_url, wait_until="commit", timeout=60000))
             
-            # Smart wait: Check for master URL immediately, max 15s wait
-            for _ in range(150):
+            # Unified Hunting Loop: Polling, Clicking, and Iframe scanning all at once.
+            self._verify_in_progress = False
+            
+            for tick in range(600): # Max 60s total hunting
                 check_stop()
-                verified = await self.get_working_url(context)
-                if verified:
-                    self.master_url = verified
-                    break
-                await asyncio.sleep(0.1)
-
-            # If no m3u8 yet, try clicking the iframe element on the main page
-            # to activate / wake up the embedded video player.
-            # Firefox headless requires this — the iframe stays on its loading
-            # spinner until it receives a user interaction event.
-            if not self.master_url:
-                try:
-                    iframes = page.locator('iframe')
-                    count = await iframes.count()
-                    for i in range(count):
+                
+                # 1. Parallel verification of network candidates
+                if not self._verify_in_progress:
+                    new_candidates = [u for u in self.candidates if u not in self.bad_candidates and u != self.master_url]
+                    if new_candidates:
+                        self._verify_in_progress = True
                         try:
-                            await iframes.nth(i).click(timeout=1000)
-                            break  # One click is enough to wake the player
+                            # Use a helper task to verify in background
+                            async def run_verify():
+                                try:
+                                    res = await self.get_working_url(context)
+                                    if res:
+                                        self.master_url = res
+                                finally:
+                                    self._verify_in_progress = False
+                            asyncio.create_task(run_verify())
                         except:
-                            continue
-                except:
-                    pass
+                            self._verify_in_progress = False
+                
+                if self.master_url:
+                    break
 
-                # Extended wait after click — give the now-activated iframe time
-                # to load the video player and make its m3u8 network request.
-                for _ in range(300):  # 30s max
-                    check_stop()
-                    verified = await self.get_working_url(context)
-                    if verified:
-                        self.master_url = verified
-                        break
-                    await asyncio.sleep(0.1)
-            
-            if self.master_url:
-                # Wait for the page title to become meaningful before extracting.
-                # On Linux, Chromium loads slower so the DOM may still be blank
-                # at this point even though the network stream was found.
-                for _ in range(12):  # poll up to 3s (12 x 250ms)
+                # 2. Proactive "Wake-up" clicks (Every 1s) to trigger JS links
+                if tick > 0 and tick % 10 == 0:
                     try:
-                        t = await page.title()
-                        if t and t.strip() and t.lower() not in ("", "loading...", "untitled"):
-                            break
+                        # Click the main body and any found iframes
+                        await page.evaluate("() => document.body.click()")
+                        iframes = page.locator('iframe')
+                        count = await iframes.count()
+                        for i in range(count):
+                            await iframes.nth(i).click(timeout=100)
                     except:
                         pass
-                    await asyncio.sleep(0.25)
 
+                # 3. Check for late-discovered candidates in HTML
+                if tick % 30 == 0:
+                    try:
+                        content = await page.content()
+                        matches = re.findall(r'https?://[^\s"\']+master\.m3u8[^\s"\']*', content, re.IGNORECASE)
+                        for match in matches:
+                            if match not in self.candidates:
+                                self.candidates.append(match)
+                    except:
+                        pass
+                
+                await asyncio.sleep(0.1)
+
+            # Cleanup navigation task
+            if not goto_task.done():
+                goto_task.cancel()
+
+            if self.master_url:
                 if self.title == "Unknown":
                     self.title = await self.extract_title(page)
-                log(f"   ⚡ Master URL found early. Skipping iframe scan.")
+                log(f"   ⚡ Master URL found! Finalizing...")
                 await self.save_cookies(context)
                 await context.close()
                 return self.master_url, self.title, start_url, "success"
