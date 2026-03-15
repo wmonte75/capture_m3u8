@@ -128,7 +128,9 @@ class MediaSaveDialog(ctk.CTkToplevel):
         ctk.CTkLabel(self.info_frame, text=meta['title'], font=("Segoe UI", 20, "bold"), wraplength=350, justify="left").pack(anchor="w", pady=(0, 10))
         
         if self.is_tv:
-            details_str = f"Type: TV Series | Seasons: {meta['seasons']}"
+            total_eps = meta.get('total_episodes', 0)
+            eps_str = f" | Episodes: {total_eps}" if total_eps > 0 else ""
+            details_str = f"Type: TV Series | Seasons: {meta['seasons']}{eps_str}"
             prompt_str = "\nWould you like to save the entire series\nas a .quu queue file for later?"
         else:
             details_str = f"Type: Movie"
@@ -199,18 +201,19 @@ class M3U8DownloaderApp(ctk.CTk):
         self.title("M3U8 Hunter & Downloader - Beta")
 
         # Set window icon synchronously
-        import sys
-        import os
         try:
-            if getattr(sys, 'frozen', False):
-                # Running in a PyInstaller bundle
-                application_path = sys._MEIPASS
+            icon_path = capture_m3u8.get_resource_path('icon2.ico')
+            if sys.platform.startswith('linux'):
+                # Linux doesn't support .ico for window icons well, use PIL to set it
+                from PIL import Image, ImageTk
+                img = Image.open(icon_path)
+                photo = ImageTk.PhotoImage(img)
+                self.wm_iconphoto(True, photo)
+                # Keep a reference to prevent garbage collection
+                self._icon_photo = photo
             else:
-                # Running in normal Python environment
-                application_path = os.path.dirname(os.path.abspath(__file__))
-            
-            icon_path = os.path.join(application_path, 'icon2.ico')
-            self.iconbitmap(icon_path)
+                # Windows handles .ico natively for window and taskbar
+                self.iconbitmap(icon_path)
         except Exception as e:
             pass
         
@@ -537,17 +540,42 @@ class M3U8DownloaderApp(ctk.CTk):
         if self.is_running:
             self.stop_event.set()
 
+    def _on_finish(self):
+        """Reset GUI state after processing is complete."""
+        self.is_running = False
+        self.stop_event.clear()
+        self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
+        self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
+        self.after(0, lambda: self.stop_btn.configure(state="disabled"))
+        self.after(0, lambda: self.top250_btn.configure(state="normal"))
+        self.after(0, lambda: self.queue_btn.configure(state="normal"))
+        self.after(0, lambda: self.check_btn.configure(state="normal"))
+
     def run_logic(self, url):
+        # Flush IMDB cache before starting a new logic run/download
+        capture_m3u8.flush_imdb_cache()
         try:
             # Check for IMDB Links (Series or Movie)
             if "imdb.com/title/" in url and not self.bypass_dialog:
                 match = re.search(r'(tt\d+)', url)
                 if match:
+                    imdb_id = match.group(1)
                     # Clear search images since we are technically starting a "search" logic
                     self.search_images = []
-                    # Trigger the unified dialog check
-                    self.check_for_media_save(url)
-                    return
+                    def on_meta(meta):
+                        try:
+                            if meta and meta.get('type') == 'tv':
+                                threading.Thread(target=lambda: asyncio.run(self.handle_imdb_series(imdb_id, url)), daemon=True).start()
+                            else:
+                                self.check_for_media_save(url)
+                                # For non-series/movies, if we just showed a dialog, we might be finished with the "Hunting" phase of the button
+                                # but wait, check_for_media_save usually leads to another start_process.
+                        except Exception as e:
+                            self.log_callback(f"\n❌ Error in metadata handling: {e}\n")
+                            self._on_finish()
+                            
+                    threading.Thread(target=lambda: on_meta(asyncio.run(capture_m3u8.get_imdb_info(imdb_id))), daemon=True).start()
+                    return # The thread will handle the rest, but we need to ensure it calls _on_finish
             
             # Reset bypass for the next run
             self.bypass_dialog = False
@@ -559,232 +587,226 @@ class M3U8DownloaderApp(ctk.CTk):
         except Exception as e:
             self.log_callback(f"\n❌ Error: {e}\n")
         finally:
-            self.is_running = False
-            self.stop_event.clear()
-            self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
-            self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
-            self.after(0, lambda: self.stop_btn.configure(state="disabled"))
-            self.after(0, lambda: self.top250_btn.configure(state="normal"))
-            self.after(0, lambda: self.queue_btn.configure(state="normal"))
-            self.after(0, lambda: self.check_btn.configure(state="normal"))
+            # Only reset here if we didn't return early to a background thread
+            # Actually, even if we returned early, the finally block runs.
+            # But if we spawned a thread, we want the THREAD to call _on_finish when IT is done.
+            # So we check if we are still "running" (which the thread will keep true)
+            if "imdb.com/title/" not in url or self.bypass_dialog:
+                self._on_finish()
 
     async def handle_imdb_series(self, imdb_id, original_url):
-        self.log_callback(f"🕵️  Analyzing IMDB Series: {imdb_id}...\n")
-        meta = await capture_m3u8.get_imdb_info(imdb_id)
-        
-        if not meta:
-            self.log_callback("❌ Failed to fetch IMDB info.\n")
-            return
+        try:
+            self.log_callback(f"🕵️  Analyzing IMDB Series: {imdb_id}...\n")
+            meta = await capture_m3u8.get_imdb_info(imdb_id)
+            
+            if not meta:
+                self.log_callback("❌ Failed to fetch IMDB info.\n")
+                return
 
-        if meta['type'] != 'tv':
-            # It's a movie, proceed normally
-            headless = self.headless_chk.get() == 1
-            await capture_m3u8.process_video(original_url, headless=headless, auto_mode=True)
-            return
+            if meta['type'] != 'tv':
+                # It's a movie, proceed normally
+                headless = self.headless_chk.get() == 1
+                await capture_m3u8.process_video(original_url, headless=headless, auto_mode=True)
+                return
 
-        # It is a TV Series
-        self.log_callback(f"\n📺 Series Found: {meta['title']}")
-        self.log_callback(f"   Seasons: {meta['seasons']} | Episodes: {meta['total_episodes']}\n")
-        
-        # Ask user for selection (on main thread)
-        self.input_value = None
-        self.input_event.clear()
-        self.after(0, lambda: self.show_series_dialog(meta))
-        self.input_event.wait()
-        
-        selection = self.input_value # Returns dict {'season': int, 'ep_start': int, 'ep_end': int} or None
-        
-        if not selection:
-            self.log_callback("❌ Selection cancelled.\n")
-            return
+            # It is a TV Series
+            self.log_callback(f"\n📺 Series Found: {meta['title']}")
+            self.log_callback(f"   Seasons: {meta['seasons']} | Episodes: {meta['total_episodes']}\n")
+            
+            # Ask user for selection (on main thread)
+            self.input_value = None
+            self.input_event.clear()
+            self.after(0, lambda: self.show_series_dialog(meta))
+            self.input_event.wait()
+            
+            selection = self.input_value # Returns dict {'season': int, 'ep_start': int, 'ep_end': int} or None
+            
+            if not selection:
+                self.log_callback("❌ Selection cancelled.\n")
+                return
 
-        # Generate Queue
-        queue_list = []
-        
-        if selection['season'] == 'all':
-            self.log_callback(f"   Fetching info for ALL {meta['seasons']} seasons...\n")
-            for s in range(1, meta['seasons'] + 1):
+            # Generate Queue
+            queue_list = []
+            
+            if selection['season'] == 'all':
+                self.log_callback(f"   Fetching info for ALL {meta['seasons']} seasons...\n")
+                for s in range(1, meta['seasons'] + 1):
+                    ep_count = await capture_m3u8.get_season_episodes(imdb_id, s)
+                    self.log_callback(f"   Season {s}: {ep_count} episodes.\n")
+                    for e in range(1, ep_count + 1):
+                        link = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season={s}&episode={e}"
+                        queue_list.append(link)
+            else:
+                s = selection['season']
+                
+                # If user selected a specific season, we need to know how many episodes it has
+                # The meta only has total_episodes (global) or we need to fetch season specific
                 ep_count = await capture_m3u8.get_season_episodes(imdb_id, s)
-                self.log_callback(f"   Season {s}: {ep_count} episodes.\n")
-                for e in range(1, ep_count + 1):
+                self.log_callback(f"   Season {s} has {ep_count} episodes.\n")
+                
+                start = selection.get('ep_start', 1)
+                end = selection.get('ep_end', ep_count)
+                
+                # Bounds check
+                if end > ep_count: end = ep_count
+                
+                for e in range(start, end + 1):
                     link = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season={s}&episode={e}"
                     queue_list.append(link)
-        else:
-            s = selection['season']
-            
-            # If user selected a specific season, we need to know how many episodes it has
-            # The meta only has total_episodes (global) or we need to fetch season specific
-            ep_count = await capture_m3u8.get_season_episodes(imdb_id, s)
-            self.log_callback(f"   Season {s} has {ep_count} episodes.\n")
-            
-            start = selection.get('ep_start', 1)
-            end = selection.get('ep_end', ep_count)
-            
-            # Bounds check
-            if end > ep_count: end = ep_count
-            
-            for e in range(start, end + 1):
-                link = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season={s}&episode={e}"
-                queue_list.append(link)
-            
-        # Setup Resume Logic
-        finder = capture_m3u8.MasterM3U8Finder()
-        safe_title = finder.sanitize_filename(meta['title'])
-        tv_dir = self.config.get('tv_dir')
-        if not tv_dir or tv_dir == ".":
-            tv_dir = os.path.join(capture_m3u8.get_base_dir(), "TV")
-            
-        series_dir = os.path.join(tv_dir, safe_title)
-        
-        if not os.path.exists(series_dir):
-            try:
-                os.makedirs(series_dir, exist_ok=True)
-            except:
-                pass
                 
-        # Global completed.log
-        script_dir = capture_m3u8.get_base_dir()
-        completed_log = os.path.join(script_dir, "completed.log")
-        completed_urls = set()
-        completed_episodes = set() # Store (season, episode) tuples
+            # Setup Resume Logic
+            finder = capture_m3u8.MasterM3U8Finder()
+            safe_title = finder.sanitize_filename(meta['title'])
+            tv_dir = self.config.get('tv_dir')
+            if not tv_dir or tv_dir == ".":
+                tv_dir = os.path.join(capture_m3u8.get_base_dir(), "TV")
+                
+            series_dir = os.path.join(tv_dir, safe_title)
+            
+            if not os.path.exists(series_dir):
+                try:
+                    os.makedirs(series_dir, exist_ok=True)
+                except:
+                    pass
+                    
+            # Global completed.log
+            script_dir = capture_m3u8.get_base_dir()
+            completed_log = os.path.join(script_dir, "completed.log")
+            completed_urls = set()
+            completed_episodes = set() # Store (season, episode) tuples
 
-        if os.path.exists(completed_log):
+            if os.path.exists(completed_log):
+                try:
+                    with open(completed_log, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line: continue
+                            completed_urls.add(line)
+                            
+                            # Extract season/episode for robust matching
+                            s_match = re.search(r'[?&]season=(\d+)', line)
+                            e_match = re.search(r'[?&]episode=(\d+)', line)
+                            if s_match and e_match:
+                                completed_episodes.add((int(s_match.group(1)), int(e_match.group(1))))
+                except Exception as e:
+                    self.log_callback(f"⚠️ Error reading completed.log: {e}\n")
+
+            # Improved resume logging
+            skipped_count = 0
+            for link in queue_list:
+                is_skipped = False
+                if link in completed_urls:
+                    is_skipped = True
+                
+                if not is_skipped:
+                    s_match = re.search(r'[?&]season=(\d+)', link)
+                    e_match = re.search(r'[?&]episode=(\d+)', link)
+                    if s_match and e_match:
+                        s_num, e_num = int(s_match.group(1)), int(e_match.group(1))
+                        if (s_num, e_num) in completed_episodes:
+                            is_skipped = True
+                        else:
+                            # File existence check
+                            season_dir_check = os.path.join(series_dir, f"Season {s_num:02d}")
+                            if os.path.exists(season_dir_check):
+                                for f_name in os.listdir(season_dir_check):
+                                    if f_name.endswith(".mkv") and f"S{s_num:02d}E{e_num:02d}" in f_name:
+                                        is_skipped = True
+                                        break
+                if is_skipped:
+                    skipped_count += 1
+
+            if completed_urls:
+                self.log_callback(f"📂 Found resume data: {len(completed_urls)} episodes previously completed for this series.\n")
+                if skipped_count > 0:
+                    self.log_callback(f"   {skipped_count} of the currently selected episodes will be skipped.\n")
+            
+            # --- Silently auto-save the queue for later reference ---
+            quu_path = os.path.join(series_dir, f"{safe_title}.quu")
             try:
-                with open(completed_log, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line: continue
-                        completed_urls.add(line)
-                        
-                        # Extract season/episode for robust matching
-                        s_match = re.search(r'[?&]season=(\d+)', line)
-                        e_match = re.search(r'[?&]episode=(\d+)', line)
-                        if s_match and e_match:
-                            completed_episodes.add((int(s_match.group(1)), int(e_match.group(1))))
+                with open(quu_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(queue_list))
+                self.log_callback(f"💾 Queue auto-saved to: {os.path.basename(quu_path)}\n")
             except Exception as e:
-                self.log_callback(f"⚠️ Error reading completed.log: {e}\n")
+                self.log_callback(f"⚠️ Failed to auto-save .quu file: {e}\n")
 
-        # Improved resume logging
-        skipped_count = 0
-        for link in queue_list:
-            is_skipped = False
-            if link in completed_urls:
-                is_skipped = True
+            self.log_callback(f"🚀 Queued {len(queue_list)} episodes. Starting batch...\n")
+            # Process Queue
+            headless = self.headless_chk.get() == 1
             
-            if not is_skipped:
-                s_match = re.search(r'[?&]season=(\d+)', link)
-                e_match = re.search(r'[?&]episode=(\d+)', link)
-                if s_match and e_match:
-                    s_num, e_num = int(s_match.group(1)), int(e_match.group(1))
-                    if (s_num, e_num) in completed_episodes:
-                        is_skipped = True
-                    else:
-                        # File existence check
-                        season_dir_check = os.path.join(series_dir, f"Season {s_num:02d}")
-                        if os.path.exists(season_dir_check):
-                            for f_name in os.listdir(season_dir_check):
-                                if f_name.endswith(".mkv") and f"S{s_num:02d}E{e_num:02d}" in f_name:
-                                    is_skipped = True
-                                    break
-            if is_skipped:
-                skipped_count += 1
+            for i, link in enumerate(queue_list):
+                if self.stop_event.is_set():
+                    self.log_callback("\n🛑 Batch processing stopped by user.\n")
+                    break
+                
+                is_completed = False
+                skip_reason = ""
 
-        if completed_urls:
-            self.log_callback(f"📂 Found resume data: {len(completed_urls)} episodes previously completed for this series.\n")
-            if skipped_count > 0:
-                self.log_callback(f"   {skipped_count} of the currently selected episodes will be skipped.\n")
-        
-        # --- Offer to save the queue for later resuming ---
-        self.input_value = None
-        self.input_event.clear()
-        self.after(0, lambda: self._ask_save_queue(queue_list, meta['title']))
-        self.input_event.wait()  # Result stored in self.input_value but we don't need it here
+                # 1. Check log file first
+                if link in completed_urls:
+                    is_completed = True
+                    skip_reason = f"in completed.log"
+                else:
+                    s_match = re.search(r'[?&]season=(\d+)', link)
+                    e_match = re.search(r'[?&]episode=(\d+)', link)
+                    if s_match and e_match:
+                        s_num, e_num = int(s_match.group(1)), int(e_match.group(1))
+                        if (s_num, e_num) in completed_episodes:
+                            is_completed = True
+                            skip_reason = f"in completed.log (S{s_num:02d}E{e_num:02d})"
+                        else:
+                            # 2. Check filesystem (self-healing)
+                            season_dir = os.path.join(series_dir, f"Season {s_num:02d}")
+                            if os.path.exists(season_dir):
+                                for f_name in os.listdir(season_dir):
+                                    if f_name.endswith(".mkv") and f"S{s_num:02d}E{e_num:02d}" in f_name:
+                                        is_completed = True
+                                        skip_reason = f"file exists ({f_name})"
+                                        # Self-heal the log
+                                        try:
+                                            with open(completed_log, 'a', encoding='utf-8') as f_log:
+                                                f_log.write(f"{link}\n")
+                                            completed_urls.add(link)
+                                        except Exception as log_e:
+                                            self.log_callback(f"   ⚠️ Could not self-heal completed.log: {log_e}\n")
+                                        break
 
-        self.log_callback(f"🚀 Queued {len(queue_list)} episodes. Starting batch...\n")
-        # Process Queue
-        headless = self.headless_chk.get() == 1
-        
-        for i, link in enumerate(queue_list):
-            if self.stop_event.is_set():
-                self.log_callback("\n🛑 Batch processing stopped by user.\n")
-                break
-            
-            is_completed = False
-            skip_reason = ""
+                if is_completed:
+                    self.log_callback(f"⏭️  Skipping ({skip_reason}): {link}\n")
+                    continue
 
-            # 1. Check log file first
-            if link in completed_urls:
-                is_completed = True
-                skip_reason = f"in completed.log"
-            else:
-                s_match = re.search(r'[?&]season=(\d+)', link)
-                e_match = re.search(r'[?&]episode=(\d+)', link)
-                if s_match and e_match:
-                    s_num, e_num = int(s_match.group(1)), int(e_match.group(1))
-                    if (s_num, e_num) in completed_episodes:
-                        is_completed = True
-                        skip_reason = f"in completed.log (S{s_num:02d}E{e_num:02d})"
-                    else:
-                        # 2. Check filesystem (self-healing)
-                        season_dir = os.path.join(series_dir, f"Season {s_num:02d}")
-                        if os.path.exists(season_dir):
-                            for f_name in os.listdir(season_dir):
-                                if f_name.endswith(".mkv") and f"S{s_num:02d}E{e_num:02d}" in f_name:
-                                    is_completed = True
-                                    skip_reason = f"file exists ({f_name})"
-                                    # Self-heal the log
-                                    try:
-                                        with open(completed_log, 'a', encoding='utf-8') as f_log:
-                                            f_log.write(f"{link}\n")
-                                        completed_urls.add(link)
-                                    except Exception as log_e:
-                                        self.log_callback(f"   ⚠️ Could not self-heal completed.log: {log_e}\n")
-                                    break
+                self.log_callback(f"\n--- Processing {i+1}/{len(queue_list)} ---\n")
+                self.after(0, lambda j=i+1, t=len(queue_list): (self.progress_lbl.configure(text=f"Processing file: {j}/{t}"), self.update_idletasks()))
+                success = await capture_m3u8.process_video(link, headless=headless, auto_mode=True)
+                
+                if success is True:
+                    try:
+                        with open(completed_log, 'a', encoding='utf-8') as f:
+                            f.write(f"{link}\n")
+                        completed_urls.add(link)
+                    except Exception as e:
+                        self.log_callback(f"⚠️ Failed to update completed.log: {e}\n")
+                
+                if i < len(queue_list) - 1:
+                    wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])
+                    self.log_callback(f"⏳ Cooling down for {wait} seconds...\n")
+                    capture_m3u8.report_status(f"Cooling down {wait}s...")
+                    await asyncio.sleep(wait)
+        except Exception as e:
+            self.log_callback(f"\n❌ Error in series handler: {e}\n")
+        finally:
+            self._on_finish()
 
-            if is_completed:
-                self.log_callback(f"⏭️  Skipping ({skip_reason}): {link}\n")
-                continue
-
-            self.log_callback(f"\n--- Processing {i+1}/{len(queue_list)} ---\n")
-            self.after(0, lambda j=i+1, t=len(queue_list): (self.progress_lbl.configure(text=f"Processing file: {j}/{t}"), self.update_idletasks()))
-            success = await capture_m3u8.process_video(link, headless=headless, auto_mode=True)
-            
-            if success is True:
-                try:
-                    with open(completed_log, 'a', encoding='utf-8') as f:
-                        f.write(f"{link}\n")
-                    completed_urls.add(link)
-                except Exception as e:
-                    self.log_callback(f"⚠️ Failed to update completed.log: {e}\n")
-            
-            if i < len(queue_list) - 1:
-                wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])
-                self.log_callback(f"⏳ Cooling down for {wait} seconds...\n")
-                capture_m3u8.report_status(f"Cooling down {wait}s...")
-                await asyncio.sleep(wait)
-
-    def _ask_save_queue(self, queue_list, series_title):
-        """Prompt user to optionally save the queue as a .quu file."""
-        answer = messagebox.askyesno(
-            "Save Queue?",
-            f"Save {len(queue_list)} episodes as a .quu queue file for later resuming?"
-        )
-        if answer:
-            safe_title = series_title.replace(':', '-').replace('/', '-').replace('\\', '-')
-            default_name = f"{safe_title}.quu"
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".quu",
-                initialfile=default_name,
-                filetypes=[("Queue Files", "*.quu"), ("All Files", "*.*")]
-            )
-            if filename:
-                try:
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        f.write('\n'.join(queue_list))
-                    self.log_callback(f"💾 Queue saved to: {os.path.basename(filename)}\n")
-                except Exception as e:
-                    self.log_callback(f"⚠️ Failed to save queue: {e}\n")
-        self.input_value = True
+    def _silent_save_queue(self, queue_list, series_title, series_dir):
+        """Silently save the queue as a .quu file to the series directory."""
+        safe_title = series_title.replace(':', '-').replace('/', '-').replace('\\', '-')
+        quu_path = os.path.join(series_dir, f"{safe_title}.quu")
+        try:
+            with open(quu_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(queue_list))
+            self.log_callback(f"💾 Queue auto-saved to series directory (.quu)\n")
+        except Exception as e:
+            self.log_callback(f"⚠️ Failed to auto-save .quu file: {e}\n")
         self.input_event.set()
 
     def show_series_dialog(self, meta):
@@ -792,11 +814,17 @@ class M3U8DownloaderApp(ctk.CTk):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Select Season/Episodes")
         
-        w, h = 300, 250
+        w, h = 320, 300
         x = self.winfo_x() + (self.winfo_width() // 2) - (w // 2)
         y = self.winfo_y() + (self.winfo_height() // 2) - (h // 2)
         dialog.geometry(f"{w}x{h}+{x}+{y}")
         dialog.attributes("-topmost", True)
+        
+        # Header with counts
+        total_eps = meta.get('total_episodes', 0)
+        eps_str = f" | Total Episodes: {total_eps}" if total_eps > 0 else ""
+        header_text = f"Seasons: {meta['seasons']}{eps_str}"
+        ctk.CTkLabel(dialog, text=header_text, font=("Segoe UI", 12, "bold"), text_color="#3498db").pack(pady=(10, 5))
         
         ctk.CTkLabel(dialog, text=f"Select Season (1-{meta['seasons']} or 'all'):").pack(pady=5)
         season_entry = ctk.CTkEntry(dialog)
@@ -842,15 +870,19 @@ class M3U8DownloaderApp(ctk.CTk):
             self.input_event.set()
             dialog.destroy()
             
-        ctk.CTkButton(dialog, text="Download", command=on_confirm).pack(pady=20)
-        
-        # Handle window close
-        def on_close():
+        def on_cancel():
             self.input_value = None
             self.input_event.set()
             dialog.destroy()
-            
-        dialog.protocol("WM_DELETE_WINDOW", on_close)
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=20)
+        
+        ctk.CTkButton(btn_frame, text="Download", command=on_confirm, width=100).pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, fg_color="#e74c3c", hover_color="#c0392b", width=100).pack(side="left", padx=10)
+        
+        # Handle window close
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
 
     def open_top250(self):
         if self.is_running: return
@@ -881,7 +913,11 @@ class M3U8DownloaderApp(ctk.CTk):
             
         dialog = ctk.CTkToplevel(self)
         dialog.title("Select Movies to Download")
-        dialog.geometry("500x600")
+        
+        w, h = 500, 600
+        x = self.winfo_x() + (self.winfo_width() // 2) - (w // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (h // 2)
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
         dialog.attributes("-topmost", True)
         
         # Scrollable frame
@@ -1202,7 +1238,14 @@ class M3U8DownloaderApp(ctk.CTk):
         
         def run_check():
             try:
-                # 1. Determine if Movie or TV Show
+                # Fetch metadata to see if it's a series or movie
+                # use a simpler approach to avoid Coroutine has no attribute 'get'
+                # The original code was already using asyncio.run, which is appropriate for calling an async function from a sync context.
+                # The comments in the provided snippet suggest a misunderstanding of how asyncio.run works or when await is needed.
+                # asyncio.run is designed to run an async coroutine until it completes, blocking the current thread.
+                # It should not be called if an event loop is already running in the current thread, but in a separate thread (like this one), it's fine.
+                # The 'await' keyword can only be used inside an 'async def' function.
+                # Therefore, the original line is the correct way to call an async function from this synchronous thread.
                 meta = asyncio.run(capture_m3u8.get_imdb_info(imdb_id))
                 
                 if meta and meta['type'] == 'tv':
@@ -1282,6 +1325,10 @@ class M3U8DownloaderApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(dialog)
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
         
+        # Standardize window appearance for PyInstaller/Cross-platform
+        dialog.update()
+        dialog.focus_force()
+        
         def select_item(url, img_url=None):
             self.url_entry.delete(0, "end")
             self.url_entry.insert(0, url)
@@ -1343,9 +1390,13 @@ class M3U8DownloaderApp(ctk.CTk):
                     movie_url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
                     threading.Thread(target=self.run_movie_append, args=(movie_url, meta), daemon=True).start()
                 elif action == "download_now" or action == "just_episode":
-                    # Already in the entry, just click Start with bypass
-                    self.bypass_dialog = True
-                    self.after(0, self.start_process)
+                    if isinstance(meta, dict) and meta.get('type') == 'tv':
+                        # For series "Download Now", it means "Pick an episode to download now"
+                        threading.Thread(target=lambda: asyncio.run(self.handle_imdb_series(imdb_id, url)), daemon=True).start()
+                    else:
+                        # Already in the entry, just click Start with bypass
+                        self.bypass_dialog = True
+                        self.after(0, self.start_process)
             
             self.after(0, lambda: MediaSaveDialog(self, meta, img_url, on_dialog_close))
             
@@ -1386,7 +1437,7 @@ class M3U8DownloaderApp(ctk.CTk):
                 except Exception as e:
                     self.log_callback(f"⚠️ Failed to append to queue: {e}\n")
             
-            self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
+            self._on_finish()
             
         self.after(0, pick_and_append)
 
@@ -1413,7 +1464,6 @@ class M3U8DownloaderApp(ctk.CTk):
                 return
                 
             def prompt_save():
-                self.progress_lbl.configure(text="Status: Idle")
                 finder = capture_m3u8.MasterM3U8Finder()
                 safe_title = finder.sanitize_filename(meta['title'])
                 default_name = f"{safe_title}_Full.quu"
@@ -1429,6 +1479,8 @@ class M3U8DownloaderApp(ctk.CTk):
                         self.log_callback(f"💾 Full series queue saved to: {os.path.basename(filename)}\n")
                     except Exception as e:
                         self.log_callback(f"⚠️ Failed to save queue: {e}\n")
+                
+                self._on_finish()
                         
             self.after(0, prompt_save)
             
