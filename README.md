@@ -5,22 +5,29 @@ A premium, all-in-one media automation tool for discovering and downloading M3U8
 ## 🚀 Key Features
 
 - **Unified Media Dialog**: One gorgeous popup for both Movies and TV.
-  - **Movies**: Choose to "Download Now" or **"Add to Queue"** (appends to your existing lists).
+  - **Movies**: Choose to "Download Now" or **"Add to Queue"**.
   - **TV Series**: Automated **"Full Series Queue"** creation or manual **"Download Now"** selection.
-- **Smart IMDB Integration**: Type a name to search, pick a result, and see the full metadata and poster before you download.
-- **Cross-Platform Perfected**: 
-  - **Windows**: Uses Chromium for optimal performance.
-  - **Linux**: Automatically uses Firefox to bypass Cloudflare/anti-bot walls.
-- **Modernized GUI Log**: 
-  - **Color-Coded**: Green ✅ (Success), Red ❌ (Error), Orange ⚠️ (Warning), Blue 🕵️ (Info).
-  - **Native Emoji Support**: Optimized font rendering for all icons on Windows.
-  - **Clear Management**: One-click "Clear" button to reset your activity view.
-- **Queue Appending**: Easily build massive movie collections by appending new titles to existing `.quu` files.
+  - **Enhanced Meta**: See total seasons and total episodes at a glance.
+- **CPU & Resource Optimization**: 
+  - **Browser Re-use**: TV series analysis uses a single browser instance for all seasons, preventing CPU spikes.
+  - **Resource Blocking**: Aggressively blocks images, fonts, and trackers during scraping to save bandwidth.
+- **Advanced Stealth & Bypass**:
+  - **Anti-Bot Countermeasures**: Mocks hardware properties and browser signatures to bypass protections.
+  - **Integrated Blocking**: Automatically blocks libraries like `disable-devtool` via `unpkg.com` interception.
+- **Automated Queue Management**: 
+  - **Silent Saving**: Automatically generates and saves `.quu` queue files silently.
+  - **Infinite Scroll Support**: Full support for IMDB Top 250 lists with real-time feedback.
 - **Robust Downloader**: 
   - **Fragment Retries**: Automatically retries missing stream fragments up to 10 times.
   - **Auto-Detection**: Sniffs network traffic to find `master.m3u8` streams early.
   - **Smart Resume**: Self-healing `completed.log` that checks the filesystem to avoid re-downloads.
-- **Default Paths**: Automatically creates `TV/` and `Movie/` subfolders in the script directory if no paths are configured.
+- **Cross-Platform Perfected**: 
+  - **Windows**: Uses Chromium for optimal performance.
+  - **Linux**: Automatically uses Firefox to bypass Cloudflare/anti-bot walls.
+- **Modernized GUI Log**: 
+  - **Real-Time Feedback**: Logs batch-by-batch progress during large scrapes.
+  - **Color-Coded**: Visual cues for success ✅, errors ❌, and scanning updates 🕵️.
+- **Default Paths**: Automatically creates `TV/` and `Movie/` subfolders if no paths are configured.
 
 ---
 
@@ -85,13 +92,32 @@ The app saves your settings automatically, but you can edit `config.json` manual
   "download_speed": "6M",
   "min_cooldown": 10,
   "max_cooldown": 25,
-  "theme": "dark"
+  "theme": "dark",
+  "ffmpeg_path": "C:/tools/ffmpeg_libfdk.exe",
+  "ytdlp_path": "C:/tools/yt-dlp.exe"
 }
 ```
+
+*   **ffmpeg_path**: Full path to a specific `ffmpeg` executable (optional).
+*   **ytdlp_path**: Full path to a specific `yt-dlp` executable (optional).
+
+### 🚫 Iframe Ignore List (`ignore_iframes.txt`)
+
+You can manually skip specific domains during the iframe scanning process. Create a file named `ignore_iframes.txt` in the script directory and add one domain per line:
+```text
+example.com
+ads.service.net
+```
+The script re-scans this file for every attempt, allowing you to update it on the fly.
 
 ---
 
 ## ❓ Troubleshooting
+
+### High CPU Usage
+The application is optimized to reuse browser instances and block non-essential resources (images/fonts) during metadata scraping. If you still encounter high CPU usage:
+1. Ensure you are running in **Headless Mode** unless you need to solve a captcha.
+2. Check that your `completed.log` isn't massive (thousands of entries), as larger logs take slightly more time to cross-reference (though the impact is minimal).
 
 ### Linux "Executable Not Found"
 If Playwright fails on Linux, ensure you've run `playwright install firefox`. The script is specifically tuned to use Firefox on Linux to bypass security filters that block Chromium.
