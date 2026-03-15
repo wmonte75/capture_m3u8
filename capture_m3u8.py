@@ -10,6 +10,7 @@ import importlib.util
 import io
 import urllib.parse
 from contextlib import redirect_stdout
+from typing import List, Tuple, Dict, Optional, Set, Any, Union, Callable
 
 # Dependency Check
 try:
@@ -29,12 +30,83 @@ except ImportError as e:
     sys.exit(1)
 
 def get_base_dir():
+    """Returns the directory where the executable or script is located."""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
-# Set Playwright to download and look for browsers in the local directory
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(get_base_dir(), "playwright_browsers")
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = getattr(sys, '_MEIPASS', None) or os.path.dirname(os.path.abspath(__file__))
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+# Handle SSL Certificates for Frozen Apps
+if getattr(sys, 'frozen', False):
+    import certifi
+    cert_path = certifi.where()
+    os.environ["SSL_CERT_FILE"] = cert_path
+    os.environ["REQUESTS_CA_BUNDLE"] = cert_path
+
+def get_browser_executable(browser_type="chromium"):
+    """
+    Finds the actual executable path for the browser in the local playwright_browsers folder.
+    Forces use of full Chromium even in headless mode to save space/avoid errors.
+    """
+    browsers_base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not browsers_base or not os.path.exists(browsers_base):
+        return None
+
+    # Determine executable name based on OS and browser
+    exec_name = "chrome.exe" # Default
+    if sys.platform == "win32":
+        exec_name = "firefox.exe" if browser_type == "firefox" else "chrome.exe"
+    else:
+        exec_name = "firefox" if browser_type == "firefox" else "chrome"
+    
+    # We want to find a folder matching the browser type but EXCLUDING headless shell
+    folder_keyword = "FIREFOX" if browser_type == "firefox" else "CHROMIUM"
+
+    # Search for the executable within the correct browser folder
+    for root, dirs, files in os.walk(browsers_base):
+        if exec_name in files:
+            path_upper = root.upper()
+            # Must contain keyword but MUST NOT contain 'HEADLESS_SHELL'
+            if folder_keyword in path_upper and "HEADLESS_SHELL" not in path_upper:
+                return os.path.normpath(os.path.join(root, exec_name))
+    
+    return None
+
+# Set Playwright to look for browsers in the bundled folder or local dev folder
+def get_smart_browsers_path():
+    """
+    Determines where to look for browser binaries.
+    1. Check if a 'playwright_browsers' folder exists next to the EXE/Script (Permanent).
+    2. If not, check if it's bundled inside (PyInstaller temp folder).
+    3. Default to the EXE folder for future persistent downloads.
+    """
+    # 1. Permanent location (Executable/Script folder)
+    base_dir = get_base_dir()
+    exe_path = os.path.join(base_dir, "playwright_browsers")
+    if os.path.exists(exe_path) and os.listdir(exe_path):
+        return exe_path
+        
+    # 2. Bundled location (PyInstaller temporary folder)
+    if getattr(sys, 'frozen', False):
+        try:
+            bundle_path = os.path.join(getattr(sys, '_MEIPASS', ''), "playwright_browsers")
+            if bundle_path and os.path.exists(bundle_path) and os.listdir(bundle_path):
+                return bundle_path
+        except:
+            pass
+            
+    # 3. Default back to EXE folder (Ensures persistence if we have to download)
+    return exe_path
+
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = get_smart_browsers_path()
 
 def ensure_playwright_browsers():
     """Download Playwright browsers if they don't exist locally."""
@@ -63,11 +135,21 @@ def ensure_playwright_browsers():
 # Sites like vidsrcme.ru cross-check the UA OS against the real OS and block
 # when they don't match (e.g. Windows UA running on Linux → about:blank).
 if sys.platform.startswith('linux'):
-    USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    # Match the browser engine (Firefox) used on Linux to avoid detection
+    USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0'
 elif sys.platform == 'darwin':
     USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 else:
     USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+async def block_resources(route):
+    """Block images, fonts, and trackers to save CPU/bandwidth."""
+    if route.request.resource_type in ["image", "font", "media"]:
+        await route.abort()
+    elif any(x in route.request.url for x in ["google-analytics", "doubleclick", "amazon-adsystem", "adnxs"]):
+        await route.abort()
+    else:
+        await route.continue_()
 
 # Download speed limit to avoid 429 "Too Many Requests" errors (e.g., '5M', '10M', '15M', '20M')
 DOWNLOAD_SPEED = '6M'
@@ -105,13 +187,57 @@ def check_stop():
     if STOP_CALLBACK and STOP_CALLBACK():
         raise Exception("Stopped by user")
 
+def get_ignored_iframes():
+    """Reads ignored domains from ignore_iframes.txt next to the executable."""
+    ignore_file = os.path.join(get_base_dir(), "ignore_iframes.txt")
+    
+    # Default list of domains to ignore
+    default_ignores = [
+        "cloudflare.com", "turnstile.com", "recaptcha.net",
+        "dtscout.com", "lijit.com", "sharethis.com",
+        "crwdcntrl.net", "intentiq.com", "doubleclick.net",
+        "googlesyndication.com", "amazon-adsystem.com",
+        "facebook.com", "google-analytics.com",
+        "scorecardresearch.com", "quantserve.com",
+        "adnxs.com", "rubiconproject.com", "pubmatic.com",
+        "2embed.cc", "unpkg.com"
+    ]
+
+    if not os.path.exists(ignore_file):
+        try:
+            with open(ignore_file, "w", encoding="utf-8") as f:
+                f.write("# Add domains or URL patterns to ignore when scanning for iframes (one per line)\n")
+                f.write("# Lines starting with # are comments\n")
+                for domain in default_ignores:
+                    f.write(f"{domain}\n")
+            log(f"   📝 Created default ignore list: {ignore_file}")
+        except Exception as e:
+            log(f"   ⚠️ Could not create {ignore_file}: {e}")
+            return default_ignores
+
+    ignored = []
+    try:
+        with open(ignore_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    ignored.append(line.lower())
+    except Exception as e:
+        log(f"   ⚠️ Error reading {ignore_file}: {e}")
+        return default_ignores
+
+    return ignored
+
+# Initialize the ignore list file on startup so users can edit it before the first scan
+get_ignored_iframes()
+
 class PluginManager:
     def __init__(self):
         self.plugins_dir = os.path.join(get_base_dir(), "plugins")
 
     def run_plugins(self, file_path):
         """
-        Scans 'plugins' folder and executes .py files sequentially.
+        Scans "plugins" folder and executes .py files sequentially.
         Each plugin must have a process(file_path) function.
         """
         if not os.path.exists(self.plugins_dir):
@@ -125,12 +251,15 @@ class PluginManager:
         current_path = file_path
 
         for filename in files:
-            plugin_path = os.path.join(self.plugins_dir, filename)
+            filename_str: str = str(filename)
+            plugin_path = os.path.join(self.plugins_dir, filename_str)
             try:
-                spec = importlib.util.spec_from_file_location(filename[:-3], plugin_path)
+                plugin_name = filename_str[:-3] if filename_str.endswith(".py") else filename_str
+                spec = importlib.util.spec_from_file_location(plugin_name, plugin_path)
                 if spec and spec.loader:
                     module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
+                    if spec.loader:
+                        spec.loader.exec_module(module)
                     
                     if hasattr(module, "process"):
                         # Capture stdout to a buffer
@@ -142,7 +271,7 @@ class PluginManager:
                                 new_path = module.process(current_path)
                         except Exception as e:
                             # If plugin fails during execution, log everything
-                            log(f"   ❌ Plugin {filename} failed during execution:")
+                            log(f"   ❌ Plugin {filename_str} failed during execution:")
                             # Log any output it produced before crashing
                             captured_output = output_buffer.getvalue()
                             if captured_output:
@@ -152,18 +281,16 @@ class PluginManager:
 
                         # Check if the plugin did something (path changed)
                         if new_path and new_path != current_path and os.path.exists(new_path):
-                            log(f"   Running plugin: {filename}...")
+                            log(f"   Running plugin: {filename_str}...")
                             # Log the captured output from the successful plugin
                             captured_output = output_buffer.getvalue()
                             if captured_output:
-                                # We use print() inside plugins, so we need to pass the whole block to log()
                                 log(captured_output, end="")
                             current_path = new_path
-                        # If the path is the same, the plugin skipped, and we silently discard its output.
                     else:
-                        log(f"   ⚠️  Skipping {filename}: No 'process' function found.")
+                        log(f"   ⚠️  Skipping {filename_str}: No 'process' function found.")
             except Exception as e:
-                log(f"   ❌ Plugin {filename} failed to load: {e}")
+                log(f"   ❌ Plugin {filename_str} failed to load: {e}")
         
         return current_path
 
@@ -176,10 +303,11 @@ class MasterM3U8Finder:
     4. Downloading the stream using yt-dlp.
     """
     def __init__(self):
-        self.master_url = None
-        self.candidates = []
-        self.bad_candidates = set()
-        self.title = "Unknown"
+        self.master_url: Optional[str] = None
+        self.candidates: List[str] = []
+        self.bad_candidates: Set[str] = set()
+        self.title: str = "Unknown"
+        self._verify_in_progress: bool = False
         
     def find_ytdlp(self):
         """Check if yt-dlp exists in common locations"""
@@ -271,7 +399,7 @@ class MasterM3U8Finder:
         except Exception as e:
             log(f"   ⚠️ Failed to save cookies: {e}")
 
-    async def get_working_url(self, context):
+    async def get_working_url(self, context) -> Optional[str]:
         """Test all new candidates in parallel and return the first working one."""
         new_candidates = [u for u in self.candidates if u not in self.bad_candidates and u != self.master_url]
         if not new_candidates:
@@ -423,7 +551,7 @@ class MasterM3U8Finder:
             log(f"\n❌ Error running yt-dlp: {e}")
             return False
 
-    async def capture(self, start_url, headless=False):
+    async def capture(self, start_url: str, headless: bool = False) -> Tuple[Optional[str], str, Optional[str], str]:
         """
         The core logic:
         - Opens the URL.
@@ -448,12 +576,16 @@ class MasterM3U8Finder:
 
         async with async_playwright() as p:
             if sys.platform.startswith('linux'):
+                exec_path = get_browser_executable("firefox")
+                if not exec_path:
+                    return None, "", None, "error"
                 # Use Firefox on Linux — different TLS/browser fingerprint bypasses
                 # Cloudflare bot detection that blocks Chromium headless on Linux.
                 # Windows/Mac continue to use Chromium (proven working, unchanged).
                 context = await p.firefox.launch_persistent_context(
                     user_data_dir,
                     headless=headless,
+                    executable_path=exec_path,
                     user_agent=USER_AGENT,
                     firefox_user_prefs={
                         # Block JS popup windows
@@ -475,10 +607,14 @@ class MasterM3U8Finder:
                     asyncio.ensure_future(new_page.close())
                 context.on("page", _close_extra_page)
             else:
+                exec_path = get_browser_executable("chromium")
+                if not exec_path:
+                    return None, "", None, "error"
                 # Chromium for Windows / Mac — proven working, unchanged
                 context = await p.chromium.launch_persistent_context(
                     user_data_dir,
                     headless=headless,
+                    executable_path=exec_path,
                     viewport=None if not headless else {'width': 1280, 'height': 720},
                     user_agent=USER_AGENT,
                     bypass_csp=True,
@@ -508,7 +644,9 @@ class MasterM3U8Finder:
                     return await route.abort()
                 
                 url = request.url.lower()
+                # Reinforce blocking of unpkg and ads
                 if "unpkg.com" in url or ad_regex.search(url):
+                    # log(f"   🚫 Blocked: {url[:60]}")
                     return await route.abort()
                 
                 await route.continue_()
@@ -540,14 +678,19 @@ class MasterM3U8Finder:
                     ]
                 });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' });
                 window.chrome = { runtime: {} };
 
                 // Fix HeadlessChrome in userAgent without recursion (Linux headless)
                 try {
-                    const _origUA = Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get.call(navigator);
-                    Object.defineProperty(navigator, 'userAgent', {
-                        get: () => _origUA.replace('HeadlessChrome', 'Chrome')
-                    });
+                    const _origUA = navigator.userAgent;
+                    if (_origUA.includes('HeadlessChrome')) {
+                        Object.defineProperty(navigator, 'userAgent', {
+                            get: () => _origUA.replace('HeadlessChrome', 'Chrome')
+                        });
+                    }
                 } catch(e) {}
             """)
             
@@ -634,32 +777,36 @@ class MasterM3U8Finder:
             frames = page.frames
             iframe_urls = []
             
+            # Load ignored domains live from the text file
+            skip_patterns = get_ignored_iframes()
+            
             for frame in frames:
                 check_stop()
                 try:
                     url = frame.url
                     if url and url != start_url and 'about:blank' not in url:
-                        # Skip known bot/captcha/tracking/ad domains
-                        # Firefox doesn't block these by default, so they show as iframes
-                        skip_domains = [
-                            'cloudflare', 'turnstile', 'recaptcha',
-                            'dtscout.com', 'lijit.com', 'sharethis.com',
-                            'crwdcntrl.net', 'intentiq.com', 'doubleclick.net',
-                            'googlesyndication.com', 'amazon-adsystem.com',
-                            'facebook.com/tr', 'google-analytics.com',
-                            'scorecardresearch.com', 'quantserve.com',
-                            'adnxs.com', 'rubiconproject.com', 'pubmatic.com',
-                        ]
-                        if any(x in url.lower() for x in skip_domains):
+                        low_url = url.lower()
+                        
+                        # Skip domains/patterns in the ignore list
+                        if any(x in low_url for x in skip_patterns):
+                            continue
+
+                        # Specifically ignore Cloudnestra ProRCP as requested
+                        if 'cloudnestra.com/prorcp/' in low_url:
                             continue
 
                         # Only keep iframes that look like video embeds
                         video_patterns = [
-                            'cloudnestra', 'vidsrc', '/embed/', '/rcp/', '/prorcp/',
+                            'cloudnestra.com/rcp/', 'vidsrc', '/embed/',
                             'streamtape', 'doodstream', 'filemoon', 'mixdrop',
                             'upstream', 'vidplay', 'mycloud', 'mp4upload',
                         ]
-                        if not any(x in url.lower() for x in video_patterns):
+                        
+                        # If it's Cloudnestra, it MUST start with the RCP prefix
+                        if 'cloudnestra.com' in low_url and not low_url.startswith('https://cloudnestra.com/rcp/'):
+                            continue
+
+                        if not any(x in low_url for x in video_patterns):
                             continue
 
                         log(f"   Found iframe: {url[:80]}")
@@ -706,14 +853,18 @@ class MasterM3U8Finder:
                             self.title = iframe_title
                             log(f"   📝 Iframe Title: {self.title}")
 
-                        # JS evaluate click — primary method (works on Windows + non-Linux)
                         try:
+                            # More aggressive interaction including multiple clicks and keypress
                             await page.evaluate("""() => {
                                 const video = document.querySelector('video');
                                 if (video) { video.muted = true; video.play().catch(e => {}); }
-                                const btn = document.querySelector('.vjs-big-play-button, .play-button, [class*="play"]');
-                                if (btn) btn.click();
+                                const btn = document.querySelector('.vjs-big-play-button, .play-button, [class*="play"], [id*="play"]');
+                                if (btn) { btn.click(); }
+                                document.body.click();
                             }""")
+                            # Extra fallback for persistent players
+                            await page.mouse.click(640, 360)
+                            await page.keyboard.press(' ') # Trigger play with space
                         except:
                             pass
 
@@ -766,6 +917,11 @@ class MasterM3U8Finder:
                 verified = await self.get_working_url(context)
                 if verified:
                     self.master_url = verified
+
+            # Add a default return to satisfy linter
+            referer = page.url if 'page' in locals() else ""
+            status = "success" if self.master_url else "timeout"
+            return self.master_url, self.title, referer, status
             
             await self.save_cookies(context)
             await context.close()
@@ -775,7 +931,7 @@ class MasterM3U8Finder:
     def set_download_speed(self, speed):
         self.download_speed = speed
 
-def get_output_paths(title, url):
+def get_output_paths(title: str, url: str) -> Tuple[str, str]:
     finder = MasterM3U8Finder()
     safe_title = finder.sanitize_filename(title)
     
@@ -813,7 +969,7 @@ def get_output_paths(title, url):
         
     return final_dir, filename
 
-async def process_video(url, headless=True, auto_mode=True):
+async def process_video(url: str, headless: bool = True, auto_mode: bool = True) -> Union[bool, str]:
     """
     Orchestrates the download process for a single URL:
     1. Converts IMDB URLs if needed.
@@ -827,14 +983,29 @@ async def process_video(url, headless=True, auto_mode=True):
     if not url.startswith('http'):
         url = 'https://' + url
     
-    # Check for IMDB URL and convert to vsembed
+    # Check for IMDB URL and convert to appropriate embed
     if "imdb.com/title/" in url:
         match = re.search(r'(tt\d+)', url)
         if match:
             imdb_id = match.group(1)
             log(f"\nℹ️  Detected IMDB URL. ID: {imdb_id}")
-            url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
-            log(f"   Converted to: {url}")
+            
+            # Fetch metadata to see if it's a series or movie
+            meta = await get_imdb_info(imdb_id)
+            if meta and meta.get('type') == 'tv':
+                # For TV series, default to S1E1 if not specified in URL
+                s = 1
+                e = 1
+                s_match = re.search(r'[?&]season=(\d+)', url)
+                e_match = re.search(r'[?&]episode=(\d+)', url)
+                if s_match: s = int(s_match.group(1))
+                if e_match: e = int(e_match.group(1))
+                
+                url = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season={s}&episode={e}"
+                log(f"   Detected TV Series. Using: {url}")
+            else:
+                url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
+                log(f"   Converted to Movie: {url}")
 
     if not auto_mode:
         log("\nBrowser visibility options:")
@@ -992,7 +1163,7 @@ async def process_video(url, headless=True, auto_mode=True):
             log(f"\n📋 Save this command:")
             log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
             return True
-        
+            
     else:
         if headless:
             log("\n⚠️  Headless capture failed. Retrying in visible mode to bypass Cloudflare...")
@@ -1001,154 +1172,201 @@ async def process_video(url, headless=True, auto_mode=True):
         log("❌ FAILED - No master.m3u8 found")
         return False
 
-async def get_imdb_info(imdb_id):
+# In-memory cache for IMDB metadata
+IMDB_CACHE: Dict[str, Any] = {}
+
+def flush_imdb_cache():
+    """Clear the IMDB metadata cache."""
+    global IMDB_CACHE
+    IMDB_CACHE.clear()
+    # log("🧹 IMDB cache flushed.")
+
+async def get_imdb_info(imdb_id: str, page=None) -> Optional[Dict[str, Any]]:
+    if imdb_id in IMDB_CACHE:
+        # log(f"🚀 Using cached metadata for: {imdb_id}")
+        return IMDB_CACHE[imdb_id]
+        
     url = f"https://www.imdb.com/title/{imdb_id}/"
     log(f"🕵️  Scanning IMDB: {url}")
     
+    async def _extract(p):
+        # Enable resource blocking for this page
+        await p.route("**/*", block_resources)
+        
+        try:
+            # Use domcontentloaded + shorter timeout for faster metadata extraction
+            # IMDB is heavy with ads/tracking that cause full 'load' to timeout.
+            await p.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            log(f"   ⚠️ IMDB load warning: {str(e)[:100]}")
+            # We continue anyway as the title and basic meta might already be in the DOM
+        
+        title = await p.title()
+        title = re.sub(r'\s*[-|]\s*IMDb.*', '', title).strip()
+        
+        # Fallback if title is empty
+        if not title:
+            try:
+                title = await p.locator('h1').first.inner_text()
+            except:
+                title = "Unknown"
+        
+        # Extract Year
+        year = ""
+        try:
+            # Get metadata items text (Year is usually 1st or 2nd item)
+            meta_items = await p.locator('[data-testid="hero-title-block__metadata"] li').all_inner_texts()
+            for text in meta_items[:3]:
+                match = re.search(r'\b(19|20)\d{2}\b', text)
+                if match:
+                    year = match.group(0)
+                    break
+        except:
+            pass
+        
+        if year and year not in title:
+            title = f"{title} ({year})"
+        
+        is_tv = False
+        
+        # Check for series markers
+        if await p.locator('text=Episode Guide').count() > 0 or \
+           await p.locator('a[href*="episodes"]').count() > 0 or \
+           await p.locator('[data-testid="hero-subnav-bar-season-episode-picker"]').count() > 0:
+            is_tv = True
+        
+        if not is_tv:
+            res = {'type': 'movie', 'title': title}
+            IMDB_CACHE[imdb_id] = res
+            return res
+        
+        total_episodes = 0
+        try:
+            ep_subtext = p.locator('[data-testid="episodes-header"] .ipc-title__subtext')
+            if await ep_subtext.count() > 0:
+                text = await ep_subtext.first.inner_text()
+                if text.isdigit():
+                    total_episodes = int(text)
+        except:
+            pass
+        
+        log("   📺 TV Series detected. Fetching season info...")
+        await p.goto(f"https://www.imdb.com/title/{imdb_id}/episodes", wait_until="domcontentloaded", timeout=45000)
+        
+        # Wait for season selector to load
+        try:
+            await p.wait_for_selector('#bySeason, [data-testid="select-season"]', timeout=5000)
+        except:
+            pass
+
+        seasons = []
+        options = await p.locator('#bySeason option').all()
+        if not options:
+            options = await p.locator('[data-testid="select-season"] option').all()
+            
+        for opt in options:
+            val = await opt.get_attribute('value')
+            if val and val.isdigit():
+                seasons.append(int(val))
+        
+        # Fallback: Check for season links if dropdown is missing
+        if not seasons:
+            links = await p.locator('a[href*="season="]').all()
+            for link in links:
+                href = await link.get_attribute('href')
+                if href:
+                    match = re.search(r'season=(\d+)', href)
+                    if match:
+                        seasons.append(int(match.group(1)))
+        
+        total_seasons = max(seasons) if seasons else 1
+        res = {'type': 'tv', 'title': title, 'seasons': total_seasons, 'total_episodes': total_episodes}
+        IMDB_CACHE[imdb_id] = res
+        return res
+
+    if page:
+        return await _extract(page)
+
     # Ensure browsers are downloaded before launching
     ensure_playwright_browsers()
     
     async with async_playwright() as p:
         if sys.platform.startswith('linux'):
-            browser = await p.firefox.launch(headless=True)
+            exec_path = get_browser_executable("firefox")
+            if not exec_path:
+                return None
+            browser = await p.firefox.launch(headless=True, executable_path=exec_path)
         else:
-            browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(user_agent=USER_AGENT)
+            exec_path = get_browser_executable("chromium")
+            if not exec_path:
+                return None
+            browser = await p.chromium.launch(headless=True, executable_path=exec_path)
         
+        new_page = await browser.new_page(user_agent=USER_AGENT)
         try:
-            try:
-                # Use domcontentloaded + shorter timeout for faster metadata extraction
-                # IMDB is heavy with ads/tracking that cause full 'load' to timeout.
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            except Exception as e:
-                log(f"   ⚠️ IMDB load warning: {str(e)[:100]}")
-                # We continue anyway as the title and basic meta might already be in the DOM
-            
-            title = await page.title()
-            title = re.sub(r'\s*[-|]\s*IMDb.*', '', title).strip()
-            
-            # Fallback if title is empty
-            if not title:
-                try:
-                    title = await page.locator('h1').first.inner_text()
-                except:
-                    title = "Unknown"
-            
-            # Extract Year
-            year = ""
-            try:
-                # Get metadata items text (Year is usually 1st or 2nd item)
-                meta_items = await page.locator('[data-testid="hero-title-block__metadata"] li').all_inner_texts()
-                for text in meta_items[:3]:
-                    match = re.search(r'\b(19|20)\d{2}\b', text)
-                    if match:
-                        year = match.group(0)
-                        break
-            except:
-                pass
-            
-            if year and year not in title:
-                title = f"{title} ({year})"
-            
-            is_tv = False
-            
-            # Check for series markers
-            if await page.locator('text=Episode Guide').count() > 0 or \
-               await page.locator('a[href*="episodes"]').count() > 0 or \
-               await page.locator('[data-testid="hero-subnav-bar-season-episode-picker"]').count() > 0:
-                is_tv = True
-            
-            if not is_tv:
-                await browser.close()
-                return {'type': 'movie', 'title': title}
-            
-            total_episodes = 0
-            try:
-                ep_subtext = page.locator('[data-testid="episodes-header"] .ipc-title__subtext')
-                if await ep_subtext.count() > 0:
-                    text = await ep_subtext.first.inner_text()
-                    if text.isdigit():
-                        total_episodes = int(text)
-            except:
-                pass
-            
-            log("   📺 TV Series detected. Fetching season info...")
-            await page.goto(f"https://www.imdb.com/title/{imdb_id}/episodes", wait_until="domcontentloaded", timeout=45000)
-            
-            # Wait for season selector to load
-            try:
-                await page.wait_for_selector('#bySeason, [data-testid="select-season"]', timeout=5000)
-            except:
-                pass
-
-            seasons = []
-            options = await page.locator('#bySeason option').all()
-            if not options:
-                options = await page.locator('[data-testid="select-season"] option').all()
-                
-            for opt in options:
-                val = await opt.get_attribute('value')
-                if val and val.isdigit():
-                    seasons.append(int(val))
-            
-            # Fallback: Check for season links if dropdown is missing
-            if not seasons:
-                links = await page.locator('a[href*="season="]').all()
-                for link in links:
-                    href = await link.get_attribute('href')
-                    if href:
-                        match = re.search(r'season=(\d+)', href)
-                        if match:
-                            seasons.append(int(match.group(1)))
-            
-            total_seasons = max(seasons) if seasons else 1
+            res = await _extract(new_page)
             await browser.close()
-            return {'type': 'tv', 'title': title, 'seasons': total_seasons, 'total_episodes': total_episodes}
-            
+            return res
         except Exception as e:
             log(f"⚠️  IMDB Scan failed: {e}")
             await browser.close()
             return None
-
-async def get_season_episodes(imdb_id, season):
+async def get_season_episodes(imdb_id: str, season: int, page=None) -> int:
     url = f"https://www.imdb.com/title/{imdb_id}/episodes?season={season}"
     log(f"   📖 Fetching episode count for Season {season}...")
     
-    async with async_playwright() as p:
-        if sys.platform.startswith('linux'):
-            browser = await p.firefox.launch(headless=True)
-        else:
-            browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(user_agent=USER_AGENT)
-        
+    async def _extract(p):
+        await p.route("**/*", block_resources)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await p.goto(url, wait_until="domcontentloaded", timeout=45000)
             try:
-                await page.wait_for_selector('.list_item, article.episode-item-wrapper, [data-testid="episodes-browse-episodes"]', timeout=5000)
+                await p.wait_for_selector('.list_item, article.episode-item-wrapper, [data-testid="episodes-browse-episodes"]', timeout=5000)
             except:
                 pass
                 
-            count = await page.locator('.list_item').count()
+            count = await p.locator('.list_item').count()
             if count == 0:
-                count = await page.locator('article.episode-item-wrapper').count()
+                count = await p.locator('article.episode-item-wrapper').count()
             if count == 0:
-                count = await page.locator('[data-testid="episodes-browse-episodes"] .ipc-title__text').count()
+                count = await p.locator('[data-testid="episodes-browse-episodes"] .ipc-title__text').count()
             
-            await browser.close()
             return count if count > 0 else 0
+        except Exception as e:
+            log(f"   ⚠️ Failed to load season {season}: {e}")
+            return 0
+
+    if page:
+        return await _extract(page)
+
+    async with async_playwright() as p:
+        if sys.platform.startswith('linux'):
+            exec_path = get_browser_executable("firefox")
+            if not exec_path: return 0
+            browser = await p.firefox.launch(headless=True, executable_path=exec_path)
+        else:
+            exec_path = get_browser_executable("chromium")
+            if not exec_path: return 0
+            browser = await p.chromium.launch(headless=True, executable_path=exec_path)
+        
+        new_page = await browser.new_page(user_agent=USER_AGENT)
+        try:
+            count = await _extract(new_page)
+            await browser.close()
+            return count
         except:
             await browser.close()
             return 0
 
 def clear_session(reason=""):
-    if os.path.exists("browser_session"):
+    session_dir = os.path.join(get_base_dir(), "browser_session")
+    if os.path.exists(session_dir):
         message = f"\n🧹 Clearing browser session"
         if reason:
             message += f" ({reason})"
         message += "..."
         log(message)
         try:
-            shutil.rmtree("browser_session")
+            shutil.rmtree(session_dir)
             log("   ✅ Session cleared.")
         except Exception as e:
             log(f"   ⚠️ Failed to clear session: {e}")
@@ -1279,7 +1497,7 @@ def get_title_details(url):
         pass
     return {'year': ''}
 
-async def scrape_imdb_chart(chart_type, limit=250):
+async def scrape_imdb_chart(chart_type, limit=250, page=None):
     """
     Scrapes IMDB Top 250 lists (Movies or TV).
     - Extracts links.
@@ -1297,51 +1515,125 @@ async def scrape_imdb_chart(chart_type, limit=250):
     log(f"🚀 Starting scrape of: {label}")
     log(f"   URL: {url}")
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(user_agent=USER_AGENT)
-        
+    async def _extract(p):
+        await p.route("**/*", block_resources)
         try:
-            await page.goto(url, timeout=60000)
-            log("   Page loaded. Scanning list...")
-            
+            await p.goto(url, timeout=60000)
             try:
-                await page.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
+                await p.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
             except:
                 pass
             
-            # Extract links
-            links = await page.locator('.ipc-metadata-list-summary-item a.ipc-title-link-wrapper').all()
-            count = len(links)
-            log(f"   Found {count} items.")
+            # Infinite Scroll Support: IMDb loads in batches. Scroll until we see the target count.
+            log("   Scrolling to load full list...")
+            max_scroll_attempts = 15
+            for attempt in range(max_scroll_attempts):
+                # Press End to jump to bottom and trigger load
+                await p.keyboard.press("End")
+                await asyncio.sleep(1.5) # Wait for Batch to load
+                
+                # Check current count
+                current_count = await p.locator('.ipc-metadata-list-summary-item').count()
+                log(f"   🔄 Batch {attempt + 1}: Loaded {current_count} items...")
+                
+                if current_count >= 250:
+                    log(f"   ✅ All {current_count} items loaded.")
+                    break
+
+            # Extract items to get both title and year metadata
+            items = await p.locator('.ipc-metadata-list-summary-item').all()
+            log(f"   Extracting details from {len(items)} items...")
             
             results = []
-            if count > 0:
-                if limit and count > limit:
-                    links = links[:limit]
+            if items:
+                if limit and len(items) > limit:
+                    items = items[:limit]
                 
-                for link in links:
-                    href = await link.get_attribute('href')
-                    title = await link.inner_text()
-                    # Clean title (remove "1. " rank)
-                    title = re.sub(r'^\d+\.\s+', '', title)
-                    
-                    if href:
-                        clean_url = "https://www.imdb.com" + href.split('?')[0]
-                        results.append({'title': title, 'url': clean_url})
+                for idx, item in enumerate(items):
+                    try:
+                        if (idx + 1) % 50 == 0:
+                            log(f"   ✍️  Processing {idx + 1}/{len(items)}...")
+                        link_el = item.locator('a.ipc-title-link-wrapper')
+                        title = await link_el.inner_text()
+                        href = await link_el.get_attribute('href')
+                        
+                        # Clean title (remove "1. " rank)
+                        title = re.sub(r'^\d+[\.\s]+', '', title).strip()
+                        
+                        # Extract metadata from the metadata items
+                        meta_elements = await item.locator('.cli-title-metadata-item').all()
+                        year = ""
+                        runtime = ""
+                        rating = ""
+                        
+                        for m_el in meta_elements:
+                            text = (await m_el.inner_text()).strip()
+                            if re.search(r'^\d{4}$', text):
+                                year = text
+                            elif 'h' in text or 'm' in text:
+                                runtime = text
+                            else:
+                                rating = text
+                        
+                        # Extract Star Rating
+                        stars = ""
+                        try:
+                            star_el = item.locator('.ipc-rating-star--imdb')
+                            star_text = await star_el.inner_text()
+                            stars_match = re.search(r'(\d+\.\d+)', star_text)
+                            if stars_match:
+                                stars = stars_match.group(1)
+                        except:
+                            pass
+
+                        # Format title: Title (Year) - [Runtime] - [Rating] - ★Stars
+                        formatted_title = title
+                        if year:
+                            formatted_title = f"{formatted_title} ({year})"
+                        if runtime:
+                            formatted_title = f"{formatted_title} - [{runtime}]"
+                        if rating:
+                            formatted_title = f"{formatted_title} - [{rating}]"
+                        if stars:
+                            formatted_title = f"{formatted_title} - ★{stars}"
+                        
+                        if href:
+                            clean_url = "https://www.imdb.com" + href.split('?')[0]
+                            results.append({'title': formatted_title, 'url': clean_url})
+                    except:
+                        continue
                 
                 log(f"✅ Scraped {len(results)} items.")
                 return results
             else:
                 log("❌ No items found. IMDB layout might have changed.")
                 return []
-                
         except Exception as e:
             log(f"❌ Error during scrape: {e}")
             return []
-        finally:
-            await browser.close()
 
+    if page:
+        return await _extract(page)
+
+    async with async_playwright() as p:
+        if sys.platform.startswith('linux'):
+            exec_path = get_browser_executable("firefox")
+            if not exec_path: return []
+            browser = await p.firefox.launch(headless=True, executable_path=exec_path)
+        else:
+            exec_path = get_browser_executable("chromium")
+            if not exec_path: return []
+            browser = await p.chromium.launch(headless=True, executable_path=exec_path)
+        
+        new_page = await browser.new_page(user_agent=USER_AGENT)
+        try:
+            results = await _extract(new_page)
+            await browser.close()
+            return results
+        except:
+            await browser.close()
+            return []
+            
 async def main():
     """
     Entry point:
@@ -1464,6 +1756,9 @@ async def main():
         session_count = 0
         not_found_report = []
 
+        # Flush cache before starting the batch/queue
+        flush_imdb_cache()
+        
         for i, queue_url in enumerate(urls):
             print(f"\n{'='*20} Processing {i+1}/{len(urls)} {'='*20}")
             
@@ -1700,7 +1995,8 @@ async def main():
                     return
 
         if url:
-            # Single movie download
+            # Single movie download - flush cache before start
+            flush_imdb_cache()
             await process_video(url, headless=headless, auto_mode=auto_mode)
 
 if __name__ == "__main__":
