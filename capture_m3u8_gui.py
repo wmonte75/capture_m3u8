@@ -92,13 +92,15 @@ class ToolTip:
             self.tip_window = None
 
 class MediaSaveDialog(ctk.CTkToplevel):
-    def __init__(self, parent, meta, img_url, callback):
+    def __init__(self, parent, meta, img_url, availability_msg, is_available, callback):
         super().__init__(parent)
         self.is_tv = (meta.get('type') == 'tv')
         self.title("Media Found" if not self.is_tv else "Save Full Series?")
         self.callback = callback
         self.meta = meta
         self.img_url = img_url
+        self.availability_msg = availability_msg
+        self.is_available = is_available
         
         # Geometry
         w, h = 550, 320
@@ -129,15 +131,24 @@ class MediaSaveDialog(ctk.CTkToplevel):
         
         if self.is_tv:
             total_eps = meta.get('total_episodes', 0)
+            seasons_count = meta.get('seasons', 0)
             eps_str = f" | Episodes: {total_eps}" if total_eps > 0 else ""
-            details_str = f"Type: TV Series | Seasons: {meta['seasons']}{eps_str}"
+            details_str = f"Type: TV Series | Seasons: {seasons_count}{eps_str}"
             prompt_str = "\nWould you like to save the entire series\nas a .quu queue file for later?"
         else:
             details_str = f"Type: Movie"
             prompt_str = "\nWould you like to download this movie now\nor add it to your queue file?"
             
         ctk.CTkLabel(self.info_frame, text=details_str, font=("Segoe UI", 12), text_color="gray").pack(anchor="w")
-        ctk.CTkLabel(self.info_frame, text=prompt_str, font=("Segoe UI", 14), justify="left").pack(anchor="w", pady=(15, 0))
+        
+        # Availability Status
+        status_color = "#2ecc71" if self.is_available else "#e74c3c"
+        ctk.CTkLabel(self.info_frame, text=self.availability_msg, font=("Segoe UI", 12, "bold"), text_color=status_color).pack(anchor="w", pady=(5, 0))
+
+        if not self.is_available:
+            prompt_str = "\nThis title was not found on the embed servers.\nAction buttons have been disabled."
+            
+        ctk.CTkLabel(self.info_frame, text=prompt_str, font=("Segoe UI", 14), justify="left").pack(anchor="w", pady=(10, 0))
         
         # Buttons
         self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -149,12 +160,20 @@ class MediaSaveDialog(ctk.CTkToplevel):
             
             self.no_btn = ctk.CTkButton(self.btn_frame, text="Download Now", command=lambda: self.on_click("just_episode"), fg_color="#3498db", height=40, font=("Segoe UI", 13, "bold"))
             self.no_btn.pack(side="right")
+            
+            if not self.is_available:
+                self.yes_btn.configure(state="disabled", fg_color="gray")
+                self.no_btn.configure(state="disabled", fg_color="gray")
         else:
             self.down_btn = ctk.CTkButton(self.btn_frame, text="Download Now", command=lambda: self.on_click("download_now"), fg_color="#3498db", height=40, font=("Segoe UI", 13, "bold"))
             self.down_btn.pack(side="right", padx=10)
             
             self.queue_btn = ctk.CTkButton(self.btn_frame, text="Add to Queue", command=lambda: self.on_click("add_to_queue"), fg_color="#9b59b6", hover_color="#8e44ad", height=40, font=("Segoe UI", 13, "bold"))
             self.queue_btn.pack(side="right", padx=10)
+
+            if not self.is_available:
+                self.down_btn.configure(state="disabled", fg_color="gray")
+                self.queue_btn.configure(state="disabled", fg_color="gray")
 
         # Cancel button for both
         self.cancel_btn = ctk.CTkButton(self.btn_frame, text="Cancel", command=self.destroy, fg_color="transparent", border_width=1, height=40, width=80, font=("Segoe UI", 12))
@@ -232,6 +251,7 @@ class M3U8DownloaderApp(ctk.CTk):
         self.input_value = None
         self.stop_event = threading.Event()
         self.bypass_dialog = False
+        self.last_ended_with_cr = False
         
         # --- CRITICAL CHANGE: Setup callbacks BEFORE loading config ---
         # This ensures 'load_config' messages are captured by the GUI log.
@@ -278,7 +298,7 @@ class M3U8DownloaderApp(ctk.CTk):
         self.start_btn = ctk.CTkButton(self.input_frame, text="Start / Analyze", command=self.start_process, fg_color="green", width=220)
         self.start_btn.pack(side="right", padx=10)
 
-        self.stop_btn = ctk.CTkButton(self.input_frame, text="Stop", command=self.stop_process, fg_color="red", width=60)
+        self.stop_btn = ctk.CTkButton(self.input_frame, text="Stop", command=self.stop_process, fg_color="red", width=60, state="disabled")
         self.stop_btn.pack(side="right", padx=5)
 
         self.top250_btn = ctk.CTkButton(self.input_frame, text="Top 250 Movies", command=self.open_top250, fg_color="blue", width=120)
@@ -425,12 +445,9 @@ class M3U8DownloaderApp(ctk.CTk):
         # Update core config
         capture_m3u8.setup_interface(config_data=self.config)
         
-        # Save to file
+        # Save to file safely (prevents overwriting manual edits like API keys)
         try:
-            script_dir = capture_m3u8.get_base_dir()
-            config_file = os.path.join(script_dir, "config.json")
-            with open(config_file, "w") as f:
-                json.dump(self.config, f, indent=4)
+            capture_m3u8.save_config(self.config)
         except Exception as e:
             self.log_callback(f"Failed to save config: {e}")
 
@@ -457,7 +474,7 @@ class M3U8DownloaderApp(ctk.CTk):
 
     def process_log_queue(self):
         while not self.log_queue.empty():
-            msg = self.log_queue.get()
+            msg = str(self.log_queue.get())
             self.log_box.configure(state="normal")
             
             # Simple color mapping based on icons
@@ -467,11 +484,37 @@ class M3U8DownloaderApp(ctk.CTk):
             elif any(x in msg for x in ["⚠️", "Warning"]): tag = "warning"
             elif any(x in msg for x in ["🔍", "🕵️", "⚡", "📝"]): tag = "info"
             
-            if tag:
-                self.log_box.insert("end", str(msg), tag)
-            else:
-                self.log_box.insert("end", str(msg))
+            # Robust overwrite for FFmpeg signatures as per user request
+            if ("frame=" in msg.lower() or "size=" in msg.lower()) and not msg.startswith('\033'):
+                if not msg.startswith('\r') and not self.last_ended_with_cr:
+                    msg = '\r' + msg
+
+            # Handle Carriage Returns for overwriting lines (FFmpeg progress)
+            if '\r' in msg:
+                parts = msg.split('\r')
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        # First part: if last msg ended with \r and we have new content, overwrite
+                        if self.last_ended_with_cr and part:
+                             self.log_box.delete("end-1c linestart", "end-1c")
+                        if part:
+                             self.log_box.insert("end", part, tag)
+                    else:
+                        # Subsequent parts (\r encountered within this msg)
+                        # Only delete if there is a 'part' to replace it with
+                        if part:
+                            self.log_box.delete("end-1c linestart", "end-1c")
+                            self.log_box.insert("end", part, tag)
                 
+                self.last_ended_with_cr = msg.endswith('\r')
+            else:
+                # Normal message without \r
+                if self.last_ended_with_cr:
+                    # If last one was an incomplete overwrite, just proceed
+                    self.last_ended_with_cr = False
+                self.log_box.insert("end", msg, tag)
+
+            # Keep scroll at bottom
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
         self.after(100, self.process_log_queue)
@@ -479,33 +522,15 @@ class M3U8DownloaderApp(ctk.CTk):
     def input_callback(self, prompt):
         # This runs in the background thread.
         # We need to ask the user on the main thread.
-        # Since CTk doesn't have a simple input dialog that blocks a thread easily without freezing main,
-        # we will use a simple workaround or standard tkinter dialog if possible.
-        
-        # For simple y/n or text, we can use CTkInputDialog, but it needs to be invoked on main thread.
-        # We'll use a queue/event system.
-        
         print(f"DEBUG: Input requested: {prompt}") # Console fallback
         
-        # If it's a simple confirmation
-        if "(y/n)" in prompt.lower():
-            # We can't easily show a popup from a thread. 
-            # For now, let's assume 'y' for auto-operations or implement a proper bridge later.
-            # But wait, the user wants a GUI.
-            
-            # Hacky bridge:
-            self.input_value = None
-            self.input_event.clear()
-            
-            # Schedule the dialog on main thread
-            self.after(0, lambda: self.show_input_dialog(prompt))
-            
-            # Wait for response
-            self.input_event.wait()
-            return self.input_value
+        # Schedule the dialog on main thread and wait for response
+        self.input_value = None
+        self.input_event.clear()
+        self.after(0, lambda: self.show_input_dialog(prompt))
+        self.input_event.wait()
         
-        # Default fallback
-        return "y"
+        return self.input_value if self.input_value is not None else "s"
 
     def show_input_dialog(self, prompt):
         # Simple dialog
@@ -554,9 +579,12 @@ class M3U8DownloaderApp(ctk.CTk):
     def run_logic(self, url):
         # Flush IMDB cache before starting a new logic run/download
         capture_m3u8.flush_imdb_cache()
+        is_imdb = "imdb.com/title/" in url
+        was_bypass = self.bypass_dialog
+        
         try:
             # Check for IMDB Links (Series or Movie)
-            if "imdb.com/title/" in url and not self.bypass_dialog:
+            if is_imdb and not was_bypass:
                 match = re.search(r'(tt\d+)', url)
                 if match:
                     imdb_id = match.group(1)
@@ -572,7 +600,9 @@ class M3U8DownloaderApp(ctk.CTk):
                                 # but wait, check_for_media_save usually leads to another start_process.
                         except Exception as e:
                             self.log_callback(f"\n❌ Error in metadata handling: {e}\n")
-                            self._on_finish()
+                        finally:
+                            if not meta or meta.get('type') != 'tv':
+                                self._on_finish()
                             
                     threading.Thread(target=lambda: on_meta(asyncio.run(capture_m3u8.get_imdb_info(imdb_id))), daemon=True).start()
                     return # The thread will handle the rest, but we need to ensure it calls _on_finish
@@ -582,16 +612,14 @@ class M3U8DownloaderApp(ctk.CTk):
 
             # Normal Single Video
             headless = self.headless_chk.get() == 1
+            self.after(0, lambda: self.progress_lbl.configure(text="Processing movie..."))
             asyncio.run(capture_m3u8.process_video(url, headless=headless, auto_mode=True))
             
         except Exception as e:
             self.log_callback(f"\n❌ Error: {e}\n")
         finally:
             # Only reset here if we didn't return early to a background thread
-            # Actually, even if we returned early, the finally block runs.
-            # But if we spawned a thread, we want the THREAD to call _on_finish when IT is done.
-            # So we check if we are still "running" (which the thread will keep true)
-            if "imdb.com/title/" not in url or self.bypass_dialog:
+            if not is_imdb or was_bypass:
                 self._on_finish()
 
     async def handle_imdb_series(self, imdb_id, original_url):
@@ -619,6 +647,7 @@ class M3U8DownloaderApp(ctk.CTk):
                 if not meta:
                     self.log_callback("❌ Failed to fetch IMDB info.\n")
                     await browser.close()
+                    self._on_finish()
                     return
     
                 if meta['type'] != 'tv':
@@ -626,6 +655,7 @@ class M3U8DownloaderApp(ctk.CTk):
                     headless = self.headless_chk.get() == 1
                     await capture_m3u8.process_video(original_url, headless=headless, auto_mode=True)
                     await browser.close()
+                    self._on_finish()
                     return
     
                 # It is a TV Series
@@ -643,6 +673,7 @@ class M3U8DownloaderApp(ctk.CTk):
                 if not selection:
                     self.log_callback("❌ Selection cancelled.\n")
                     await browser.close()
+                    self._on_finish()
                     return
     
                 # Generate Queue
@@ -798,13 +829,18 @@ class M3U8DownloaderApp(ctk.CTk):
                 self.after(0, lambda j=i+1, t=len(queue_list): (self.progress_lbl.configure(text=f"Processing file: {j}/{t}"), self.update_idletasks()))
                 success = await capture_m3u8.process_video(link, headless=headless, auto_mode=True)
                 
-                if success is True:
-                    try:
-                        with open(completed_log, 'a', encoding='utf-8') as f:
-                            f.write(f"{link}\n")
-                        completed_urls.add(link)
-                    except Exception as e:
-                        self.log_callback(f"⚠️ Failed to update completed.log: {e}\n")
+                if isinstance(success, str) and success != "404":
+                    if os.path.exists(success) and os.path.getsize(success) > 5 * 1024 * 1024:
+                        try:
+                            with open(completed_log, 'a', encoding='utf-8') as f:
+                                f.write(f"{link}\n")
+                            completed_urls.add(link)
+                        except Exception as e:
+                            self.log_callback(f"⚠️ Failed to update completed.log: {e}\n")
+                    else:
+                        self.log_callback(f"⚠️ File missing or too small after processing. Not marking complete.\n")
+                elif success == "404":
+                    self.log_callback(f"⏭️ Skipping 404 item...\n")
                 
                 if i < len(queue_list) - 1:
                     wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])
@@ -818,7 +854,14 @@ class M3U8DownloaderApp(ctk.CTk):
 
     def _silent_save_queue(self, queue_list, series_title, series_dir):
         """Silently save the queue as a .quu file to the series directory."""
-        safe_title = series_title.replace(':', '-').replace('/', '-').replace('\\', '-')
+        # Clean title and try to extract year: "Title (1990)" -> "Title.1990"
+        match = re.search(r'^(.*?)\s*\((\d{4})\)$', series_title)
+        if match:
+            clean_name = f"{match.group(1).strip()}.{match.group(2)}"
+        else:
+            clean_name = series_title.replace(':', '-').replace('/', '-').replace('\\', '-')
+        
+        safe_title = capture_m3u8.MasterM3U8Finder().sanitize_filename(clean_name)
         quu_path = os.path.join(series_dir, f"{safe_title}.quu")
         try:
             with open(quu_path, 'w', encoding='utf-8') as f:
@@ -1205,13 +1248,18 @@ class M3U8DownloaderApp(ctk.CTk):
                 
                 success = asyncio.run(capture_m3u8.process_video(url, headless=headless, auto_mode=True))
                 
-                if success is True:
-                    try:
-                        with open(completed_log, 'a', encoding='utf-8') as f:
-                            f.write(f"{url}\n")
-                        completed_urls.add(url)
-                    except Exception as e:
-                        self.log_callback(f"⚠️ Failed to update completed.log: {e}\n")
+                if isinstance(success, str) and success != "404":
+                    if os.path.exists(success) and os.path.getsize(success) > 5 * 1024 * 1024:
+                        try:
+                            with open(completed_log, 'a', encoding='utf-8') as f:
+                                f.write(f"{url}\n")
+                            completed_urls.add(url)
+                        except Exception as e:
+                            self.log_callback(f"⚠️ Failed to update completed.log: {e}\n")
+                    else:
+                        self.log_callback(f"⚠️ File missing or too small after processing. Not marking complete.\n")
+                elif success == "404":
+                    self.log_callback(f"⏭️ Skipping 404 item...\n")
                 
                 if i < len(urls) - 1:
                     wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])
@@ -1258,34 +1306,14 @@ class M3U8DownloaderApp(ctk.CTk):
         def run_check():
             try:
                 # Fetch metadata to see if it's a series or movie
-                # use a simpler approach to avoid Coroutine has no attribute 'get'
-                # The original code was already using asyncio.run, which is appropriate for calling an async function from a sync context.
-                # The comments in the provided snippet suggest a misunderstanding of how asyncio.run works or when await is needed.
-                # asyncio.run is designed to run an async coroutine until it completes, blocking the current thread.
-                # It should not be called if an event loop is already running in the current thread, but in a separate thread (like this one), it's fine.
-                # The 'await' keyword can only be used inside an 'async def' function.
-                # Therefore, the original line is the correct way to call an async function from this synchronous thread.
                 meta = asyncio.run(capture_m3u8.get_imdb_info(imdb_id))
+                is_tv = (meta and meta.get('type') == 'tv')
                 
-                if meta and meta['type'] == 'tv':
-                    # It's a TV Show. Check S01E01 availability
-                    embed_url = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season=1&episode=1"
-                    type_str = "TV Series (Checking S01E01)"
-                else:
-                    # It's a Movie
-                    embed_url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
-                    type_str = "Movie"
-
-                # 2. Ping the Embed URL
-                headers = {"User-Agent": "Mozilla/5.0"}
-                resp = requests.get(embed_url, headers=headers, timeout=10)
+                # Perform content-based verification
+                available, status_msg = asyncio.run(capture_m3u8.check_embed_availability(imdb_id, is_tv))
                 
-                if resp.status_code == 200 and len(resp.text) > 500:
-                    result = "Available ✅"
-                else:
-                    result = "Not Available ❌"
-                    
-                msg = f"Type: {type_str}\nStatus for {imdb_id}:\n\n{result}"
+                result_icon = "✅" if available else "❌"
+                msg = f"Type: {'TV Series' if is_tv else 'Movie'}\nAvailability: {status_msg} {result_icon}"
             except Exception as e:
                 msg = f"Error checking: {str(e)}"
                 
@@ -1397,30 +1425,54 @@ class M3U8DownloaderApp(ctk.CTk):
         imdb_id = match.group(1)
         
         try:
-            meta = asyncio.run(capture_m3u8.get_imdb_info(imdb_id))
+            # 1. Start with Cache (fastest)
+            meta = capture_m3u8.IMDB_CACHE.get(imdb_id)
+            # If cached entry is from search (missing full details like seasons), force re-fetch for TV
+            if meta and meta.get('type') == 'tv' and 'seasons' not in meta:
+                meta = None
+                
+            if not meta:
+                # Fallback to fetching basic metadata if not in cache
+                try:
+                    meta = asyncio.run(asyncio.wait_for(capture_m3u8.get_imdb_info(imdb_id), timeout=20))
+                except Exception as e:
+                    self.log_callback(f"⚠️ Metadata fetch timed out: {e}\n")
+                    # If we can't even get basic info, we still need a fallback
+                    if not meta: return 
+
             if not meta:
                 return
+            
+            is_tv = (meta.get('type') == 'tv')
+            # 2. Content verification check (with timeout)
+            available = False
+            status_msg = "Checking status..."
+            try:
+                available, status_msg = asyncio.run(asyncio.wait_for(capture_m3u8.check_embed_availability(imdb_id, is_tv), timeout=10))
+            except Exception as e:
+                status_msg = f"Availability Timeout ({e})"
+                available = False
                 
             def on_dialog_close(action):
                 if action == "save_queue":
                     threading.Thread(target=self.run_full_series_queue_save, args=(imdb_id, meta), daemon=True).start()
                 elif action == "add_to_queue":
-                    # For movies, add to a .quu file (append)
                     movie_url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
                     threading.Thread(target=self.run_movie_append, args=(movie_url, meta), daemon=True).start()
                 elif action == "download_now" or action == "just_episode":
-                    if isinstance(meta, dict) and meta.get('type') == 'tv':
-                        # For series "Download Now", it means "Pick an episode to download now"
+                    if is_tv:
                         threading.Thread(target=lambda: asyncio.run(self.handle_imdb_series(imdb_id, url)), daemon=True).start()
                     else:
-                        # Already in the entry, just click Start with bypass
                         self.bypass_dialog = True
                         self.after(0, self.start_process)
             
-            self.after(0, lambda: MediaSaveDialog(self, meta, img_url, on_dialog_close))
+            # 3. Always show dialog if we have basic metadata
+            self.after(0, lambda: MediaSaveDialog(self, meta, img_url, status_msg, available, on_dialog_close))
             
-        except Exception:
-            pass
+        except Exception as e:
+            self.log_callback(f"❌ Dialog Error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def run_movie_append(self, movie_url, meta):
         """Append a movie URL to a .quu file."""
@@ -1434,7 +1486,8 @@ class M3U8DownloaderApp(ctk.CTk):
                 title="Select Queue File to Append To",
                 defaultextension=".quu",
                 initialfile="Movie_Queue.quu",
-                filetypes=[("Queue Files", "*.quu"), ("All Files", "*.*")]
+                filetypes=[("Queue Files", "*.quu"), ("All Files", "*.*")],
+                confirmoverwrite=False
             )
             
             if filename:
@@ -1467,7 +1520,8 @@ class M3U8DownloaderApp(ctk.CTk):
             
             async def fetch_all():
                 q = []
-                for s in range(1, meta['seasons'] + 1):
+                num_seasons = meta.get('seasons', 1)
+                for s in range(1, num_seasons + 1):
                     # Update status
                     self.after(0, lambda s_num=s: self.progress_lbl.configure(text=f"Fetching S{s_num:02d}..."))
                     ep_count = await capture_m3u8.get_season_episodes(imdb_id, s)
@@ -1484,18 +1538,39 @@ class M3U8DownloaderApp(ctk.CTk):
                 
             def prompt_save():
                 finder = capture_m3u8.MasterM3U8Finder()
-                safe_title = finder.sanitize_filename(meta['title'])
-                default_name = f"{safe_title}_Full.quu"
+                title_str = meta['title']
+                match = re.search(r'^(.*?)\s*\((\d{4})\)$', title_str)
+                if match:
+                    clean_name = f"{match.group(1).strip()}.{match.group(2)}"
+                else:
+                    # Fallback if no year in title, check if we have series start year in meta
+                    clean_name = title_str
+                    if meta.get('year'): # or similar
+                        pass 
+                
+                safe_title = finder.sanitize_filename(clean_name)
+                default_name = f"{safe_title}.quu"
                 filename = filedialog.asksaveasfilename(
+                    title="Select Queue File",
                     defaultextension=".quu",
                     initialfile=default_name,
-                    filetypes=[("Queue Files", "*.quu"), ("All Files", "*.*")]
+                    filetypes=[("Queue Files", "*.quu"), ("All Files", "*.*")],
+                    confirmoverwrite=False
                 )
                 if filename:
                     try:
-                        with open(filename, 'w', encoding='utf-8') as f:
-                            f.write('\n'.join(queue_list))
-                        self.log_callback(f"💾 Full series queue saved to: {os.path.basename(filename)}\n")
+                        # Use append mode and ensure data starts on a new line if file exists
+                        mode = 'a' if os.path.exists(filename) else 'w'
+                        with open(filename, mode, encoding='utf-8') as f:
+                            if mode == 'a':
+                                with open(filename, 'rb') as fr:
+                                    fr.seek(0, 2)
+                                    if fr.tell() > 0:
+                                        fr.seek(-1, 2)
+                                        if fr.read(1) != b'\n':
+                                            f.write('\n')
+                            f.write('\n'.join(queue_list) + '\n')
+                        self.log_callback(f"💾 Full series queue appended to: {os.path.basename(filename)}\n")
                     except Exception as e:
                         self.log_callback(f"⚠️ Failed to save queue: {e}\n")
                 

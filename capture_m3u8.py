@@ -29,6 +29,7 @@ except ImportError as e:
         print("    pip install -r requirements.txt\n")
     sys.exit(1)
 
+
 def get_base_dir():
     """Returns the directory where the executable or script is located."""
     if getattr(sys, 'frozen', False):
@@ -84,17 +85,33 @@ def get_browser_executable(browser_type="chromium"):
 def get_smart_browsers_path():
     """
     Determines where to look for browser binaries.
-    1. Check if a 'playwright_browsers' folder exists next to the EXE/Script (Permanent).
-    2. If not, check if it's bundled inside (PyInstaller temp folder).
-    3. Default to the EXE folder for future persistent downloads.
+    1. Check if a 'playwright_browsers_path' is specified in config.json.
+    2. Check if a 'binaries/playwright_browsers' folder exists (Priority).
+    3. Check if a 'playwright_browsers' folder exists next to the EXE/Script (Root).
+    4. If not, check if it's bundled inside (PyInstaller temp folder).
     """
-    # 1. Permanent location (Executable/Script folder)
     base_dir = get_base_dir()
+    
+    # 1. Config First
+    if 'CONFIG' in globals() and CONFIG.get('playwright_browsers_path'):
+        conf_path = CONFIG['playwright_browsers_path']
+        if os.path.exists(conf_path):
+            return conf_path
+        abs_conf = os.path.join(base_dir, conf_path)
+        if os.path.exists(abs_conf):
+            return abs_conf
+
+    # 2. Binaries Folder (Priority)
+    binaries_path = os.path.join(base_dir, "binaries", "playwright_browsers")
+    if os.path.exists(binaries_path) and os.listdir(binaries_path):
+        return binaries_path
+
+    # 3. Root Folder (Legacy/Default)
     exe_path = os.path.join(base_dir, "playwright_browsers")
     if os.path.exists(exe_path) and os.listdir(exe_path):
         return exe_path
         
-    # 2. Bundled location (PyInstaller temporary folder)
+    # 4. Bundled location (PyInstaller temporary folder)
     if getattr(sys, 'frozen', False):
         try:
             bundle_path = os.path.join(getattr(sys, '_MEIPASS', ''), "playwright_browsers")
@@ -103,8 +120,8 @@ def get_smart_browsers_path():
         except:
             pass
             
-    # 3. Default back to EXE folder (Ensures persistence if we have to download)
-    return exe_path
+    # Default back to binaries folder for future persistent downloads
+    return binaries_path
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = get_smart_browsers_path()
 
@@ -164,6 +181,43 @@ STATUS_CALLBACK = None
 STOP_CALLBACK = None
 CONFIG = {}
 
+def find_binary(name, config_key=None):
+    """Robust binary discovery (Priority: Config -> Binaries Folder -> Root -> System Path)."""
+    base_dir = get_base_dir()
+    is_win = sys.platform == 'win32'
+    
+    # 1. Config First (if available in global CONFIG)
+    if config_key and 'CONFIG' in globals() and CONFIG.get(config_key):
+        conf_path = CONFIG[config_key]
+        if os.path.exists(conf_path):
+            return conf_path
+        # Relative to base dir
+        abs_conf = os.path.join(base_dir, conf_path)
+        if os.path.exists(abs_conf):
+            return abs_conf
+            
+    # 2. Search Directories (Priority: Binaries Folder -> Root)
+    exts = [".exe"] if is_win else [""]
+    search_names = [name]
+    if name == "ffmpeg" and is_win:
+        search_names.append("ffmpeg_libfdk_aac_1")
+        
+    search_dirs = [
+        os.path.join(base_dir, "binaries"), # 1. Binaries Subfolder
+        base_dir                            # 2. Root Folder
+    ]
+    
+    for d in search_dirs:
+        if not os.path.exists(d): continue
+        for s_name in search_names:
+            for ext in exts:
+                local_path = os.path.join(d, s_name + ext)
+                if os.path.exists(local_path):
+                    return os.path.abspath(local_path)
+                    
+    # 3. System Path
+    return shutil.which(name) or name
+
 def setup_interface(config_data=None, log_cb=None, input_cb=None, status_cb=None, stop_cb=None):
     global CONFIG, LOG_CALLBACK, INPUT_CALLBACK, STATUS_CALLBACK, STOP_CALLBACK
     if config_data: CONFIG.update(config_data)
@@ -175,6 +229,15 @@ def setup_interface(config_data=None, log_cb=None, input_cb=None, status_cb=None
 def log(msg, end="\n"):
     if LOG_CALLBACK: LOG_CALLBACK(str(msg) + end)
     else: print(msg, end=end)
+
+class RealTimeLogger(io.TextIOBase):
+    """A file-like object that streams stdout/stderr to the global log() function instantly."""
+    def write(self, s):
+        if s:
+            log(s, end="")
+        return len(s)
+    def flush(self):
+        pass
 
 def get_user_input(prompt):
     if INPUT_CALLBACK: return INPUT_CALLBACK(prompt)
@@ -262,30 +325,25 @@ class PluginManager:
                         spec.loader.exec_module(module)
                     
                     if hasattr(module, "process"):
-                        # Capture stdout to a buffer
-                        output_buffer = io.StringIO()
                         new_path = None
                         
                         try:
-                            with redirect_stdout(output_buffer):
+                            # Log the handoff for visibility (CLI & GUI)
+                            log(f"🔌 [Plugin] Passing '{os.path.basename(current_path)}' to {filename_str}...")
+                            
+                            # Use RealTimeLogger to stream any print() calls inside the plugin directly to log()
+                            rtl = RealTimeLogger()
+                            with redirect_stdout(rtl):
                                 new_path = module.process(current_path)
                         except Exception as e:
-                            # If plugin fails during execution, log everything
-                            log(f"   ❌ Plugin {filename_str} failed during execution:")
-                            # Log any output it produced before crashing
-                            captured_output = output_buffer.getvalue()
-                            if captured_output:
-                                log(captured_output, end="")
-                            log(f"      Error: {e}")
+                            # If plugin fails during execution, log the error
+                            log(f"   ❌ Plugin {filename_str} failed during execution: {e}")
                             continue # Move to the next plugin
 
                         # Check if the plugin did something (path changed)
-                        if new_path and new_path != current_path and os.path.exists(new_path):
-                            log(f"   Running plugin: {filename_str}...")
-                            # Log the captured output from the successful plugin
-                            captured_output = output_buffer.getvalue()
-                            if captured_output:
-                                log(captured_output, end="")
+                        if new_path and os.path.exists(new_path):
+                            if new_path != current_path:
+                                pass # Removed duplicate log message
                             current_path = new_path
                     else:
                         log(f"   ⚠️  Skipping {filename_str}: No 'process' function found.")
@@ -310,26 +368,16 @@ class MasterM3U8Finder:
         self._verify_in_progress: bool = False
         
     def find_ytdlp(self):
-        """Check if yt-dlp exists in common locations"""
-        for name in ["yt-dlp.exe", "yt-dlp"]:
-            if os.path.exists(name):
-                return os.path.abspath(name)
-        
-        ytdlp_path = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-        if ytdlp_path:
-            return ytdlp_path
+        """Check if yt-dlp exists with priority: Config -> Root -> System Path"""
+        # 1. Priority: Config
+        config_path = CONFIG.get('ytdlp_path')
+        if config_path and os.path.exists(config_path):
+            return config_path
             
-        common_paths = [
-            r"C:\tools\yt-dlp.exe",
-            os.path.expanduser(r"~\Downloads\yt-dlp.exe"),
-            os.path.expanduser(r"~\yt-dlp\yt-dlp.exe"),
-        ]
-        
-        for path in common_paths:
-            if os.path.exists(path):
-                return path
-                
-        return None
+        # 2. Priority: Root folder & binaries subfolder
+        base_dir = get_base_dir()
+        is_win = os.name == 'nt'
+        return find_binary("yt-dlp", "ytdlp_path")
     
     async def extract_title(self, page):
         """Extract video title from page with fast timeouts"""
@@ -445,17 +493,24 @@ class MasterM3U8Finder:
             '--ignore-errors',
             '--no-warnings',
             '--fixup', 'detect_or_warn',
-            '--fragment-retries', '10',
-            '--retry-sleep', 'fragment:5',
+            '--fragment-retries', '30',
+            '--skip-unavailable-fragments',
+            '--retry-sleep', 'fragment:10',
             '--hls-prefer-native',
             '--limit-rate', self.download_speed if hasattr(self, 'download_speed') else DOWNLOAD_SPEED,
+        ]
+        
+        # Add FFmpeg location if found
+        ffmpeg_bin = find_binary("ffmpeg", "ffmpeg_path")
+        if ffmpeg_bin and os.path.exists(ffmpeg_bin):
+            cmd.extend(['--ffmpeg-location', ffmpeg_bin])
+            
+        cmd.extend([
             '--write-subs',
             '--all-subs',
             '--sub-langs', CONFIG['subtitle_langs'] if 'CONFIG' in globals() and 'subtitle_langs' in CONFIG else 'all',
-            '--fragment-retries', '10',  # Don't retry forever if the stream is dead
-            '--skip-unavailable-fragments', # Skip segments that return no data blocks
             '-o', output_file,
-        ]
+        ])
         
         # Optional: Use cookies from browser if available (helps with some sites)
         if use_cookies:
@@ -1052,7 +1107,7 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
             f.write(f"Title: {title}\n")
             f.write(f"URL: {master_url}\n")
             f.write(f"Filename: {final_filename}\n")
-            f.write(f"Command: yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get('download_speed', DOWNLOAD_SPEED)} --user-agent \"{USER_AGENT}\" -o \"{final_filename}\" \"{master_url}\"\n")
+            f.write(f"Command: yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 30 --retry-sleep fragment:10 --hls-prefer-native --limit-rate {CONFIG.get('download_speed', DOWNLOAD_SPEED)} --user-agent \"{USER_AGENT}\" -o \"{final_filename}\" \"{master_url}\"\n")
         log(f"\n💾 Details saved to {txt_filename}")
         
         if ytdlp_path:
@@ -1121,7 +1176,8 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                                 os.rmdir(final_dir)
                         except:
                             pass
-                        return True
+                        report_status("Success")
+                        return new_temp_filename
                     
                     temp_filename = new_temp_filename
                     # Update final filename extension if plugin changed it
@@ -1145,32 +1201,40 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                             except:
                                 pass
                                 
-                        return True
+                        report_status("Success")
+                        return final_filename
                     except Exception as e:
                         log(f"❌ Error moving file: {e}")
+                        report_status("Ready")
                         return False
                 
                 if not success:
                     log("\n📋 Manual command (try running this in terminal):")
-                    log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                    log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 30 --retry-sleep fragment:10 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                    report_status("Ready")
+                else:
+                    report_status("Success")
                 return success
             else:
                 log(f"\n📋 Manual command:")
-                log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 30 --retry-sleep fragment:10 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                report_status("Ready")
                 return True
         else:
             log("\n❌ yt-dlp not found")
             log(f"\n📋 Save this command:")
-            log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+            log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 30 --retry-sleep fragment:10 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+            report_status("Ready")
             return True
             
     else:
         if headless:
             log("\n⚠️  Headless capture failed. Retrying in visible mode to bypass Cloudflare...")
             return await process_video(url, headless=False, auto_mode=auto_mode)
-            
-        log("❌ FAILED - No master.m3u8 found")
-        return False
+        else:
+            log("\n❌ Failed to capture stream.")
+            report_status("Ready")
+            return False
 
 # In-memory cache for IMDB metadata
 IMDB_CACHE: Dict[str, Any] = {}
@@ -1183,8 +1247,12 @@ def flush_imdb_cache():
 
 async def get_imdb_info(imdb_id: str, page=None) -> Optional[Dict[str, Any]]:
     if imdb_id in IMDB_CACHE:
-        # log(f"🚀 Using cached metadata for: {imdb_id}")
-        return IMDB_CACHE[imdb_id]
+        res = IMDB_CACHE[imdb_id]
+        # Only return cache if it's a movie or a TV show with ALREADY fetched seasons
+        # (search hints only provide 'type' and 'title')
+        if res.get('type') == 'movie' or (res.get('type') == 'tv' and 'seasons' in res):
+            # log(f"🚀 Using cached metadata for: {imdb_id}")
+            return res
         
     url = f"https://www.imdb.com/title/{imdb_id}/"
     log(f"🕵️  Scanning IMDB: {url}")
@@ -1211,11 +1279,13 @@ async def get_imdb_info(imdb_id: str, page=None) -> Optional[Dict[str, Any]]:
             except:
                 title = "Unknown"
         
-        # Extract Year
+        # Extract Year / Year Range
         year = ""
+        full_meta_text = ""
         try:
             # Get metadata items text (Year is usually 1st or 2nd item)
             meta_items = await p.locator('[data-testid="hero-title-block__metadata"] li').all_inner_texts()
+            full_meta_text = " | ".join(meta_items).lower()
             for text in meta_items[:3]:
                 match = re.search(r'\b(19|20)\d{2}\b', text)
                 if match:
@@ -1227,13 +1297,21 @@ async def get_imdb_info(imdb_id: str, page=None) -> Optional[Dict[str, Any]]:
         if year and year not in title:
             title = f"{title} ({year})"
         
-        is_tv = False
-        
         # Check for series markers
+        is_tv = False
         if await p.locator('text=Episode Guide').count() > 0 or \
            await p.locator('a[href*="episodes"]').count() > 0 or \
            await p.locator('[data-testid="hero-subnav-bar-season-episode-picker"]').count() > 0:
             is_tv = True
+        
+        # Additional robust checks for keywords and year ranges
+        if not is_tv:
+            is_tv_kw = any(kw in full_meta_text for kw in ['tv series', 'tv mini-series', 'tv special', 'tv episode', 'tv movie', 'tv-series'])
+            has_series_kw = 'series' in full_meta_text or 'episode' in full_meta_text or 'season' in full_meta_text
+            has_range = re.search(r'\d{4}[–-]\d*', full_meta_text)
+            
+            if is_tv_kw or has_series_kw or has_range:
+                is_tv = True
         
         if not is_tv:
             res = {'type': 'movie', 'title': title}
@@ -1396,54 +1474,81 @@ def load_config():
         
     return default_config, log_messages
 
-async def search_imdb(query, filter_type='all'):
+def save_config(new_data):
     """
-    Searches IMDB for a query and returns a list of candidates.
+    Safely saves configuration by merging with the existing file on disk.
+    This prevents overwriting manual edits (like API keys) with stale memory data.
+    """
+    script_dir = get_base_dir()
+    config_file = os.path.join(script_dir, "config.json")
+    
+    # 1. Load latest data from disk
+    current_disk_config = {}
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                current_disk_config = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Error reading config for merge: {e}")
+
+    # 2. Merge new data into disk data
+    current_disk_config.update(new_data)
+    
+    # 3. Write back atomically
+    temp_file = config_file + ".tmp"
+    try:
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(current_disk_config, f, indent=4)
+        # On Windows, os.replace is atomic; on Linux, os.rename is atomic
+        if os.name == 'nt' and os.path.exists(config_file):
+            os.remove(config_file)
+        os.rename(temp_file, config_file)
+        return True
+    except Exception as e:
+        print(f"❌ Failed to save config: {e}")
+        if os.path.exists(temp_file):
+            try: os.remove(temp_file)
+            except: pass
+        return False
+
+async def search_imdb(query, filter_type='all', page=None):
+    """
+    Searches IMDB for a query and returns a list of candidates using Playwright.
     """
     encoded_query = urllib.parse.quote(query)
-    # Exact URL format as requested
     url = f"https://www.imdb.com/find/?q={encoded_query}"
     
     log(f"🔎 Searching IMDB for: {query} (Encoded: {encoded_query})")
     log(f"   🔗 Link: {url}")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.5"
-    }
-
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
+    async def _extract(p):
+        await p.route("**/*", block_resources)
+        try:
+            await p.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            log(f"   ⚠️ IMDB Search load warning: {str(e)[:100]}")
         
-        soup = BeautifulSoup(response.content, "html.parser")
         results = []
-        
-        # Target the 'li' items first to ensure we have the container
-        items = soup.find_all('li', class_='ipc-metadata-list-summary-item')
-
-        for item in items:
-            try:
-                # Look for the title link specifically
-                link_tag = item.find('a', class_='ipc-title-link-wrapper')
-                if not link_tag:
-                    for a in item.find_all('a'):
-                        if 'title' in a.get('href', '') and a.get_text().strip():
-                            link_tag = a
-                            break
-                            
-                img_tag = item.find('img')
-                
-                if link_tag and 'title' in link_tag.get('href', ''):
-                    title = link_tag.get_text().strip()
-                    href = link_tag.get('href').split('?')[0]
+        try:
+            # Wait for results to appear
+            await p.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
+            items = await p.locator('.ipc-metadata-list-summary-item').all()
+            
+            for item in items:
+                try:
+                    link_el = item.locator('a.ipc-title-link-wrapper')
+                    if await link_el.count() == 0:
+                        continue
+                        
+                    title = await link_el.inner_text()
+                    href = await link_el.get_attribute('href')
+                    if not href: continue
                     
-                    if href.startswith('/'):
-                        link = "https://www.imdb.com" + href
-                    else:
-                        link = href
+                    clean_href = href.split('?')[0]
+                    link = "https://www.imdb.com" + clean_href if clean_href.startswith('/') else clean_href
                     
-                    img_url = img_tag.get('src') if img_tag else "No Image"
+                    img_el = item.locator('img').first
+                    img_url = await img_el.get_attribute('src') if await img_el.count() > 0 else "No Image"
                     
                     # Log in the requested format
                     log(f"{img_url}: {title} - {link}")
@@ -1452,22 +1557,145 @@ async def search_imdb(query, filter_type='all'):
                     if not match: continue
                     imdb_id = match.group(1)
 
-                    # Get metadata (dates, etc.)
-                    meta_elements = item.find_all(lambda tag: tag.name in ['li', 'span'] and tag.get('class') and any(c in tag.get('class') for c in ['ipc-inline-list__item', 'ipc-metadata-list-summary-item__li', 'cli-title-metadata-item', 'cli-title-type-data']))
-                    meta_str = " | ".join([m.get_text().strip() for m in meta_elements]) if meta_elements else ""
-
-                    results.append({'title': title.strip(), 'meta': meta_str, 'url': link, 'id': imdb_id, 'img': img_url})
+                    # 1. Clean Meta String for GUI Display
+                    meta_texts = []
+                    # Try to find all metadata items under the item
+                    # Standard IMDB search result items have .ipc-inline-list__item or .cli-title-metadata-item
+                    meta_texts = await item.locator('.ipc-inline-list__item').all_inner_texts()
+                    if not meta_texts:
+                        meta_texts = await item.locator('.cli-title-metadata-item').all_inner_texts()
                     
-                    if len(results) >= 20:
-                        break
-            except:
-                continue
-        
+                    # Clean and remove title if it accidentally got in
+                    meta_texts = [t.strip() for t in meta_texts if t.strip() and t.lower() != title.lower()]
+                    
+                    # Extract Year, Rating, and type-label
+                    year_val = ""
+                    rating_val = ""
+                    type_label = ""
+                    
+                    for t in meta_texts:
+                        # Year: 4 digits, possibly with range
+                        if re.search(r'\d{4}', t):
+                            if not year_val: year_val = t
+                        # Rating: Standard IMDB rating keywords
+                        elif any(r in t for r in ['TV-', 'PG', 'G', 'R', 'NC-17', 'Approved', 'U', '12', '15', '18']):
+                            if not rating_val: rating_val = t
+                        # Type: Series, Movie, Special, Episode, Podcast
+                        elif any(kw in t.lower() for kw in ['series', 'movie', 'special', 'episode', 'podcast']):
+                            if not type_label: type_label = t
+                    
+                    # 2. Robust Type Detection (Check ALL text in the item)
+                    media_type = 'movie'
+                    item_text = await item.inner_text()
+                    low_text = item_text.lower()
+                    
+                    # Keywords and patterns for logic
+                    is_tv_kw = any(kw in low_text for kw in ['tv series', 'tv mini-series', 'tv mini series', 'tv special', 'tv episode', 'tv movie', 'tv-series', 'podcast series', 'mini series'])
+                    has_series_kw = 'series' in low_text or 'episode' in low_text or 'season' in low_text
+                    has_range = re.search(r'\d{4}[–-]\d*', low_text)
+                    
+                    if is_tv_kw or has_series_kw or has_range:
+                        media_type = 'tv'
+                        if not type_label: 
+                            if 'mini-series' in low_text or 'mini series' in low_text: type_label = "TV Mini Series"
+                            else: type_label = "TV Series"
+                    else:
+                        if not type_label: type_label = "Movie"
+
+                    # 3. Format for display
+                    display_title = f"{title.strip()} ({year_val})" if year_val else title.strip()
+                    # User wanted: rating - Type of media
+                    display_meta = f"{rating_val} - {type_label}" if rating_val else type_label
+                    
+                    # Proactively cache type
+                    IMDB_CACHE[imdb_id] = {'type': media_type, 'title': title.strip()}
+                    
+                    results.append({
+                        'title': display_title, 
+                        'url': link, 
+                        'img': img_url, 
+                        'id': imdb_id, 
+                        'meta': display_meta, 
+                        'type': media_type
+                    })
+                except Exception as e:
+                    # log(f"   ⚠️ Error extracting item: {e}")
+                    continue
+                
+                if len(results) >= 20:
+                    break
+        except Exception as e:
+            log(f"❌ Error during IMDB search: {e}")
+            
+        if not results:
+            log("❌ No results found or IMDB blocked the search.")
+        else:
+            log(f"✅ Found {len(results)} results.")
         return results
 
+    if page:
+        return await _extract(page)
+
+    ensure_playwright_browsers()
+    async with async_playwright() as p:
+        if sys.platform.startswith('linux'):
+            exec_path = get_browser_executable("firefox")
+            if not exec_path: return []
+            browser = await p.firefox.launch(headless=True, executable_path=exec_path)
+        else:
+            exec_path = get_browser_executable("chromium")
+            if not exec_path: return []
+            browser = await p.chromium.launch(headless=True, executable_path=exec_path)
+        
+        new_page = await browser.new_page(user_agent=USER_AGENT)
+        try:
+            res = await _extract(new_page)
+            await browser.close()
+            return res
+        except Exception as e:
+            log(f"❌ Error in Search session: {e}")
+            await browser.close()
+            return []
+
+async def check_embed_availability(imdb_id: str, is_tv: bool) -> tuple[bool, str]:
+    """
+    Checks if a title is actually available on the embed servers by verifying the page title.
+    Returns (is_available, status_message)
+    """
+    if is_tv:
+        url = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season=1&episode=1"
+    else:
+        url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        # Use requests with a reasonable timeout
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return False, f"Not Found (HTTP {response.status_code})"
+            
+        soup = BeautifulSoup(response.content, "html.parser")
+        title_tag = soup.find("title")
+        if not title_tag:
+            return False, "No Content Found"
+            
+        page_title = title_tag.get_text().strip()
+        low_title = page_title.lower()
+        
+        # Check for explicit failure labels
+        if "404" in low_title or "not found" in low_title:
+            return False, "Not Found (404 Page)"
+            
+        # If it's just the domain name or too short, it's likely a soft failure
+        if len(page_title) < 5 or low_title == "vsembed" or low_title == "vidsrc":
+             return False, "Invalid Title / Soft 404"
+             
+        return True, f"Available: {page_title}"
     except Exception as e:
-        log(f"❌ Search error: {e}")
-        return []
+        return False, f"Check Failed: {str(e)[:50]}"
 
 def get_title_details(url):
     """
@@ -1802,10 +2030,13 @@ async def main():
             try:
                 result = await process_video(queue_url, headless=True, auto_mode=True)
                 
-                if result is True:
-                    with open(completed_log, 'a', encoding='utf-8') as f:
-                        f.write(f"{queue_url}\n")
-                    print(f"✅ Marked as complete.")
+                if isinstance(result, str) and result != "404":
+                    if os.path.exists(result) and os.path.getsize(result) > 5 * 1024 * 1024:
+                        with open(completed_log, 'a', encoding='utf-8') as f:
+                            f.write(f"{queue_url}\n")
+                        print(f"✅ Marked as complete.")
+                    else:
+                        print(f"⚠️ File missing or too small after processing. Not marking complete.")
                 elif result == "404":
                     print(f"⏭️  Skipping 404 item...")
                     
