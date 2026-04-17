@@ -19,7 +19,7 @@ Once a download completes, the file is passed through a sequential plugin chain:
 
 1.  **[001] Cleanup**: Uses `mkvmerge` to sanitize the container, fixing broken timestamps and seeking issues.
 2.  **[002] Normalization**: Upmixes stereo to 5.1 and applies `dynaudnorm` for consistent, professional-grade audio.
-3.  **[010] TMDB Enrichment**: Identifies the title, fetches posters/NFOs, tags the MKV header, and moves the file to your permanent library (`V:/`).
+3.  **[010] TMDB Enrichment**: Identifies the title, fetches posters/NFOs, tags the MKV header, and moves the file to your permanent library.
 
 ## 🚀 Prerequisites & Detailed Installation
 
@@ -61,7 +61,7 @@ sudo dnf install python3 python3-pip python3-tkinter
 ### 3. Setting Up the Project
 Once Python and Pip are verified as working on your system, initialize the Hunter Suite environment:
 
-1.  **Clone/Extract**: Navigate to the `i:\capture_m3u8\` directory in your terminal.
+1.  **Clone/Extract**: Navigate to the `capture_m3u8/` directory in your terminal.
 2.  **Install Python Dependencies**:
     ```bash
     pip install -r requirements.txt
