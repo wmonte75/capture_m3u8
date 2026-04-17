@@ -790,7 +790,7 @@ class MasterM3U8Finder:
             binary_path,
             master_url,
             "--save-dir", save_dir,
-            "--save-name", save_name,
+            "--save-name", f'"{save_name}"',
             "--header", f"User-Agent: {USER_AGENT}",
             "--auto-select",
             "--binary-merge",
