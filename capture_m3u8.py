@@ -7,9 +7,12 @@ import subprocess
 import json
 import random
 import importlib.util
+import ctypes
 import io
+import zipfile
 import urllib.parse
-from contextlib import redirect_stdout
+from datetime import datetime, timedelta
+from contextlib import redirect_stdout, suppress
 from typing import List, Tuple, Dict, Optional, Set, Any, Union, Callable
 
 # Dependency Check
@@ -18,6 +21,7 @@ try:
     import requests
     from bs4 import BeautifulSoup
 except ImportError as e:
+    # ... (dependency check remains the same)
     missing_module = str(e).split("'")[1] if "'" in str(e) else str(e)
     print(f"\n❌ Missing required Python library: {missing_module}")
     print("\nPlease install the missing requirements to run this script.")
@@ -27,7 +31,8 @@ except ImportError as e:
     else:
         print("\nRun this command in your command prompt/terminal:")
         print("    pip install -r requirements.txt\n")
-    sys.exit(1)
+    sys.exit(1) # ... (dependency check remains the same)
+
 
 def get_base_dir():
     """Returns the directory where the executable or script is located."""
@@ -43,6 +48,13 @@ def get_resource_path(relative_path):
     else:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
+
+def get_log_dir():
+    """Returns the absolute path to the Logs directory, creating it if needed."""
+    log_dir = os.path.join(get_base_dir(), "binaries", "Logs")
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    return log_dir
 
 # Handle SSL Certificates for Frozen Apps
 if getattr(sys, 'frozen', False):
@@ -84,17 +96,33 @@ def get_browser_executable(browser_type="chromium"):
 def get_smart_browsers_path():
     """
     Determines where to look for browser binaries.
-    1. Check if a 'playwright_browsers' folder exists next to the EXE/Script (Permanent).
-    2. If not, check if it's bundled inside (PyInstaller temp folder).
-    3. Default to the EXE folder for future persistent downloads.
+    1. Check if a 'playwright_browsers_path' is specified in config.json.
+    2. Check if a 'binaries/playwright_browsers' folder exists (Priority).
+    3. Check if a 'playwright_browsers' folder exists next to the EXE/Script (Root).
+    4. If not, check if it's bundled inside (PyInstaller temp folder).
     """
-    # 1. Permanent location (Executable/Script folder)
     base_dir = get_base_dir()
+    
+    # 1. Config First
+    if 'CONFIG' in globals() and CONFIG.get('playwright_browsers_path'):
+        conf_path = CONFIG['playwright_browsers_path']
+        if os.path.exists(conf_path):
+            return conf_path
+        abs_conf = os.path.join(base_dir, conf_path)
+        if os.path.exists(abs_conf):
+            return abs_conf
+
+    # 2. Binaries Folder (Priority)
+    binaries_path = os.path.join(base_dir, "binaries", "playwright_browsers")
+    if os.path.exists(binaries_path) and os.listdir(binaries_path):
+        return binaries_path
+
+    # 3. Root Folder (Legacy/Default)
     exe_path = os.path.join(base_dir, "playwright_browsers")
     if os.path.exists(exe_path) and os.listdir(exe_path):
         return exe_path
         
-    # 2. Bundled location (PyInstaller temporary folder)
+    # 4. Bundled location (PyInstaller temporary folder)
     if getattr(sys, 'frozen', False):
         try:
             bundle_path = os.path.join(getattr(sys, '_MEIPASS', ''), "playwright_browsers")
@@ -103,8 +131,8 @@ def get_smart_browsers_path():
         except:
             pass
             
-    # 3. Default back to EXE folder (Ensures persistence if we have to download)
-    return exe_path
+    # Default back to binaries folder for future persistent downloads
+    return binaries_path
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = get_smart_browsers_path()
 
@@ -142,11 +170,23 @@ elif sys.platform == 'darwin':
 else:
     USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
+async def block_resources(route):
+    """Block images, fonts, and trackers to save CPU/bandwidth."""
+    if route.request.resource_type in ["image", "font", "media"]:
+        await route.abort()
+    elif any(x in route.request.url for x in ["google-analytics", "doubleclick", "amazon-adsystem", "adnxs"]):
+        await route.abort()
+    else:
+        await route.continue_()
+
 # Download speed limit to avoid 429 "Too Many Requests" errors (e.g., '5M', '10M', '15M', '20M')
 DOWNLOAD_SPEED = '6M'
 
 # Random cooldown range between queue items (min_seconds, max_seconds)
 COOLDOWN_RANGE = (10, 25)
+
+# Global to track custom session directory for cleanup
+CUSTOM_SESSION_DIR = None
 
 # --- GUI / EXTERNAL INTERFACE HELPERS ---
 LOG_CALLBACK = None
@@ -154,6 +194,309 @@ INPUT_CALLBACK = None
 STATUS_CALLBACK = None
 STOP_CALLBACK = None
 CONFIG = {}
+
+def is_process_running(pid: int) -> bool:
+    """OS-aware check to see if a process ID is currently active."""
+    if pid <= 0: return False
+    if sys.platform == 'win32':
+        # Standard Windows API check for process existence
+        PROCESS_QUERY_INFORMATION = 0x0400
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    else:
+        # Unix-like signal 0 check
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+class DownloadLock:
+    """Context manager to ensure only one instance downloads at a time with queueing."""
+    def __init__(self, title: str):
+        self.lock_file = os.path.join(get_log_dir(), "download.lock")
+        self.title = title
+
+    async def __aenter__(self):
+        while True:
+            check_stop()
+            if os.path.exists(self.lock_file):
+                try:
+                    with open(self.lock_file, 'r', encoding='utf-8') as f:
+                        content = f.read().strip()
+                    
+                    if '|' in content:
+                        pid_str, locked_title = content.split('|', 1)
+                        pid = int(pid_str)
+                        
+                        if is_process_running(pid):
+                            report_status(f"Waiting for: {locked_title}")
+                            log(f"⏳ Waiting for {locked_title} to finish... (Queueing)", end="\r")
+                            await asyncio.sleep(5)
+                            continue
+                        else:
+                            log(f"⚠️  Detected stale lock from dead PID {pid}. Cleaning up...")
+                    
+                except (ValueError, OSError, Exception):
+                    pass 
+                
+                # If we reach here, the lock is stale or invalid
+                with suppress(OSError):
+                    os.remove(self.lock_file)
+            
+            # Attempt to acquire lock atomically
+            try:
+                with open(self.lock_file, 'x', encoding='utf-8') as f:
+                    f.write(f"{os.getpid()}|{self.title}")
+                log(f"🔓 Lock acquired for: {self.title}")
+                return self
+            except FileExistsError:
+                continue
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        with suppress(OSError):
+            if os.path.exists(self.lock_file):
+                # Only delete if it's our lock (matches our PID)
+                with open(self.lock_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                if content.startswith(f"{os.getpid()}|"):
+                    os.remove(self.lock_file)
+                    log(f"🔒 Lock released for: {self.title}")
+
+async def update_nm3u8dl_re():
+    """Queries GitHub API for the latest N_m3u8DL-RE release and updates the local binary."""
+    repo = "nilaoda/N_m3u8DL-RE"
+    bin_dir = os.path.join(get_base_dir(), "binaries")
+    os.makedirs(bin_dir, exist_ok=True)
+    
+    keyword = "win-x64" if sys.platform == 'win32' else "linux-x64"
+    log(f"🔄 Checking GitHub for latest N_m3u8DL-RE release ({keyword})...")
+    
+    try:
+        api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+        resp = requests.get(api_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+        if resp.status_code == 404:
+            # Fallback if 'latest' flag is missing
+            resp = requests.get(f"https://api.github.com/repos/{repo}/releases", headers={"User-Agent": USER_AGENT}, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()[0]
+        else:
+            resp.raise_for_status()
+            data = resp.json()
+            
+        tag = data.get("tag_name", "Unknown")
+        assets = data.get("assets", [])
+        
+        download_url = next((a["browser_download_url"] for a in assets if keyword in a["name"].lower()), None)
+        
+        if not download_url:
+            log(f"   ❌ Could not find a suitable binary for {keyword} in release {tag}.")
+            return
+            
+        log(f"   ⬇️  Downloading version {tag}...")
+        asset_resp = requests.get(download_url, stream=True, timeout=60)
+        asset_resp.raise_for_status()
+        
+        content = io.BytesIO(asset_resp.content)
+        
+        if download_url.endswith(".zip"):
+            with zipfile.ZipFile(content) as z:
+                exe_name = "N_m3u8DL-RE.exe" if sys.platform == "win32" else "N_m3u8DL-RE"
+                # Find the executable inside the zip and extract it flat into binaries/
+                for zinfo in z.infolist():
+                    if zinfo.filename.lower().endswith(exe_name.lower()):
+                        # We need to extract it without the internal zip folders
+                        source = z.open(zinfo)
+                        target_path = os.path.join(bin_dir, exe_name)
+                        
+                        # Close the existing binary handle if it's currently "found"
+                        with open(target_path, "wb") as f:
+                            shutil.copyfileobj(source, f)
+                        break
+        else:
+            target_path = os.path.join(bin_dir, "N_m3u8DL-RE.exe" if sys.platform == "win32" else "N_m3u8DL-RE")
+            with open(target_path, "wb") as f:
+                f.write(content.getbuffer())
+
+        log(f"   ✅ Successfully updated to {tag} in /binaries.")
+        
+    except Exception as e:
+        log(f"   ❌ Update failed: {e}")
+
+async def update_mkvtoolnix():
+    """Queries GitHub for the latest MKVToolNix static build (Windows only)."""
+    if sys.platform != 'win32':
+        # For Linux/Mac, mkvpropedit is best managed via package manager
+        if not shutil.which("mkvpropedit"):
+            log("\n🐧 mkvpropedit not found.")
+            log("   Please install via your package manager:")
+            log("   Ubuntu/Debian: sudo apt install mkvtoolnix")
+            log("   Arch/BigLinux: sudo pacman -S mkvtoolnix-gui")
+            log("   MacOS: brew install mkvtoolnix")
+        return
+
+    base_url = "https://mkvtoolnix.download/windows/releases/"
+    bin_dir = os.path.join(get_base_dir(), "binaries")
+    os.makedirs(bin_dir, exist_ok=True)
+    
+    log(f"🔄 Checking official MKVToolNix server for latest portable build...")
+    
+    try:
+        # 1. Scrape the main releases page to find the latest version directory
+        resp = requests.get(base_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # Collect links that represent version folders
+        version_folders = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            # Normalize the path to get the last folder name (e.g., "88.0/" or "/path/88.0/")
+            folder_name = href.strip('/').split('/')[-1]
+            
+            # Check if this part looks like a version number (digits and dots)
+            if re.match(r'^\d+(\.\d+)*$', folder_name):
+                version_folders.append(href)
+
+        if not version_folders:
+            log("   ❌ Could not identify version folders on the official server.")
+            return
+
+        # Sort folders by version number (descending)
+        version_folders.sort(key=lambda s: [int(u) for u in s.strip('/').split('/')[-1].split('.')], reverse=True)
+        latest_folder = version_folders[0]
+        latest_version = latest_folder.strip('/').split('/')[-1]
+        
+        # 2. Enter the latest version folder and find the 64-bit zip
+        folder_url = urllib.parse.urljoin(base_url, latest_folder)
+        if not folder_url.endswith('/'):
+            folder_url += '/'
+        resp = requests.get(folder_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        zip_link = next((a['href'] for a in soup.find_all('a', href=True) if '64-bit' in a['href'] and a['href'].endswith('.zip')), None)
+        
+        if not zip_link:
+            log(f"   ❌ Could not find 64-bit zip in version {latest_version}.")
+            return
+            
+        download_url = urllib.parse.urljoin(folder_url, zip_link)
+        log(f"   ⬇️  Downloading version {latest_version}...")
+        asset_resp = requests.get(download_url, stream=True, timeout=120)
+        asset_resp.raise_for_status()
+        
+        content = io.BytesIO(asset_resp.content)
+        with zipfile.ZipFile(content) as z:
+            # We only want specific tools to keep the binaries folder clean
+            targets = ["mkvpropedit.exe", "mkvmerge.exe"]
+            extracted_count = 0
+            
+            for zinfo in z.infolist():
+                filename = os.path.basename(zinfo.filename)
+                if filename.lower() in [t.lower() for t in targets]:
+                    # Extract and flatten to binaries/
+                    source = z.open(zinfo)
+                    target_path = os.path.join(bin_dir, filename)
+                    with open(target_path, "wb") as f:
+                        shutil.copyfileobj(source, f)
+                    extracted_count += 1
+            
+            if extracted_count > 0:
+                log(f"   ✅ Successfully updated {extracted_count} MKVToolNix component(s) to {latest_version}.")
+            else:
+                log("   ⚠️  Download finished, but could not find target executables inside the ZIP.")
+    except Exception as e:
+        log(f"   ❌ MKVToolNix official update failed: {e}")
+
+async def update_ffmpeg():
+    """Queries BtbN/ffmpeg-builds for the latest auto-build (Windows only)."""
+    if sys.platform != 'win32':
+        # Linux users should use 'sudo apt install ffmpeg' or 'sudo pacman -S ffmpeg'
+        return
+
+    repo = "BtbN/ffmpeg-builds"
+    bin_dir = os.path.join(get_base_dir(), "binaries")
+    os.makedirs(bin_dir, exist_ok=True)
+    
+    log(f"🔄 Checking GitHub for latest FFmpeg (BtbN win64-gpl)...")
+    
+    try:
+        # BtbN uses the standard 'latest' tag for their master builds
+        api_url = f"https://api.github.com/repos/{repo}/releases"
+        resp = requests.get(api_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()[0] # Grab the absolute latest auto-build
+        tag = data.get("tag_name", "Unknown")
+        assets = data.get("assets", [])
+        
+        # Target the shared GPL win64 zip
+        download_url = next((a["browser_download_url"] for a in assets if "win64-gpl.zip" in a["name"]), None)
+        
+        if not download_url:
+            log(f"   ❌ Could not find win64-gpl.zip in release {tag}.")
+            return
+            
+        log(f"   ⬇️  Downloading version {tag}...")
+        asset_resp = requests.get(download_url, stream=True, timeout=180) # FFmpeg is larger, higher timeout
+        asset_resp.raise_for_status()
+        
+        content = io.BytesIO(asset_resp.content)
+        with zipfile.ZipFile(content) as z:
+            targets = ["ffmpeg.exe", "ffprobe.exe"]
+            extracted_count = 0
+            for zinfo in z.infolist():
+                filename = os.path.basename(zinfo.filename)
+                if filename.lower() in [t.lower() for t in targets]:
+                    source = z.open(zinfo)
+                    target_path = os.path.join(bin_dir, filename)
+                    with open(target_path, "wb") as f:
+                        shutil.copyfileobj(source, f)
+                    extracted_count += 1
+            
+            if extracted_count > 0:
+                log(f"   ✅ Successfully updated {extracted_count} FFmpeg component(s) to {tag}.")
+    except Exception as e:
+        log(f"   ❌ FFmpeg update failed: {e}")
+
+def find_binary(name, config_key=None):
+    """Robust binary discovery (Priority: Config -> Binaries Folder -> Root -> System Path)."""
+    base_dir = get_base_dir()
+    is_win = sys.platform == 'win32'
+    
+    # 1. Config First (if available in global CONFIG)
+    if config_key and 'CONFIG' in globals() and CONFIG.get(config_key):
+        conf_path = CONFIG[config_key]
+        if os.path.exists(conf_path):
+            return conf_path
+        # Relative to base dir
+        abs_conf = os.path.join(base_dir, conf_path)
+        if os.path.exists(abs_conf):
+            return abs_conf
+            
+    # 2. Search Directories (Priority: Binaries Folder -> Root)
+    exts = [".exe"] if is_win else [""]
+    search_names = [name]
+    if name == "ffmpeg" and is_win:
+        search_names.append("ffmpeg_libfdk_aac_1")
+        
+    search_dirs = [
+        os.path.join(base_dir, "binaries"), # 1. Binaries Subfolder
+        base_dir                            # 2. Root Folder
+    ]
+    
+    for d in search_dirs:
+        if not os.path.exists(d): continue
+        for s_name in search_names:
+            for ext in exts:
+                local_path = os.path.join(d, s_name + ext)
+                if os.path.exists(local_path):
+                    return os.path.abspath(local_path)
+                    
+    # 3. System Path
+    return shutil.which(name) or name
 
 def setup_interface(config_data=None, log_cb=None, input_cb=None, status_cb=None, stop_cb=None):
     global CONFIG, LOG_CALLBACK, INPUT_CALLBACK, STATUS_CALLBACK, STOP_CALLBACK
@@ -165,7 +508,25 @@ def setup_interface(config_data=None, log_cb=None, input_cb=None, status_cb=None
 
 def log(msg, end="\n"):
     if LOG_CALLBACK: LOG_CALLBACK(str(msg) + end)
-    else: print(msg, end=end)
+    else:
+        # Use sys.__stdout__ directly to bypass redirection and avoid infinite recursion in CLI
+        try:
+            if sys.__stdout__:
+                sys.__stdout__.write(str(msg) + end)
+                sys.__stdout__.flush()
+            else:
+                print(msg, end=end)
+        except:
+            print(msg, end=end)
+
+class RealTimeLogger(io.TextIOBase):
+    """A file-like object that streams stdout/stderr to the global log() function instantly."""
+    def write(self, s):
+        if s:
+            log(s, end="")
+        return len(s)
+    def flush(self):
+        pass
 
 def get_user_input(prompt):
     if INPUT_CALLBACK: return INPUT_CALLBACK(prompt)
@@ -225,6 +586,17 @@ get_ignored_iframes()
 class PluginManager:
     def __init__(self):
         self.plugins_dir = os.path.join(get_base_dir(), "plugins")
+        os.makedirs(self.plugins_dir, exist_ok=True)
+
+    def get_plugin_count(self):
+        """Returns the number of valid plugin files found."""
+        return len(self.get_plugin_names())
+
+    def get_plugin_names(self):
+        """Returns a list of valid plugin filenames."""
+        if not os.path.exists(self.plugins_dir):
+            return []
+        return sorted([f for f in os.listdir(self.plugins_dir) if f.endswith(".py") and not f.startswith("_")])
 
     def run_plugins(self, file_path):
         """
@@ -253,30 +625,25 @@ class PluginManager:
                         spec.loader.exec_module(module)
                     
                     if hasattr(module, "process"):
-                        # Capture stdout to a buffer
-                        output_buffer = io.StringIO()
                         new_path = None
                         
                         try:
-                            with redirect_stdout(output_buffer):
+                            # Log the handoff for visibility (CLI & GUI)
+                            log(f"🔌 [Plugin] Passing '{os.path.basename(current_path)}' to {filename_str}...")
+                            
+                            # Use RealTimeLogger to stream any print() calls inside the plugin directly to log()
+                            rtl = RealTimeLogger()
+                            with redirect_stdout(rtl):
                                 new_path = module.process(current_path)
                         except Exception as e:
-                            # If plugin fails during execution, log everything
-                            log(f"   ❌ Plugin {filename_str} failed during execution:")
-                            # Log any output it produced before crashing
-                            captured_output = output_buffer.getvalue()
-                            if captured_output:
-                                log(captured_output, end="")
-                            log(f"      Error: {e}")
+                            # If plugin fails during execution, log the error
+                            log(f"   ❌ Plugin {filename_str} failed during execution: {e}")
                             continue # Move to the next plugin
 
                         # Check if the plugin did something (path changed)
-                        if new_path and new_path != current_path and os.path.exists(new_path):
-                            log(f"   Running plugin: {filename_str}...")
-                            # Log the captured output from the successful plugin
-                            captured_output = output_buffer.getvalue()
-                            if captured_output:
-                                log(captured_output, end="")
+                        if new_path and os.path.exists(new_path):
+                            if new_path != current_path:
+                                pass # Removed duplicate log message
                             current_path = new_path
                     else:
                         log(f"   ⚠️  Skipping {filename_str}: No 'process' function found.")
@@ -301,26 +668,16 @@ class MasterM3U8Finder:
         self._verify_in_progress: bool = False
         
     def find_ytdlp(self):
-        """Check if yt-dlp exists in common locations"""
-        for name in ["yt-dlp.exe", "yt-dlp"]:
-            if os.path.exists(name):
-                return os.path.abspath(name)
-        
-        ytdlp_path = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-        if ytdlp_path:
-            return ytdlp_path
+        """Check if yt-dlp exists with priority: Config -> Root -> System Path"""
+        # 1. Priority: Config
+        config_path = CONFIG.get('ytdlp_path')
+        if config_path and os.path.exists(config_path):
+            return config_path
             
-        common_paths = [
-            r"C:\tools\yt-dlp.exe",
-            os.path.expanduser(r"~\Downloads\yt-dlp.exe"),
-            os.path.expanduser(r"~\yt-dlp\yt-dlp.exe"),
-        ]
-        
-        for path in common_paths:
-            if os.path.exists(path):
-                return path
-                
-        return None
+        # 2. Priority: Root folder & binaries subfolder
+        base_dir = get_base_dir()
+        is_win = os.name == 'nt'
+        return find_binary("yt-dlp", "ytdlp_path")
     
     async def extract_title(self, page):
         """Extract video title from page with fast timeouts"""
@@ -365,16 +722,15 @@ class MasterM3U8Finder:
     def sanitize_filename(self, title):
         """Convert title to safe filename"""
         safe = re.sub(r'[<>:"/\\|?*]', '', title)
-        safe = safe.replace(' ', '.')
         safe = re.sub(r'\.+', '.', safe)
         if len(safe) > 50:
             safe = safe[:50]
-        return safe.strip('.')
+        return safe.strip()
 
     async def save_cookies(self, context):
         """Save session cookies to Netscape format for yt-dlp"""
         try:
-            cookie_file = os.path.join(get_base_dir(), 'cookies.txt')
+            cookie_file = os.path.join(get_log_dir(), 'cookies.txt')
             cookies = await context.cookies()
             with open(cookie_file, 'w', encoding='utf-8') as f:
                 f.write("# Netscape HTTP Cookie File\n")
@@ -420,126 +776,75 @@ class MasterM3U8Finder:
         
         return self.master_url if self.master_url else None
 
-    async def run_ytdlp(self, ytdlp_path, master_url, output_file, use_cookies=False, status_prefix=""):
-        """Execute yt-dlp download internally"""
+    async def run_nm3u8dl_re(self, binary_path, master_url, output_file, referer=None, status_prefix=""):
+        """Execute download using N_m3u8DL-RE with native speed control logic."""
+        check_stop()
+        save_dir = os.path.dirname(output_file)
+        save_name = os.path.splitext(os.path.basename(output_file))[0]
+
+        # Handle native speed control based on GUI setting
+        limit_speed = CONFIG.get('download_speed', 'Unlimited')
+        
+        # Match the structure of your working command example
+        cmd = [
+            binary_path,
+            master_url,
+            "--save-dir", save_dir,
+            "--save-name", save_name,
+            "--header", f"User-Agent: {USER_AGENT}",
+            "--auto-select",
+            "--binary-merge",
+            "--del-after-done",
+            "--download-retry-count", "20",
+            "--mux-after-done", "format=mkv"
+        ]
+
+        if referer:
+            cmd.extend(["--header", f"Referer: {referer}"])
+
+        if limit_speed != "Unlimited":
+            # Speed control requires thread-count 1 for strict enforcement on many servers
+            cmd.extend(["--thread-count", "1", "--max-speed", limit_speed])
+            log(f"   🐢 Throttling enabled (GUI Limit: {limit_speed}). Using 1 thread.")
+        else:
+            cmd.extend(["--thread-count", "8"]) # Safer default
+
+        # Link FFmpeg only for fragment muxing (assembly), not downloading
+        ffmpeg_bin = find_binary("ffmpeg", "ffmpeg_path")
+        if ffmpeg_bin:
+            cmd.extend(["--ffmpeg-binary-path", ffmpeg_bin])
+
         creation_flags = 0
         if sys.platform == 'win32':
             creation_flags = subprocess.CREATE_NO_WINDOW
 
-        check_stop()
-        if not output_file.endswith('.mkv'):
-            output_file += '.mkv'
-        
-        # Base arguments with Cloudflare bypass
-        cmd = [
-            ytdlp_path,
-            '--ignore-errors',
-            '--no-warnings',
-            '--fixup', 'detect_or_warn',
-            '--fragment-retries', '10',
-            '--retry-sleep', 'fragment:5',
-            '--hls-prefer-native',
-            '--limit-rate', self.download_speed if hasattr(self, 'download_speed') else DOWNLOAD_SPEED,
-            '--write-subs',
-            '--all-subs',
-            '--sub-langs', CONFIG['subtitle_langs'] if 'CONFIG' in globals() and 'subtitle_langs' in CONFIG else 'all',
-            '--fragment-retries', '10',  # Don't retry forever if the stream is dead
-            '--skip-unavailable-fragments', # Skip segments that return no data blocks
-            '-o', output_file,
-        ]
-        
-        # Optional: Use cookies from browser if available (helps with some sites)
-        if use_cookies:
-            cmd.extend(['--user-agent', USER_AGENT])
-            cookie_file = os.path.join(get_base_dir(), 'cookies.txt')
-            if os.path.exists(cookie_file):
-                log("   🍪 Using captured browser cookies...")
-                cmd.extend(['--cookies', cookie_file])
-        
-        cmd.append(master_url)
-        
-        # Check if we need to capture output for GUI
-        capture_output = (LOG_CALLBACK is not None)
-        if capture_output:
-            cmd.insert(1, '--newline')
+        log(f"\n⬇️  Starting download with N_m3u8DL-RE...")
+        report_status(f"{status_prefix}Downloading (RE)...")
 
-        report_status(f"{status_prefix}Downloading...")
-        log(f"\n⬇️  Starting download with yt-dlp...")
-        log(f"   Output: {output_file}")
-        log(f"   Anti-bot: Enabled")
-        # log(f"   DEBUG Command: {cmd}")
-        
         try:
-            # Run internally using asyncio subprocess
-            if capture_output:
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    creationflags=creation_flags
-                )
-                
-                while True:
-                    check_stop()
-                    try:
-                        line = await asyncio.wait_for(process.stdout.readline(), timeout=0.1)
-                        if not line: break
-                        text = line.decode('utf-8', errors='replace').strip()
-                        if text:
-                            if '[download]' in text and 'ETA' in text:
-                                match = re.search(r'(\d+\.?\d*)%', text)
-                                if match:
-                                    report_status(f"{status_prefix}Downloading {match.group(1)}%")
-                            elif "HTTP Error 429" in text:
-                                pass
-                            elif "Downloading fragment" in text:
-                                pass
-                            else:
-                                log(text)
-                    except asyncio.TimeoutError:
-                        if process.returncode is not None: break
-                        continue
-                
-                await process.wait()
-            else:
-                process = await asyncio.create_subprocess_exec(*cmd, creationflags=creation_flags)
-                try:
-                    # Poll for stop signal while waiting for process
-                    while process.returncode is None:
-                        check_stop()
-                        try:
-                            await asyncio.wait_for(process.wait(), timeout=0.5)
-                        except asyncio.TimeoutError:
-                            continue
-                    
-                    # Check return code after wait
-                    if process.returncode != 0 and process.returncode is not None:
-                        # If we captured output, the error is already logged. 
-                        # If not, it might be on stderr which we didn't capture in CLI mode (inherited).
-                        pass
-                except Exception as e:
-                    if "Stopped by user" in str(e):
-                        log("\n🛑 Process stopped by user.")
-                        process.terminate()
-                        await process.wait()
-                    raise e # Re-raise to be handled by the calling function
-                except asyncio.CancelledError:
-                    log("\n🛑 Stopping download process...")
-                    process.terminate()
-                    await process.wait()
-                    raise
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                creationflags=creation_flags
+            )
 
-            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                report_status(f"{status_prefix}Downloading 100.0%")
-                log(f"\n✅ Download complete: {output_file}")
-                size = os.path.getsize(output_file) / (1024*1024)
-                log(f"   File size: {size:.1f} MB")
-                return True
-            else:
-                log(f"\n❌ Download failed (File not found). Exit code: {process.returncode}")
-                return False
+            while True:
+                check_stop()
+                line = await process.stdout.readline()
+                if not line: break
+                text = line.decode('utf-8', errors='replace').strip()
+                if text:
+                    if '%' in text:
+                        parts = text.split()
+                        pct = next((p for p in parts if '%' in p), None)
+                        if pct: report_status(f"{status_prefix}DL: {pct}")
+                    log(f"\r   {text}", end="")
+            
+            await process.wait()
+            return process.returncode == 0 and any(os.path.exists(os.path.join(save_dir, f"{save_name}{ext}")) for ext in ['.mkv', '.ts', '.mp4'])
         except Exception as e:
-            log(f"\n❌ Error running yt-dlp: {e}")
+            log(f"❌ N_m3u8DL-RE download error: {e}")
             return False
 
     async def capture(self, start_url: str, headless: bool = False) -> Tuple[Optional[str], str, Optional[str], str]:
@@ -558,7 +863,10 @@ class MasterM3U8Finder:
         
         # Use a persistent user data directory to save cookies/session
         # Use get_base_dir() so the session folder lives next to the .exe, not in CWD
-        user_data_dir = os.path.join(get_base_dir(), "browser_session")
+        if CUSTOM_SESSION_DIR:
+            user_data_dir = os.path.join(get_base_dir(), CUSTOM_SESSION_DIR)
+        else:
+            user_data_dir = os.path.join(get_base_dir(), "browser_session")
         if not os.path.exists(user_data_dir):
             os.makedirs(user_data_dir)
 
@@ -941,10 +1249,11 @@ def get_output_paths(title: str, url: str) -> Tuple[str, str]:
         # Clean the title to remove existing Season/Episode info
         # This prevents redundancy like "Series.S01E01.S01E01.mkv"
         clean_title = safe_title
-        clean_title = re.sub(r'\.S\d+E\d+.*', '', clean_title, flags=re.IGNORECASE)
-        clean_title = re.sub(r'\.S\d+\.?$', '', clean_title, flags=re.IGNORECASE)
-        clean_title = re.sub(r'\.Season\.\d+.*', '', clean_title, flags=re.IGNORECASE)
-        clean_title = clean_title.strip('.')
+        clean_title = re.sub(r'[. ]S\d+E\d+.*', '', clean_title, flags=re.IGNORECASE)
+        clean_title = re.sub(r'[. ]S\d+\.?$', '', clean_title, flags=re.IGNORECASE)
+        clean_title = re.sub(r'[. ]Season[ .]\d+.*', '', clean_title, flags=re.IGNORECASE)
+        clean_title = re.sub(r'[ .(\)]+(\d{4})[ .(\)]+\1', r' (\1)', clean_title) # Fix duplicate years like (2024) (2024)
+        clean_title = clean_title.strip()
         
         series_dir = os.path.join(base_dir, clean_title)
         final_dir = os.path.join(series_dir, f"Season {season_num:02d}")
@@ -966,7 +1275,7 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
     1. Converts IMDB URLs if needed.
     2. Runs MasterM3U8Finder to get the stream.
     3. Saves metadata to a .txt file.
-    4. Runs yt-dlp to download.
+    4. Runs N_m3u8DL-RE to download.
     5. Moves the file to the final destination on success.
     """
     check_stop()
@@ -992,10 +1301,12 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                 if s_match: s = int(s_match.group(1))
                 if e_match: e = int(e_match.group(1))
                 
-                url = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season={s}&episode={e}"
+                template = CONFIG.get('tv_template', "https://vidsrcme.ru/embed/tv?imdb={imdb}&season={s}&episode={e}")
+                url = template.replace("{imdb}", imdb_id).replace("{s}", str(s)).replace("{e}", str(e))
                 log(f"   Detected TV Series. Using: {url}")
             else:
-                url = f"https://vsembed.ru/embed/movie?imdb={imdb_id}"
+                template = CONFIG.get('movie_template', "https://vsembed.ru/embed/movie?imdb={imdb}")
+                url = template.replace("{imdb}", imdb_id)
                 log(f"   Converted to Movie: {url}")
 
     if not auto_mode:
@@ -1025,29 +1336,38 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
         log(f"\n🎬 Title: {title}")
         log(f"🔗 URL: {master_url[:80]}...")
         
-        ytdlp_path = finder.find_ytdlp()
+        nm3u8_path = find_binary("N_m3u8DL-RE", "nm3u8dl_re_path")
         
-        final_dir, filename = get_output_paths(title, url)
-        os.makedirs(final_dir, exist_ok=True)
-        
-        txt_filename = os.path.join(final_dir, f"{safe_title}.txt")
-        final_filename = os.path.join(final_dir, filename)
-            
         # Setup Temp Directory
         script_dir = get_base_dir()
         temp_dir = os.path.join(script_dir, "temp_downloads")
         os.makedirs(temp_dir, exist_ok=True)
-        temp_filename = os.path.join(temp_dir, f"{safe_title}.mkv")
+
+        final_dir, filename = get_output_paths(title, url)
+        txt_filename = os.path.join(temp_dir, f"{os.path.splitext(filename)[0]}.txt")
+        temp_filename = os.path.join(temp_dir, filename)
+        final_filename = os.path.join(final_dir, filename)
             
         with open(txt_filename, 'w', encoding='utf-8') as f:
             f.write(f"Title: {title}\n")
             f.write(f"URL: {master_url}\n")
             f.write(f"Filename: {final_filename}\n")
-            f.write(f"Command: yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get('download_speed', DOWNLOAD_SPEED)} --user-agent \"{USER_AGENT}\" -o \"{final_filename}\" \"{master_url}\"\n")
+            
+            # Generate the exact manual command based on current speed settings
+            limit_speed = CONFIG.get('download_speed', 'Unlimited')
+            ref_header = f" --header \"Referer: {referer}\"" if referer else ""
+            
+            if limit_speed != "Unlimited":
+                speed_flags = f"--thread-count 1 --max-speed {limit_speed} --download-retry-count 10"
+            else:
+                speed_flags = "--thread-count 8 --download-retry-count 10"
+
+            f.write(f"Command: N_m3u8DL-RE \"{master_url}\" --save-dir \"{temp_dir}\" --save-name \"{os.path.splitext(filename)[0]}\" --header \"User-Agent: {USER_AGENT}\"{ref_header} --auto-select --binary-merge --del-after-done {speed_flags}\n")
+            
         log(f"\n💾 Details saved to {txt_filename}")
         
-        if ytdlp_path:
-            log(f"\n🛠️  yt-dlp found: {ytdlp_path}")
+        if nm3u8_path:
+            log(f"\n🛠️  N_m3u8DL-RE found: {nm3u8_path}")
             
             if os.path.exists(final_filename):
                 log(f"\n⚠️  File '{final_filename}' already exists.")
@@ -1077,14 +1397,11 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                     e_num = int(e_match.group(1)) if e_match else 0
                     status_prefix = f"S{s_num:02d}E{e_num:02d} "
 
-                # Download to temp file first
-                success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename, status_prefix=status_prefix)
+                # Apply the OS-aware Download Lock
+                async with DownloadLock(title):
+                    success = await finder.run_nm3u8dl_re(nm3u8_path, master_url, temp_filename, referer=referer, status_prefix=status_prefix)
                 
-                if not success:
-                    log("\n⚠️  First attempt failed. Trying with browser cookies...")
-                    success = await finder.run_ytdlp(ytdlp_path, master_url, temp_filename, use_cookies=True, status_prefix=status_prefix)
-                
-                cookie_file = os.path.join(get_base_dir(), 'cookies.txt')
+                cookie_file = os.path.join(get_log_dir(), 'cookies.txt')
                 if os.path.exists(cookie_file):
                     try:
                         os.remove(cookie_file)
@@ -1108,11 +1425,25 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                                 pass
                         # Cleanup empty default directory if we created it and it's empty
                         try:
-                            if os.path.exists(final_dir) and not os.listdir(final_dir):
-                                os.rmdir(final_dir)
+                            curr_clean = os.path.abspath(final_dir)
+                            # Try cleaning up two levels (e.g., Season folder then the dotted Series folder)
+                            for _ in range(2):
+                                if os.path.exists(curr_clean) and os.path.isdir(curr_clean) and not os.listdir(curr_clean):
+                                    # Safety: Don't delete configured base dirs or program root
+                                    if curr_clean in [os.path.abspath(CONFIG.get('tv_dir', '')), 
+                                                     os.path.abspath(CONFIG.get('movies_dir', '')), 
+                                                     os.path.abspath(os.path.join(get_base_dir(), "TV")), 
+                                                     os.path.abspath(os.path.join(get_base_dir(), "Movie")),
+                                                     os.path.abspath(get_base_dir())]:
+                                        break
+                                    os.rmdir(curr_clean)
+                                    curr_clean = os.path.dirname(curr_clean)
+                                else:
+                                    break
                         except:
                             pass
-                        return True
+                        report_status("Success")
+                        return new_temp_filename
                     
                     temp_filename = new_temp_filename
                     # Update final filename extension if plugin changed it
@@ -1125,6 +1456,7 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                     log(f"   From: {temp_filename}")
                     log(f"   To:   {final_filename}")
                     try:
+                        os.makedirs(final_dir, exist_ok=True)
                         if os.path.exists(final_filename):
                             os.remove(final_filename)
                         shutil.move(temp_filename, final_filename)
@@ -1136,32 +1468,34 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                             except:
                                 pass
                                 
-                        return True
+                        report_status("Success")
+                        return final_filename
                     except Exception as e:
                         log(f"❌ Error moving file: {e}")
+                        report_status("Ready")
                         return False
                 
                 if not success:
-                    log("\n📋 Manual command (try running this in terminal):")
-                    log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                    log("\n❌ N_m3u8DL-RE download failed.")
+                    report_status("Ready")
+                else:
+                    report_status("Success")
                 return success
             else:
-                log(f"\n📋 Manual command:")
-                log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+                report_status("Ready")
                 return True
         else:
-            log("\n❌ yt-dlp not found")
-            log(f"\n📋 Save this command:")
-            log(f'yt-dlp --ignore-errors --no-warnings --fixup detect_or_warn --fragment-retries 10 --retry-sleep fragment:5 --hls-prefer-native --limit-rate {CONFIG.get("download_speed", DOWNLOAD_SPEED)} --user-agent "{USER_AGENT}" -o "{final_filename}" "{master_url}"')
+            log("\n❌ N_m3u8DL-RE not found.")
+            report_status("Ready")
             return True
-        
     else:
         if headless:
             log("\n⚠️  Headless capture failed. Retrying in visible mode to bypass Cloudflare...")
             return await process_video(url, headless=False, auto_mode=auto_mode)
-            
-        log("❌ FAILED - No master.m3u8 found")
-        return False
+        else:
+            log("\n❌ Failed to capture stream.")
+            report_status("Ready")
+            return False
 
 # In-memory cache for IMDB metadata
 IMDB_CACHE: Dict[str, Any] = {}
@@ -1172,14 +1506,126 @@ def flush_imdb_cache():
     IMDB_CACHE.clear()
     # log("🧹 IMDB cache flushed.")
 
-async def get_imdb_info(imdb_id: str) -> Optional[Dict[str, Any]]:
+async def get_imdb_info(imdb_id: str, page=None) -> Optional[Dict[str, Any]]:
     if imdb_id in IMDB_CACHE:
-        # log(f"🚀 Using cached metadata for: {imdb_id}")
-        return IMDB_CACHE[imdb_id]
+        res = IMDB_CACHE[imdb_id]
+        # Only return cache if it's a movie or a TV show with ALREADY fetched seasons
+        # (search hints only provide 'type' and 'title')
+        if res.get('type') == 'movie' or (res.get('type') == 'tv' and 'seasons' in res):
+            # log(f"🚀 Using cached metadata for: {imdb_id}")
+            return res
         
     url = f"https://www.imdb.com/title/{imdb_id}/"
     log(f"🕵️  Scanning IMDB: {url}")
     
+    async def _extract(p):
+        # Enable resource blocking for this page
+        await p.route("**/*", block_resources)
+        
+        try:
+            # Use domcontentloaded + shorter timeout for faster metadata extraction
+            # IMDB is heavy with ads/tracking that cause full 'load' to timeout.
+            await p.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            log(f"   ⚠️ IMDB load warning: {str(e)[:100]}")
+            # We continue anyway as the title and basic meta might already be in the DOM
+        
+        title = await p.title()
+        title = re.sub(r'\s*[-|]\s*IMDb.*', '', title).strip()
+        
+        # Fallback if title is empty
+        if not title:
+            try:
+                title = await p.locator('h1').first.inner_text()
+            except:
+                title = "Unknown"
+        
+        # Extract Year / Year Range
+        year = ""
+        full_meta_text = ""
+        try:
+            # Get metadata items text (Year is usually 1st or 2nd item)
+            meta_items = await p.locator('[data-testid="hero-title-block__metadata"] li').all_inner_texts()
+            full_meta_text = " | ".join(meta_items).lower()
+            for text in meta_items[:3]:
+                match = re.search(r'\b(19|20)\d{2}\b', text)
+                if match:
+                    year = match.group(0)
+                    break
+        except:
+            pass
+        
+        if year and year not in title:
+            title = f"{title} ({year})"
+        
+        # Check for series markers
+        is_tv = False
+        if await p.locator('text=Episode Guide').count() > 0 or \
+           await p.locator('a[href*="episodes"]').count() > 0 or \
+           await p.locator('[data-testid="hero-subnav-bar-season-episode-picker"]').count() > 0:
+            is_tv = True
+        
+        # Additional robust checks for keywords and year ranges
+        if not is_tv:
+            is_tv_kw = any(kw in full_meta_text for kw in ['tv series', 'tv mini-series', 'tv special', 'tv episode', 'tv movie', 'tv-series'])
+            has_series_kw = 'series' in full_meta_text or 'episode' in full_meta_text or 'season' in full_meta_text
+            has_range = re.search(r'\d{4}[–-]\d*', full_meta_text)
+            
+            if is_tv_kw or has_series_kw or has_range:
+                is_tv = True
+        
+        if not is_tv:
+            res = {'type': 'movie', 'title': title}
+            IMDB_CACHE[imdb_id] = res
+            return res
+        
+        total_episodes = 0
+        try:
+            ep_subtext = p.locator('[data-testid="episodes-header"] .ipc-title__subtext')
+            if await ep_subtext.count() > 0:
+                text = await ep_subtext.first.inner_text()
+                if text.isdigit():
+                    total_episodes = int(text)
+        except:
+            pass
+        
+        log("   📺 TV Series detected. Fetching season info...")
+        await p.goto(f"https://www.imdb.com/title/{imdb_id}/episodes", wait_until="domcontentloaded", timeout=45000)
+        
+        # Wait for season selector to load
+        try:
+            await p.wait_for_selector('#bySeason, [data-testid="select-season"]', timeout=5000)
+        except:
+            pass
+
+        seasons = []
+        options = await p.locator('#bySeason option').all()
+        if not options:
+            options = await p.locator('[data-testid="select-season"] option').all()
+            
+        for opt in options:
+            val = await opt.get_attribute('value')
+            if val and val.isdigit():
+                seasons.append(int(val))
+        
+        # Fallback: Check for season links if dropdown is missing
+        if not seasons:
+            links = await p.locator('a[href*="season="]').all()
+            for link in links:
+                href = await link.get_attribute('href')
+                if href:
+                    match = re.search(r'season=(\d+)', href)
+                    if match:
+                        seasons.append(int(match.group(1)))
+        
+        total_seasons = max(seasons) if seasons else 1
+        res = {'type': 'tv', 'title': title, 'seasons': total_seasons, 'total_episodes': total_episodes}
+        IMDB_CACHE[imdb_id] = res
+        return res
+
+    if page:
+        return await _extract(page)
+
     # Ensure browsers are downloaded before launching
     ensure_playwright_browsers()
     
@@ -1193,113 +1639,44 @@ async def get_imdb_info(imdb_id: str) -> Optional[Dict[str, Any]]:
             exec_path = get_browser_executable("chromium")
             if not exec_path:
                 return None
-            # Force using full Chromium even for headless mode to avoid needing headless_shell folder
             browser = await p.chromium.launch(headless=True, executable_path=exec_path)
-        page = await browser.new_page(user_agent=USER_AGENT)
         
+        new_page = await browser.new_page(user_agent=USER_AGENT)
         try:
-            try:
-                # Use domcontentloaded + shorter timeout for faster metadata extraction
-                # IMDB is heavy with ads/tracking that cause full 'load' to timeout.
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            except Exception as e:
-                log(f"   ⚠️ IMDB load warning: {str(e)[:100]}")
-                # We continue anyway as the title and basic meta might already be in the DOM
-            
-            title = await page.title()
-            title = re.sub(r'\s*[-|]\s*IMDb.*', '', title).strip()
-            
-            # Fallback if title is empty
-            if not title:
-                try:
-                    title = await page.locator('h1').first.inner_text()
-                except:
-                    title = "Unknown"
-            
-            # Extract Year
-            year = ""
-            try:
-                # Get metadata items text (Year is usually 1st or 2nd item)
-                meta_items = await page.locator('[data-testid="hero-title-block__metadata"] li').all_inner_texts()
-                for text in meta_items[:3]:
-                    match = re.search(r'\b(19|20)\d{2}\b', text)
-                    if match:
-                        year = match.group(0)
-                        break
-            except:
-                pass
-            
-            if year and year not in title:
-                title = f"{title} ({year})"
-            
-            is_tv = False
-            
-            # Check for series markers
-            if await page.locator('text=Episode Guide').count() > 0 or \
-               await page.locator('a[href*="episodes"]').count() > 0 or \
-               await page.locator('[data-testid="hero-subnav-bar-season-episode-picker"]').count() > 0:
-                is_tv = True
-            
-            if not is_tv:
-                res = {'type': 'movie', 'title': title}
-                IMDB_CACHE[imdb_id] = res
-                await browser.close()
-                return res
-            
-            total_episodes = 0
-            try:
-                ep_subtext = page.locator('[data-testid="episodes-header"] .ipc-title__subtext')
-                if await ep_subtext.count() > 0:
-                    text = await ep_subtext.first.inner_text()
-                    if text.isdigit():
-                        total_episodes = int(text)
-            except:
-                pass
-            
-            log("   📺 TV Series detected. Fetching season info...")
-            await page.goto(f"https://www.imdb.com/title/{imdb_id}/episodes", wait_until="domcontentloaded", timeout=45000)
-            
-            # Wait for season selector to load
-            try:
-                await page.wait_for_selector('#bySeason, [data-testid="select-season"]', timeout=5000)
-            except:
-                pass
-
-            seasons = []
-            options = await page.locator('#bySeason option').all()
-            if not options:
-                options = await page.locator('[data-testid="select-season"] option').all()
-                
-            for opt in options:
-                val = await opt.get_attribute('value')
-                if val and val.isdigit():
-                    seasons.append(int(val))
-            
-            # Fallback: Check for season links if dropdown is missing
-            if not seasons:
-                links = await page.locator('a[href*="season="]').all()
-                for link in links:
-                    href = await link.get_attribute('href')
-                    if href:
-                        match = re.search(r'season=(\d+)', href)
-                        if match:
-                            seasons.append(int(match.group(1)))
-            
-            total_seasons = max(seasons) if seasons else 1
-            res = {'type': 'tv', 'title': title, 'seasons': total_seasons, 'total_episodes': total_episodes}
-            IMDB_CACHE[imdb_id] = res
+            res = await _extract(new_page)
             await browser.close()
             return res
-            
         except Exception as e:
             log(f"⚠️  IMDB Scan failed: {e}")
             await browser.close()
             return None
-
-async def get_season_episodes(imdb_id: str, season: int) -> int:
+async def get_season_episodes(imdb_id: str, season: int, page=None) -> int:
     url = f"https://www.imdb.com/title/{imdb_id}/episodes?season={season}"
     log(f"   📖 Fetching episode count for Season {season}...")
     
+    async def _extract(p):
+        await p.route("**/*", block_resources)
+        try:
+            await p.goto(url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                await p.wait_for_selector('.list_item, article.episode-item-wrapper, [data-testid="episodes-browse-episodes"]', timeout=5000)
+            except:
+                pass
+                
+            count = await p.locator('.list_item').count()
+            if count == 0:
+                count = await p.locator('article.episode-item-wrapper').count()
+            if count == 0:
+                count = await p.locator('[data-testid="episodes-browse-episodes"] .ipc-title__text').count()
+            
+            return count if count > 0 else 0
+        except Exception as e:
+            log(f"   ⚠️ Failed to load season {season}: {e}")
+            return 0
+
+    if page:
+        return await _extract(page)
+
     async with async_playwright() as p:
         if sys.platform.startswith('linux'):
             exec_path = get_browser_executable("firefox")
@@ -1309,29 +1686,22 @@ async def get_season_episodes(imdb_id: str, season: int) -> int:
             exec_path = get_browser_executable("chromium")
             if not exec_path: return 0
             browser = await p.chromium.launch(headless=True, executable_path=exec_path)
-        page = await browser.new_page(user_agent=USER_AGENT)
         
+        new_page = await browser.new_page(user_agent=USER_AGENT)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            try:
-                await page.wait_for_selector('.list_item, article.episode-item-wrapper, [data-testid="episodes-browse-episodes"]', timeout=5000)
-            except:
-                pass
-                
-            count = await page.locator('.list_item').count()
-            if count == 0:
-                count = await page.locator('article.episode-item-wrapper').count()
-            if count == 0:
-                count = await page.locator('[data-testid="episodes-browse-episodes"] .ipc-title__text').count()
-            
+            count = await _extract(new_page)
             await browser.close()
-            return count if count > 0 else 0
+            return count
         except:
             await browser.close()
             return 0
 
-def clear_session(reason=""):
-    session_dir = os.path.join(get_base_dir(), "browser_session")
+def clear_session(reason="", target_dir=None):
+    if target_dir:
+        session_dir = os.path.join(get_base_dir(), target_dir)
+    else:
+        session_dir = os.path.join(get_base_dir(), "browser_session")
+        
     if os.path.exists(session_dir):
         message = f"\n🧹 Clearing browser session"
         if reason:
@@ -1344,6 +1714,22 @@ def clear_session(reason=""):
         except Exception as e:
             log(f"   ⚠️ Failed to clear session: {e}")
 
+def cleanup_stale_browser_session(session_dir_name: str = "browser_session"):
+    """
+    Deletes the browser session folder if it exists and is older than 0.5 hours (30 minutes).
+    """
+    full_session_path = os.path.join(get_base_dir(), session_dir_name)
+    
+    if os.path.exists(full_session_path):
+        with suppress(Exception): # Suppress errors during cleanup to not block startup
+            mtime = os.path.getmtime(full_session_path)
+            modified_time = datetime.fromtimestamp(mtime)
+            current_time = datetime.now()
+            
+            if current_time - modified_time > timedelta(minutes=30):
+                log(f"\n🗑️  Stale browser session folder detected (older than 0.5 hours). Deleting: {full_session_path}")
+                clear_session(reason="stale session", target_dir=session_dir_name)
+
 def load_config():
     script_dir = get_base_dir()
     config_file = os.path.join(script_dir, "config.json")
@@ -1355,7 +1741,9 @@ def load_config():
         "min_cooldown": COOLDOWN_RANGE[0],
         "max_cooldown": COOLDOWN_RANGE[1],
         "subtitle_langs": "all",
-        "session_reset_count": 5
+        "session_reset_count": 5,
+        "movie_template": "https://vsembed.ru/embed/movie?imdb={imdb}",
+        "tv_template": "https://vidsrcme.ru/embed/tv?imdb={imdb}&season={s}&episode={e}"
     }
     
     if os.path.exists(config_file):
@@ -1369,54 +1757,81 @@ def load_config():
         
     return default_config, log_messages
 
-async def search_imdb(query, filter_type='all'):
+def save_config(new_data):
     """
-    Searches IMDB for a query and returns a list of candidates.
+    Safely saves configuration by merging with the existing file on disk.
+    This prevents overwriting manual edits (like API keys) with stale memory data.
+    """
+    script_dir = get_base_dir()
+    config_file = os.path.join(script_dir, "config.json")
+    
+    # 1. Load latest data from disk
+    current_disk_config = {}
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                current_disk_config = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Error reading config for merge: {e}")
+
+    # 2. Merge new data into disk data
+    current_disk_config.update(new_data)
+    
+    # 3. Write back atomically
+    temp_file = config_file + ".tmp"
+    try:
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(current_disk_config, f, indent=4)
+        # On Windows, os.replace is atomic; on Linux, os.rename is atomic
+        if os.name == 'nt' and os.path.exists(config_file):
+            os.remove(config_file)
+        os.rename(temp_file, config_file)
+        return True
+    except Exception as e:
+        print(f"❌ Failed to save config: {e}")
+        if os.path.exists(temp_file):
+            try: os.remove(temp_file)
+            except: pass
+        return False
+
+async def search_imdb(query, filter_type='all', page=None):
+    """
+    Searches IMDB for a query and returns a list of candidates using Playwright.
     """
     encoded_query = urllib.parse.quote(query)
-    # Exact URL format as requested
     url = f"https://www.imdb.com/find/?q={encoded_query}"
     
     log(f"🔎 Searching IMDB for: {query} (Encoded: {encoded_query})")
     log(f"   🔗 Link: {url}")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.5"
-    }
-
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
+    async def _extract(p):
+        await p.route("**/*", block_resources)
+        try:
+            await p.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            log(f"   ⚠️ IMDB Search load warning: {str(e)[:100]}")
         
-        soup = BeautifulSoup(response.content, "html.parser")
         results = []
-        
-        # Target the 'li' items first to ensure we have the container
-        items = soup.find_all('li', class_='ipc-metadata-list-summary-item')
-
-        for item in items:
-            try:
-                # Look for the title link specifically
-                link_tag = item.find('a', class_='ipc-title-link-wrapper')
-                if not link_tag:
-                    for a in item.find_all('a'):
-                        if 'title' in a.get('href', '') and a.get_text().strip():
-                            link_tag = a
-                            break
-                            
-                img_tag = item.find('img')
-                
-                if link_tag and 'title' in link_tag.get('href', ''):
-                    title = link_tag.get_text().strip()
-                    href = link_tag.get('href').split('?')[0]
+        try:
+            # Wait for results to appear
+            await p.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
+            items = await p.locator('.ipc-metadata-list-summary-item').all()
+            
+            for item in items:
+                try:
+                    link_el = item.locator('a.ipc-title-link-wrapper')
+                    if await link_el.count() == 0:
+                        continue
+                        
+                    title = await link_el.inner_text()
+                    href = await link_el.get_attribute('href')
+                    if not href: continue
                     
-                    if href.startswith('/'):
-                        link = "https://www.imdb.com" + href
-                    else:
-                        link = href
+                    clean_href = href.split('?')[0]
+                    link = "https://www.imdb.com" + clean_href if clean_href.startswith('/') else clean_href
                     
-                    img_url = img_tag.get('src') if img_tag else "No Image"
+                    img_el = item.locator('img').first
+                    img_url = await img_el.get_attribute('src') if await img_el.count() > 0 else "No Image"
                     
                     # Log in the requested format
                     log(f"{img_url}: {title} - {link}")
@@ -1425,22 +1840,147 @@ async def search_imdb(query, filter_type='all'):
                     if not match: continue
                     imdb_id = match.group(1)
 
-                    # Get metadata (dates, etc.)
-                    meta_elements = item.find_all(lambda tag: tag.name in ['li', 'span'] and tag.get('class') and any(c in tag.get('class') for c in ['ipc-inline-list__item', 'ipc-metadata-list-summary-item__li', 'cli-title-metadata-item', 'cli-title-type-data']))
-                    meta_str = " | ".join([m.get_text().strip() for m in meta_elements]) if meta_elements else ""
-
-                    results.append({'title': title.strip(), 'meta': meta_str, 'url': link, 'id': imdb_id, 'img': img_url})
+                    # 1. Clean Meta String for GUI Display
+                    meta_texts = []
+                    # Try to find all metadata items under the item
+                    # Standard IMDB search result items have .ipc-inline-list__item or .cli-title-metadata-item
+                    meta_texts = await item.locator('.ipc-inline-list__item').all_inner_texts()
+                    if not meta_texts:
+                        meta_texts = await item.locator('.cli-title-metadata-item').all_inner_texts()
                     
-                    if len(results) >= 20:
-                        break
-            except:
-                continue
-        
+                    # Clean and remove title if it accidentally got in
+                    meta_texts = [t.strip() for t in meta_texts if t.strip() and t.lower() != title.lower()]
+                    
+                    # Extract Year, Rating, and type-label
+                    year_val = ""
+                    rating_val = ""
+                    type_label = ""
+                    
+                    for t in meta_texts:
+                        # Year: 4 digits, possibly with range
+                        if re.search(r'\d{4}', t):
+                            if not year_val: year_val = t
+                        # Rating: Standard IMDB rating keywords
+                        elif any(r in t for r in ['TV-', 'PG', 'G', 'R', 'NC-17', 'Approved', 'U', '12', '15', '18']):
+                            if not rating_val: rating_val = t
+                        # Type: Series, Movie, Special, Episode, Podcast
+                        elif any(kw in t.lower() for kw in ['series', 'movie', 'special', 'episode', 'podcast']):
+                            if not type_label: type_label = t
+                    
+                    # 2. Robust Type Detection (Check ALL text in the item)
+                    media_type = 'movie'
+                    item_text = await item.inner_text()
+                    low_text = item_text.lower()
+                    
+                    # Keywords and patterns for logic
+                    is_tv_kw = any(kw in low_text for kw in ['tv series', 'tv mini-series', 'tv mini series', 'tv special', 'tv episode', 'tv movie', 'tv-series', 'podcast series', 'mini series'])
+                    has_series_kw = 'series' in low_text or 'episode' in low_text or 'season' in low_text
+                    has_range = re.search(r'\d{4}[–-]\d*', low_text)
+                    
+                    if is_tv_kw or has_series_kw or has_range:
+                        media_type = 'tv'
+                        if not type_label: 
+                            if 'mini-series' in low_text or 'mini series' in low_text: type_label = "TV Mini Series"
+                            else: type_label = "TV Series"
+                    else:
+                        if not type_label: type_label = "Movie"
+
+                    # 3. Format for display
+                    display_title = f"{title.strip()} ({year_val})" if year_val else title.strip()
+                    # User wanted: rating - Type of media
+                    display_meta = f"{rating_val} - {type_label}" if rating_val else type_label
+                    
+                    # Proactively cache type
+                    IMDB_CACHE[imdb_id] = {'type': media_type, 'title': title.strip()}
+                    
+                    results.append({
+                        'title': display_title, 
+                        'url': link, 
+                        'img': img_url, 
+                        'id': imdb_id, 
+                        'meta': display_meta, 
+                        'type': media_type
+                    })
+                except Exception as e:
+                    # log(f"   ⚠️ Error extracting item: {e}")
+                    continue
+                
+                if len(results) >= 20:
+                    break
+        except Exception as e:
+            log(f"❌ Error during IMDB search: {e}")
+            
+        if not results:
+            log("❌ No results found or IMDB blocked the search.")
+        else:
+            log(f"✅ Found {len(results)} results.")
         return results
 
+    if page:
+        return await _extract(page)
+
+    ensure_playwright_browsers()
+    async with async_playwright() as p:
+        if sys.platform.startswith('linux'):
+            exec_path = get_browser_executable("firefox")
+            if not exec_path: return []
+            browser = await p.firefox.launch(headless=True, executable_path=exec_path)
+        else:
+            exec_path = get_browser_executable("chromium")
+            if not exec_path: return []
+            browser = await p.chromium.launch(headless=True, executable_path=exec_path)
+        
+        new_page = await browser.new_page(user_agent=USER_AGENT)
+        try:
+            res = await _extract(new_page)
+            await browser.close()
+            return res
+        except Exception as e:
+            log(f"❌ Error in Search session: {e}")
+            await browser.close()
+            return []
+
+async def check_embed_availability(imdb_id: str, is_tv: bool) -> tuple[bool, str]:
+    """
+    Checks if a title is actually available on the embed servers by verifying the page title.
+    Returns (is_available, status_message)
+    """
+    if is_tv:
+        template = CONFIG.get('tv_template', "https://vidsrcme.ru/embed/tv?imdb={imdb}&season={s}&episode={e}")
+        url = template.replace("{imdb}", imdb_id).replace("{s}", "1").replace("{e}", "1")
+    else:
+        template = CONFIG.get('movie_template', "https://vsembed.ru/embed/movie?imdb={imdb}")
+        url = template.replace("{imdb}", imdb_id)
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        # Use requests with a reasonable timeout
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return False, f"Not Found (HTTP {response.status_code})"
+            
+        soup = BeautifulSoup(response.content, "html.parser")
+        title_tag = soup.find("title")
+        if not title_tag:
+            return False, "No Content Found"
+            
+        page_title = title_tag.get_text().strip()
+        low_title = page_title.lower()
+        
+        # Check for explicit failure labels
+        if "404" in low_title or "not found" in low_title:
+            return False, "Not Found (404 Page)"
+            
+        # If it's just the domain name or too short, it's likely a soft failure
+        if len(page_title) < 5 or low_title == "vsembed" or low_title == "vidsrc":
+             return False, "Invalid Title / Soft 404"
+             
+        return True, f"Available: {page_title}"
     except Exception as e:
-        log(f"❌ Search error: {e}")
-        return []
+        return False, f"Check Failed: {str(e)[:50]}"
 
 def get_title_details(url):
     """
@@ -1470,7 +2010,7 @@ def get_title_details(url):
         pass
     return {'year': ''}
 
-async def scrape_imdb_chart(chart_type, limit=250):
+async def scrape_imdb_chart(chart_type, limit=250, page=None):
     """
     Scrapes IMDB Top 250 lists (Movies or TV).
     - Extracts links.
@@ -1488,24 +2028,12 @@ async def scrape_imdb_chart(chart_type, limit=250):
     log(f"🚀 Starting scrape of: {label}")
     log(f"   URL: {url}")
     
-    async with async_playwright() as p:
-        # Use firefox on linux, chromium elsewhere to match ensure_playwright_browsers()
-        if sys.platform.startswith('linux'):
-            exec_path = get_browser_executable("firefox")
-            if not exec_path:
-                return []
-            browser = await p.firefox.launch(headless=True, executable_path=exec_path)
-        else:
-            exec_path = get_browser_executable("chromium")
-            if not exec_path:
-                return []
-            browser = await p.chromium.launch(headless=True, executable_path=exec_path)
-        page = await browser.new_page(user_agent=USER_AGENT)
-        
+    async def _extract(p):
+        await p.route("**/*", block_resources)
         try:
-            await page.goto(url, timeout=60000)
+            await p.goto(url, timeout=60000)
             try:
-                await page.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
+                await p.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
             except:
                 pass
             
@@ -1514,29 +2042,30 @@ async def scrape_imdb_chart(chart_type, limit=250):
             max_scroll_attempts = 15
             for attempt in range(max_scroll_attempts):
                 # Press End to jump to bottom and trigger load
-                await page.keyboard.press("End")
+                await p.keyboard.press("End")
                 await asyncio.sleep(1.5) # Wait for Batch to load
                 
                 # Check current count
-                current_count = await page.locator('.ipc-metadata-list-summary-item').count()
+                current_count = await p.locator('.ipc-metadata-list-summary-item').count()
+                log(f"   🔄 Batch {attempt + 1}: Loaded {current_count} items...")
+                
                 if current_count >= 250:
                     log(f"   ✅ All {current_count} items loaded.")
                     break
-                
-                if attempt % 3 == 0:
-                    log(f"   ...loaded {current_count} items so far...")
 
             # Extract items to get both title and year metadata
-            items = await page.locator('.ipc-metadata-list-summary-item').all()
-            log(f"   Found {len(items)} items.")
+            items = await p.locator('.ipc-metadata-list-summary-item').all()
+            log(f"   Extracting details from {len(items)} items...")
             
             results = []
             if items:
                 if limit and len(items) > limit:
                     items = items[:limit]
                 
-                for item in items:
+                for idx, item in enumerate(items):
                     try:
+                        if (idx + 1) % 50 == 0:
+                            log(f"   ✍️  Processing {idx + 1}/{len(items)}...")
                         link_el = item.locator('a.ipc-title-link-wrapper')
                         title = await link_el.inner_text()
                         href = await link_el.get_attribute('href')
@@ -1545,7 +2074,6 @@ async def scrape_imdb_chart(chart_type, limit=250):
                         title = re.sub(r'^\d+[\.\s]+', '', title).strip()
                         
                         # Extract metadata from the metadata items
-                        # In the Top 250 list, these are usually: [Year, Runtime, Certificate]
                         meta_elements = await item.locator('.cli-title-metadata-item').all()
                         year = ""
                         runtime = ""
@@ -1565,7 +2093,6 @@ async def scrape_imdb_chart(chart_type, limit=250):
                         try:
                             star_el = item.locator('.ipc-rating-star--imdb')
                             star_text = await star_el.inner_text()
-                            # star_text often looks like "9.3\n(3.2M)" or "9.3 (3.2M)"
                             stars_match = re.search(r'(\d+\.\d+)', star_text)
                             if stars_match:
                                 stars = stars_match.group(1)
@@ -1582,7 +2109,7 @@ async def scrape_imdb_chart(chart_type, limit=250):
                             formatted_title = f"{formatted_title} - [{rating}]"
                         if stars:
                             formatted_title = f"{formatted_title} - ★{stars}"
-
+                        
                         if href:
                             clean_url = "https://www.imdb.com" + href.split('?')[0]
                             results.append({'title': formatted_title, 'url': clean_url})
@@ -1594,13 +2121,32 @@ async def scrape_imdb_chart(chart_type, limit=250):
             else:
                 log("❌ No items found. IMDB layout might have changed.")
                 return []
-                
         except Exception as e:
             log(f"❌ Error during scrape: {e}")
             return []
-        finally:
-            await browser.close()
 
+    if page:
+        return await _extract(page)
+
+    async with async_playwright() as p:
+        if sys.platform.startswith('linux'):
+            exec_path = get_browser_executable("firefox")
+            if not exec_path: return []
+            browser = await p.firefox.launch(headless=True, executable_path=exec_path)
+        else:
+            exec_path = get_browser_executable("chromium")
+            if not exec_path: return []
+            browser = await p.chromium.launch(headless=True, executable_path=exec_path)
+        
+        new_page = await browser.new_page(user_agent=USER_AGENT)
+        try:
+            results = await _extract(new_page)
+            await browser.close()
+            return results
+        except:
+            await browser.close()
+            return []
+            
 async def main():
     """
     Entry point:
@@ -1608,12 +2154,29 @@ async def main():
     - Handles command line arguments (scraping, queue files, or single URLs).
     - Manages the queue loop and cooldowns.
     """
+    global CUSTOM_SESSION_DIR, COOLDOWN_RANGE
+    
+    # Check for custom session directory flag
+    # This needs to be done before cleanup_stale_browser_session is called
+    # to ensure the correct session directory is targeted if specified.
+    # However, the bug specifically refers to "browser_session" folder,
+    # so we'll prioritize cleaning the default one unless a custom one is explicitly old.
+    
+    if "--session-dir" in sys.argv:
+        try:
+            idx = sys.argv.index("--session-dir")
+            CUSTOM_SESSION_DIR = sys.argv[idx + 1]
+        except (IndexError, ValueError):
+            pass
+
+    # --- BUG FIX: Clean up stale browser session on startup ---
+    cleanup_stale_browser_session(CUSTOM_SESSION_DIR if CUSTOM_SESSION_DIR else "browser_session")
+
     # Load config and set global
     loaded_config, messages = load_config()
     for msg in messages:
         log(msg)
     setup_interface(config_data=loaded_config)
-    global COOLDOWN_RANGE
     COOLDOWN_RANGE = (loaded_config['min_cooldown'], loaded_config['max_cooldown'])
 
     # Default settings
@@ -1627,14 +2190,9 @@ async def main():
     if len(sys.argv) > 1:
         input_arg = sys.argv[1].strip()
         if input_arg == '-U':
-            print("🔄 Checking for yt-dlp updates...")
-            finder = MasterM3U8Finder()
-            ytdlp_path = finder.find_ytdlp()
-            if ytdlp_path:
-                print(f"   Found yt-dlp at: {ytdlp_path}")
-                subprocess.run([ytdlp_path, '-U'])
-            else:
-                print("❌ yt-dlp executable not found.")
+            await update_nm3u8dl_re()
+            await update_mkvtoolnix()
+            await update_ffmpeg()
             return
         elif input_arg == 'scrapemovie':
             results = await scrape_imdb_chart('movie')
@@ -1647,7 +2205,10 @@ async def main():
                 
                 run_now = input(f"🚀 Start downloading Top 250 Movies now? (y/n) [default: y]: ").strip().lower() or 'y'
                 if run_now == 'y':
-                    subprocess.run([sys.executable, "capture_m3u8.py", "imdb_top_250_movies.txt"])
+                    if getattr(sys, 'frozen', False):
+                        subprocess.run([sys.executable, "imdb_top_250_movies.txt"])
+                    else:
+                        subprocess.run([sys.executable, "capture_m3u8.py", "imdb_top_250_movies.txt"])
             return
         elif input_arg == 'scrapetv':
             results = await scrape_imdb_chart('tv')
@@ -1659,7 +2220,10 @@ async def main():
                 
                 run_now = input(f"🚀 Start downloading Top 250 TV Shows now? (y/n) [default: y]: ").strip().lower() or 'y'
                 if run_now == 'y':
-                    subprocess.run([sys.executable, "capture_m3u8.py", "imdb_top_250_tv.txt"])
+                    if getattr(sys, 'frozen', False):
+                        subprocess.run([sys.executable, "imdb_top_250_tv.txt"])
+                    else:
+                        subprocess.run([sys.executable, "capture_m3u8.py", "imdb_top_250_tv.txt"])
             return
         elif input_arg.endswith('.txt'):
             queue_mode = True
@@ -1698,8 +2262,7 @@ async def main():
         print(f"📊 Found {len(urls)} items in queue.")
         
         # Global completed.log
-        script_dir = get_base_dir()
-        completed_log = os.path.join(script_dir, "completed.log")
+        completed_log = os.path.join(get_log_dir(), "completed.log")
         completed_urls = set()
         completed_keys = set() # (imdb_id, season, episode)
 
@@ -1769,10 +2332,13 @@ async def main():
             try:
                 result = await process_video(queue_url, headless=True, auto_mode=True)
                 
-                if result is True:
-                    with open(completed_log, 'a', encoding='utf-8') as f:
-                        f.write(f"{queue_url}\n")
-                    print(f"✅ Marked as complete.")
+                if isinstance(result, str) and result != "404":
+                    if os.path.exists(result) and os.path.getsize(result) > 5 * 1024 * 1024:
+                        with open(completed_log, 'a', encoding='utf-8') as f:
+                            f.write(f"{queue_url}\n")
+                        print(f"✅ Marked as complete.")
+                    else:
+                        print(f"⚠️ File missing or too small after processing. Not marking complete.")
                 elif result == "404":
                     print(f"⏭️  Skipping 404 item...")
                     
@@ -1799,7 +2365,7 @@ async def main():
             
             if i < len(urls) - 1:
                 wait_time = random.randint(COOLDOWN_RANGE[0], COOLDOWN_RANGE[1])
-                print(f"⏳ Cooling down ({wait_time}s)...")
+                log(f"⏳ Cooling down ({wait_time}s)...")
                 await asyncio.sleep(wait_time)
         
         # Auto-delete queue file if it was a generated list and completed successfully
@@ -1881,18 +2447,17 @@ async def main():
                     finder = MasterM3U8Finder()
                     safe_title = finder.sanitize_filename(meta['title'])
 
-                    # Create Series Folder
-                    tv_dir = CONFIG.get('tv_dir')
-                    if not tv_dir or tv_dir == ".":
-                        tv_dir = os.path.join(get_base_dir(), "TV")
-                    
+                    # We still need series_dir to check the library for existing files
+                    tv_dir = CONFIG.get('tv_dir') or os.path.join(get_base_dir(), "TV")
                     series_dir = os.path.join(tv_dir, safe_title)
-                        
-                    os.makedirs(series_dir, exist_ok=True)
+                    
+                    # Use temp folder for the queue file
+                    temp_dir = os.path.join(get_base_dir(), "temp_downloads")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    queue_filename = os.path.join(temp_dir, f"{safe_title}.quu")
                     
                     # Global completed.log
-                    script_dir = get_base_dir()
-                    completed_log = os.path.join(script_dir, "completed.log")
+                    completed_log = os.path.join(get_log_dir(), "completed.log")
                     skipped_count = 0
                     resume_found = False
                     existing_count = 0
@@ -1938,8 +2503,6 @@ async def main():
                         except Exception as e:
                             print(f"   ⚠️ Could not read resume data: {e}")
 
-                    queue_filename = os.path.join(series_dir, f"{safe_title}.txt")
-                    
                     with open(queue_filename, 'w', encoding='utf-8') as f:
                         for link in queue_list:
                             f.write(f"{link}\n")
@@ -1956,7 +2519,10 @@ async def main():
                     if run_now == 'y':
                         print(f"\n🚀 Starting Batch Process for {queue_filename}...")
                         # Restart script with the new queue file
-                        subprocess.run([sys.executable, "capture_m3u8.py", queue_filename])
+                        if getattr(sys, 'frozen', False):
+                            subprocess.run([sys.executable, queue_filename])
+                        else:
+                            subprocess.run([sys.executable, "capture_m3u8.py", queue_filename])
                         return
                     print("\n👋 Exiting. You can run the queue file later.")
                     return
@@ -1972,4 +2538,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n⚠️  Interrupted by user")
     finally:
-        clear_session(reason="shutdown")
+        clear_session(reason="shutdown", target_dir=CUSTOM_SESSION_DIR)

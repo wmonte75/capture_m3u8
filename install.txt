@@ -1,20 +1,77 @@
-INSTALLATION GUIDE
-==================
+================================================================================
+               M3U8 HUNTER & DOWNLOADER - INSTALLATION GUIDE
+================================================================================
 
-1. INSTALL PYTHON
-   - Download Python 3.8 or newer from https://www.python.org/
-   - Check "Add Python to PATH" during installation.
+This project is designed to be portable and self-healing. Follow these steps 
+to set up your environment and initialize the required binaries.
+
+1. PREREQUISITES
+--------------------------------------------------------------------------------
+- Python 3.8 or higher installed.
+- (Linux Users) Ensure 'tkinter' is installed:
+    Ubuntu/Debian: sudo apt install python3-tk
+    Arch/BigLinux: sudo pacman -S tk
 
 2. INSTALL DEPENDENCIES
-   - Open a terminal/command prompt in this folder.
-   - Run: pip install -r requirements.txt
+--------------------------------------------------------------------------------
+Open your terminal or command prompt in the program folder and run:
 
-3. INSTALL BROWSER ENGINE
-   - In the same terminal, run: playwright install chromium
+    pip install -r requirements.txt
 
-4. SETUP YT-DLP
-   - Download yt-dlp.exe from: https://github.com/yt-dlp/yt-dlp/releases
-   - Place yt-dlp.exe in this folder (next to capture_m3u8.py).
+This will install Playwright, CustomTkinter, and other required libraries.
 
-5. RUN
-   - Double-click 'run.bat' or run 'python capture_m3u8.py' in terminal.
+3. INITIALIZE TOOLCHAIN (CRITICAL)
+--------------------------------------------------------------------------------
+The program requires specific binaries (N_m3u8DL-RE, FFmpeg, mkvpropedit). 
+The program can download these automatically. Run the following command:
+
+    python capture_m3u8.py -U
+
+This command is OS-aware and will populate the 'binaries/' folder with the 
+correct versions for your system.
+
+4. CONFIGURATION (API KEYS)
+--------------------------------------------------------------------------------
+To use the automated library organization and metadata features (TMDB plugin), 
+open 'config.json' and enter your free API keys:
+
+    "tmdb_api_key": "YOUR_KEY",
+    "fanart_api_key": "YOUR_KEY",
+    "omdb_api_key": "YOUR_KEY"
+
+You can also set your default "movies_dir" and "tv_dir" paths here or via 
+the GUI settings window.
+
+5. HOW TO RUN
+--------------------------------------------------------------------------------
+
+A) GRAPHICAL INTERFACE (GUI):
+   Run the following to launch the visual hunter and manager:
+   
+   Windows: python capture_m3u8_gui.py
+   Linux:   ./run_capture_m3u8_gui.sh (or python3 capture_m3u8_gui.py)
+
+B) COMMAND LINE (CLI):
+   - To download a single title:
+     python capture_m3u8.py "IMDB_URL_OR_ID"
+     
+   - To process a batch list:
+     python capture_m3u8.py my_queue.txt
+
+6. PROJECT STRUCTURE
+--------------------------------------------------------------------------------
+- /binaries: Portable tools (FFmpeg, etc.) downloaded via the -U flag.
+- /binaries/Logs: Centralized logs (completed.log, TMDB.log).
+- /plugins: Sequence-based processing scripts (001, 002, 010).
+- /temp_downloads: Active workspace for downloads and manifest files.
+
+7. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+- If a download fails to start, try running 'python capture_m3u8.py -U' again 
+  to ensure all tools are up to date.
+- All error details are logged to 'binaries/Logs/TMDB.log' and the console.
+- On Linux, if Playwright fails, run: playwright install-deps
+
+--------------------------------------------------------------------------------
+Enjoy your high-quality library!
+================================================================================

@@ -1,0 +1,22 @@
+# Add domains or URL patterns to ignore when scanning for iframes (one per line)
+# Lines starting with # are comments
+cloudflare.com
+turnstile.com
+recaptcha.net
+dtscout.com
+lijit.com
+sharethis.com
+crwdcntrl.net
+intentiq.com
+doubleclick.net
+googlesyndication.com
+amazon-adsystem.com
+facebook.com
+google-analytics.com
+scorecardresearch.com
+quantserve.com
+adnxs.com
+rubiconproject.com
+pubmatic.com
+2embed.cc
+unpkg.com
