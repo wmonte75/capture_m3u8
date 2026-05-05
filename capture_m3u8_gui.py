@@ -4,6 +4,7 @@ import queue
 import asyncio
 import json
 import os
+import shutil
 import time
 import random
 import re
@@ -209,120 +210,234 @@ class MediaSaveDialog(ctk.CTkToplevel):
         self.callback(action)
 
 class SettingsWindow(ctk.CTkToplevel):
-    def __init__(self, parent):
+    def __init__(self, parent, open_tab=None):
         super().__init__(parent)
         self.parent = parent
         self.title("Application Settings")
         self.attributes("-topmost", True)
         self.resizable(False, False)
 
-        # Update geometry to ensure content fits and is centered
-        self.update_idletasks()
-        w, h = 600, 600
-        # Ensure parent window coordinates are fresh
         parent.update_idletasks()
+        w, h = 640, 540
         x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (w // 2)
         y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (h // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
-        
-        self.grid_columnconfigure(1, weight=1)
-        
-        # Header
-        ctk.CTkLabel(self, text="📁 Directory Configuration", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, columnspan=3, padx=20, pady=(20, 10), sticky="w")
 
-        # Movies Dir
-        ctk.CTkLabel(self, text="Movies Folder:").grid(row=1, column=0, padx=20, pady=5, sticky="e")
-        self.movie_dir_entry = ctk.CTkEntry(self)
-        self.movie_dir_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-        self.movie_dir_entry.insert(0, parent.config.get("movies_dir", ""))
-        ctk.CTkButton(self, text="Browse", width=60, command=lambda: self.browse_folder(self.movie_dir_entry)).grid(row=1, column=2, padx=20, pady=5)
-        
-        # TV Dir
-        ctk.CTkLabel(self, text="TV Shows Folder:").grid(row=2, column=0, padx=20, pady=5, sticky="e")
-        self.tv_dir_entry = ctk.CTkEntry(self)
-        self.tv_dir_entry.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
-        self.tv_dir_entry.insert(0, parent.config.get("tv_dir", ""))
-        ctk.CTkButton(self, text="Browse", width=60, command=lambda: self.browse_folder(self.tv_dir_entry)).grid(row=2, column=2, padx=20, pady=5)
+        self.tabs = ctk.CTkTabview(self, width=600, height=440)
+        self.tabs.pack(padx=15, pady=(15, 5), fill="both", expand=True)
 
-        # Separator
-        ctk.CTkLabel(self, text="⚙️ Download & UI Settings", font=("Segoe UI", 14, "bold")).grid(row=3, column=0, columnspan=3, padx=20, pady=(20, 10), sticky="w")
+        self.tabs.add("General")
+        self.tabs.add("Download")
+        self.tabs.add("Providers")
+        self.tabs.add("Tools")
 
-        # Cooldowns
-        self.opts_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.opts_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=20, pady=5)
-        
-        ctk.CTkLabel(self.opts_frame, text="Cooldown (s):").pack(side="left", padx=5)
-        self.min_cool = ctk.CTkEntry(self.opts_frame, width=50)
-        self.min_cool.pack(side="left", padx=2)
-        self.min_cool.insert(0, str(parent.config.get("min_cooldown", 10)))
-        
-        ctk.CTkLabel(self.opts_frame, text="to").pack(side="left", padx=2)
-        self.max_cool = ctk.CTkEntry(self.opts_frame, width=50)
-        self.max_cool.pack(side="left", padx=2)
-        self.max_cool.insert(0, str(parent.config.get("max_cooldown", 25)))
-        
-        ctk.CTkLabel(self.opts_frame, text="Speed:").pack(side="left", padx=(20, 5))
-        self.speed_opt = ctk.CTkOptionMenu(self.opts_frame, values=["Unlimited", "25M", "10M", "6.5M", "6M", "5.5M", "5M", "4.5M", "4M", "3.5M", "3M", "2.5M", "2M", "1.5M", "1M"])
-        self.speed_opt.pack(side="left", padx=5)
-        self.speed_opt.set(parent.config.get("download_speed", "6M"))
-        
-        # Switches Row
-        self.sw_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.sw_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=20, pady=10)
+        self._build_general_tab()
+        self._build_download_tab()
+        self._build_providers_tab()
+        self._build_tools_tab()
 
-        self.headless_chk = ctk.CTkCheckBox(self.sw_frame, text="Headless Mode")
-        self.headless_chk.pack(side="left", padx=10)
-        if parent.config.get("headless", True): self.headless_chk.select()
-        else: self.headless_chk.deselect()
+        ctk.CTkButton(self, text="Save & Close", command=self.save_and_close, fg_color="#27ae60", hover_color="#2ecc71").pack(pady=(5, 15))
 
-        self.dark_mode_switch = ctk.CTkSwitch(self.sw_frame, text="Dark Mode", command=self.toggle_theme)
-        self.dark_mode_switch.pack(side="left", padx=20)
-        if parent.config.get("theme", "dark") == "dark": self.dark_mode_switch.select()
-        else: self.dark_mode_switch.deselect()
+        if open_tab and open_tab in ["General", "Download", "Providers", "Tools"]:
+            self.tabs.set(open_tab)
 
-        # Provider Templates
-        ctk.CTkLabel(self, text="🔗 Provider Templates", font=("Segoe UI", 14, "bold")).grid(row=6, column=0, columnspan=3, padx=20, pady=(20, 10), sticky="w")
-        
-        ctk.CTkLabel(self, text="Movie:").grid(row=7, column=0, padx=20, pady=5, sticky="e")
-        self.movie_tpl_entry = ctk.CTkEntry(self, placeholder_text="...{imdb}")
-        self.movie_tpl_entry.grid(row=7, column=1, columnspan=2, padx=(5, 20), pady=5, sticky="ew")
-        self.movie_tpl_entry.insert(0, parent.config.get("movie_template", "https://vsembed.ru/embed/movie?imdb={imdb}"))
-        ToolTip(self.movie_tpl_entry, "Use {imdb} placeholder for the Movie ID.")
-
-        ctk.CTkLabel(self, text="TV Series:").grid(row=8, column=0, padx=20, pady=5, sticky="e")
-        self.tv_tpl_entry = ctk.CTkEntry(self, placeholder_text="...{imdb}&season={s}&episode={e}")
-        self.tv_tpl_entry.grid(row=8, column=1, columnspan=2, padx=(5, 20), pady=5, sticky="ew")
-        self.tv_tpl_entry.insert(0, parent.config.get("tv_template", "https://vidsrcme.ru/embed/tv?imdb={imdb}&season={s}&episode={e}"))
-        ToolTip(self.tv_tpl_entry, "Use {imdb}, {s} (season), and {e} (episode) placeholders.")
-
-        # Maintenance Buttons
-        ctk.CTkLabel(self, text="🛠️ Maintenance", font=("Segoe UI", 14, "bold")).grid(row=9, column=0, columnspan=3, padx=20, pady=(20, 10), sticky="w")
-        
-        self.maint_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.maint_frame.grid(row=10, column=0, columnspan=3, sticky="ew", padx=20, pady=5)
-
-        self.reload_btn = ctk.CTkButton(self.maint_frame, text="Reload Plugins", fg_color="transparent", border_width=1, command=parent.reload_plugins)
-        self.reload_btn.pack(side="left", padx=5)
-
-        self.update_btn = ctk.CTkButton(self.maint_frame, text="Check & Update Tools", fg_color="#34495e", hover_color="#2c3e50", command=self.run_tools_update)
-        self.update_btn.pack(side="left", padx=5)
-
-        # Save Button at bottom
-        self.save_btn = ctk.CTkButton(self, text="Save & Close", command=self.save_and_close, fg_color="#27ae60", hover_color="#2ecc71")
-        self.save_btn.grid(row=11, column=0, columnspan=3, pady=(30, 20))
-
-    def browse_folder(self, entry_widget):
+    def _browse_folder(self, entry_widget):
         folder = filedialog.askdirectory()
         if folder:
             entry_widget.delete(0, "end")
             entry_widget.insert(0, folder)
 
-    def toggle_theme(self):
+    def _browse_file(self, entry_widget, title="Select executable"):
+        if sys.platform == 'win32':
+            filetypes = [("Executables", "*.exe"), ("All Files", "*.*")]
+        else:
+            filetypes = [("All Files", "*.*")]
+        f = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if f:
+            entry_widget.delete(0, "end")
+            entry_widget.insert(0, f)
+
+    def _build_general_tab(self):
+        tab = self.tabs.tab("General")
+        tab.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(tab, text="📁 Directories", font=("Segoe UI", 13, "bold")).grid(row=0, column=0, columnspan=3, padx=15, pady=(15, 10), sticky="w")
+
+        ctk.CTkLabel(tab, text="Movies Folder:").grid(row=1, column=0, padx=15, pady=6, sticky="e")
+        self.movie_dir_entry = ctk.CTkEntry(tab)
+        self.movie_dir_entry.grid(row=1, column=1, padx=5, pady=6, sticky="ew")
+        self.movie_dir_entry.insert(0, self.parent.config.get("movies_dir", ""))
+        ctk.CTkButton(tab, text="Browse", width=60, command=lambda: self._browse_folder(self.movie_dir_entry)).grid(row=1, column=2, padx=15, pady=6)
+
+        ctk.CTkLabel(tab, text="TV Shows Folder:").grid(row=2, column=0, padx=15, pady=6, sticky="e")
+        self.tv_dir_entry = ctk.CTkEntry(tab)
+        self.tv_dir_entry.grid(row=2, column=1, padx=5, pady=6, sticky="ew")
+        self.tv_dir_entry.insert(0, self.parent.config.get("tv_dir", ""))
+        ctk.CTkButton(tab, text="Browse", width=60, command=lambda: self._browse_folder(self.tv_dir_entry)).grid(row=2, column=2, padx=15, pady=6)
+
+        ctk.CTkLabel(tab, text="🎨 Interface", font=("Segoe UI", 13, "bold")).grid(row=3, column=0, columnspan=3, padx=15, pady=(25, 10), sticky="w")
+
+        row4 = ctk.CTkFrame(tab, fg_color="transparent")
+        row4.grid(row=4, column=0, columnspan=3, padx=15, pady=5, sticky="w")
+        self.headless_chk = ctk.CTkCheckBox(row4, text="Headless Mode")
+        self.headless_chk.pack(side="left", padx=(0, 20))
+        if self.parent.config.get("headless", True): self.headless_chk.select()
+        else: self.headless_chk.deselect()
+
+        self.dark_mode_switch = ctk.CTkSwitch(row4, text="Dark Mode", command=self._toggle_theme)
+        self.dark_mode_switch.pack(side="left")
+        if self.parent.config.get("theme", "dark") == "dark": self.dark_mode_switch.select()
+        else: self.dark_mode_switch.deselect()
+
+    def _build_download_tab(self):
+        tab = self.tabs.tab("Download")
+        tab.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(tab, text="⏱️ Timing", font=("Segoe UI", 13, "bold")).grid(row=0, column=0, columnspan=3, padx=15, pady=(15, 8), sticky="w")
+
+        timing = ctk.CTkFrame(tab, fg_color="transparent")
+        timing.grid(row=1, column=0, columnspan=3, padx=15, pady=2, sticky="w")
+        ctk.CTkLabel(timing, text="Cooldown:").pack(side="left")
+        self.min_cool = ctk.CTkEntry(timing, width=50)
+        self.min_cool.pack(side="left", padx=4)
+        self.min_cool.insert(0, str(self.parent.config.get("min_cooldown", 10)))
+        ctk.CTkLabel(timing, text="to").pack(side="left", padx=2)
+        self.max_cool = ctk.CTkEntry(timing, width=50)
+        self.max_cool.pack(side="left", padx=4)
+        self.max_cool.insert(0, str(self.parent.config.get("max_cooldown", 25)))
+        ctk.CTkLabel(timing, text="seconds").pack(side="left", padx=2)
+
+        ctk.CTkLabel(tab, text="Fallback Speed (Manual):").grid(row=2, column=0, padx=15, pady=(15, 5), sticky="e")
+        self.speed_opt = ctk.CTkOptionMenu(
+            tab,
+            values=["Unlimited", "25M", "10M", "6.5M", "6M", "5.5M", "5M", "4.5M", "4M", "3.5M", "3M", "2.5M", "2M", "1.5M", "1M"]
+        )
+        self.speed_opt.set(self.parent.config.get("download_speed", "6M"))
+        self.speed_opt.grid(row=2, column=1, padx=5, pady=(15, 5), sticky="w")
+
+        ctk.CTkLabel(tab, text="Preferred Resolution:").grid(row=3, column=0, padx=15, pady=(10, 5), sticky="e")
+        self.pref_res = ctk.CTkOptionMenu(
+            tab,
+            values=["Auto", "1080p", "720p", "480p", "360p"]
+        )
+        self.pref_res.set(self.parent.config.get("preferred_resolution", "Auto"))
+        self.pref_res.grid(row=3, column=1, padx=5, pady=(10, 5), sticky="w")
+
+        sep = ctk.CTkFrame(tab, height=2, fg_color="#333333")
+        sep.grid(row=4, column=0, columnspan=3, padx=15, pady=(20, 10), sticky="ew")
+
+        ctk.CTkLabel(tab, text="🎛️ PRO: Adaptive Speed Control", font=("Segoe UI", 13, "bold"), text_color="#f1c40f").grid(
+            row=5, column=0, columnspan=3, padx=15, pady=(0, 8), sticky="w")
+
+        toggle_row = ctk.CTkFrame(tab, fg_color="transparent")
+        toggle_row.grid(row=6, column=0, columnspan=3, padx=15, pady=(0, 8), sticky="w")
+        self.pro_switch = ctk.CTkSwitch(toggle_row, text="Auto-Limit Speed by Resolution", command=self._toggle_pro, font=("Segoe UI", 12, "bold"))
+        self.pro_switch.pack(side="left")
+        self.pro_hint = ctk.CTkLabel(toggle_row, text="  (Disabled)", text_color="gray", font=("Segoe UI", 10))
+        self.pro_hint.pack(side="left", padx=5)
+        if self.parent.config.get("auto_speed_by_resolution", False):
+            self.pro_switch.select()
+
+        self.pro_card = ctk.CTkFrame(tab, fg_color="#151515", corner_radius=8)
+        self.pro_card.grid(row=7, column=0, columnspan=3, padx=15, pady=5, sticky="ew")
+
+        tiers = [
+            ("1080p and above", "speed_cap_1080", "2.5M"),
+            ("720p", "speed_cap_720", "2M"),
+            ("480p", "speed_cap_480", "1.5M"),
+            ("360p and below", "speed_cap_360", "1M"),
+        ]
+        self.tier_widgets = {}
+        for label, key, default in tiers:
+            r = ctk.CTkFrame(self.pro_card, fg_color="transparent")
+            r.pack(fill="x", padx=12, pady=4)
+            ctk.CTkLabel(r, text=f"{label}:", width=130, anchor="e", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+            dd = ctk.CTkOptionMenu(r, values=["Unlimited", "10M", "5M", "4M", "3.5M", "3M", "2.5M", "2M", "1.5M", "1M", "750K", "500K"], width=110)
+            dd.set(self.parent.config.get(key, default))
+            dd.configure(state="disabled")
+            dd.pack(side="left")
+            self.tier_widgets[key] = dd
+
+        self._toggle_pro()
+
+    def _build_providers_tab(self):
+        tab = self.tabs.tab("Providers")
+        tab.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(tab, text="🔗 Provider Templates", font=("Segoe UI", 13, "bold")).grid(row=0, column=0, columnspan=2, padx=15, pady=(15, 10), sticky="w")
+
+        ctk.CTkLabel(tab, text="Movie:").grid(row=1, column=0, padx=15, pady=6, sticky="e")
+        self.movie_tpl_entry = ctk.CTkEntry(tab, placeholder_text="...{imdb}")
+        self.movie_tpl_entry.grid(row=1, column=1, padx=(5, 15), pady=6, sticky="ew")
+        self.movie_tpl_entry.insert(0, self.parent.config.get("movie_template", "https://vsembed.ru/embed/movie?imdb={imdb}"))
+        ToolTip(self.movie_tpl_entry, "Use {imdb} placeholder for the Movie ID.")
+
+        ctk.CTkLabel(tab, text="TV Series:").grid(row=2, column=0, padx=15, pady=6, sticky="e")
+        self.tv_tpl_entry = ctk.CTkEntry(tab, placeholder_text="...{imdb}&season={s}&episode={e}")
+        self.tv_tpl_entry.grid(row=2, column=1, padx=(5, 15), pady=6, sticky="ew")
+        self.tv_tpl_entry.insert(0, self.parent.config.get("tv_template", "https://vidsrcme.ru/embed/tv?imdb={imdb}&season={s}&episode={e}"))
+        ToolTip(self.tv_tpl_entry, "Use {imdb}, {s} (season), and {e} (episode) placeholders.")
+
+    def _build_tools_tab(self):
+        tab = self.tabs.tab("Tools")
+        tab.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(tab, text="🔧 Binary Paths (Auto-detected if blank)", font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=15, pady=(15, 8))
+
+        # Platform-appropriate binary names (no .exe on Linux/Mac)
+        _bin_ext = ".exe" if sys.platform == 'win32' else ""
+        binaries = [
+            ("FFmpeg:", "ffmpeg_path", f"ffmpeg{_bin_ext}"),
+            ("FFprobe:", "ffprobe_path", f"ffprobe{_bin_ext}"),
+            ("N_m3u8DL-RE:", "nm3u8dl_re_path", f"N_m3u8DL-RE{_bin_ext}"),
+            ("MKVPropEdit:", "mkvpropedit_path", f"mkvpropedit{_bin_ext}"),
+            ("MKVMerge:", "mkvmerge_path", f"mkvmerge{_bin_ext}"),
+        ]
+        self.tool_entries = {}
+        for label, key, example in binaries:
+            row = ctk.CTkFrame(tab, fg_color="transparent")
+            row.pack(fill="x", padx=15, pady=3)
+            ctk.CTkLabel(row, text=label, width=110, anchor="e", font=("Segoe UI", 11)).pack(side="left", padx=(0, 6))
+            ent = ctk.CTkEntry(row, placeholder_text=f"Auto ({example})")
+            ent.insert(0, self.parent.config.get(key, ""))
+            ent.pack(side="left", fill="x", expand=True, padx=(0, 6))
+            ctk.CTkButton(row, text="Browse", width=55, command=lambda e=ent, t=label: self._browse_file(e, f"Select {t.replace(':', '')}")).pack(side="left")
+            self.tool_entries[key] = ent
+
+        sep = ctk.CTkFrame(tab, height=2, fg_color="#333333")
+        sep.pack(fill="x", padx=15, pady=(18, 10))
+
+        ctk.CTkLabel(tab, text="🛠️ Maintenance", font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=15, pady=(5, 8))
+
+        btn_box = ctk.CTkFrame(tab, fg_color="transparent")
+        btn_box.pack(anchor="w", padx=15, pady=2)
+        self.reload_btn = ctk.CTkButton(btn_box, text="Reload Plugins", fg_color="transparent", border_width=1, width=130, command=self.parent.reload_plugins)
+        self.reload_btn.pack(side="left", padx=4)
+        self.update_btn = ctk.CTkButton(btn_box, text="Check & Update Tools", fg_color="#34495e", hover_color="#2c3e50", width=150, command=self._run_tools_update)
+        self.update_btn.pack(side="left", padx=4)
+
+        ctk.CTkLabel(tab, text="🗑️ Session", font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=15, pady=(20, 8))
+        ctk.CTkButton(tab, text="Clear Browser Session", fg_color="#e74c3c", hover_color="#c0392b", width=150, command=lambda: capture_m3u8.clear_session(reason="user request")).pack(anchor="w", padx=20, pady=2)
+
+    def _toggle_theme(self):
         theme = "dark" if self.dark_mode_switch.get() == 1 else "light"
         ctk.set_appearance_mode(theme)
         self.parent.config["theme"] = theme
 
-    def run_tools_update(self):
+    def _toggle_pro(self):
+        on = self.pro_switch.get() == 1
+        for dd in self.tier_widgets.values():
+            dd.configure(state="normal" if on else "disabled")
+        if on:
+            self.pro_hint.configure(text="  (Enabled — reads master.m3u8)", text_color="#2ecc71")
+            self.speed_opt.configure(state="disabled")
+            self.pro_card.configure(fg_color="#1a2e1a")
+        else:
+            self.pro_hint.configure(text="  (Disabled)", text_color="gray")
+            self.speed_opt.configure(state="normal")
+            self.pro_card.configure(fg_color="#151515")
+
+    def _run_tools_update(self):
         self.update_btn.configure(state="disabled", text="Updating...")
         def update_task():
             try:
@@ -335,7 +450,6 @@ class SettingsWindow(ctk.CTkToplevel):
                 self.parent.log_callback(f"❌ Update task failed: {e}\n")
             finally:
                 self.after(0, lambda: self.update_btn.configure(state="normal", text="Check & Update Tools"))
-        
         threading.Thread(target=update_task, daemon=True).start()
 
     def save_and_close(self):
@@ -350,9 +464,137 @@ class SettingsWindow(ctk.CTkToplevel):
         self.parent.config["headless"] = (self.headless_chk.get() == 1)
         self.parent.config["movie_template"] = self.movie_tpl_entry.get().strip()
         self.parent.config["tv_template"] = self.tv_tpl_entry.get().strip()
-        
+        self.parent.config["auto_speed_by_resolution"] = (self.pro_switch.get() == 1)
+        self.parent.config["preferred_resolution"] = self.pref_res.get()
+        for key, dd in self.tier_widgets.items():
+            self.parent.config[key] = dd.get()
+        for key, ent in self.tool_entries.items():
+            self.parent.config[key] = ent.get().strip()
+
         self.parent.save_settings()
         self.destroy()
+
+
+class DependencyInstallerDialog(ctk.CTkToplevel):
+    """Startup dialog that detects missing binaries and offers auto-install or manual commands."""
+    def __init__(self, parent, deps):
+        super().__init__(parent)
+        self.parent = parent
+        self.deps = deps
+        self.title("Missing Dependencies")
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+
+        parent.update_idletasks()
+        w, h = 520, 420
+        x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (w // 2)
+        y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (h // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        ctk.CTkLabel(self, text="Missing Dependencies Detected", font=("Segoe UI", 16, "bold")).pack(pady=(20, 5))
+        ctk.CTkLabel(self, text="The following tools are required but were not found.", text_color="gray").pack()
+
+        scroll = ctk.CTkScrollableFrame(self, width=480, height=210)
+        scroll.pack(padx=20, pady=15, fill="both", expand=True)
+
+        self.dep_widgets = {}
+        for dep in deps:
+            self._add_dep_row(scroll, dep)
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(5, 20))
+
+        has_auto = any(d.get("auto") for d in deps)
+        if has_auto:
+            ctk.CTkButton(btn_frame, text="Install All Possible", fg_color="#27ae60", hover_color="#2ecc71", command=self._install_all).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Open Tools Tab", fg_color="#34495e", hover_color="#2c3e50", command=self._open_tools).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Skip", fg_color="transparent", border_width=1, command=self.destroy).pack(side="left", padx=5)
+
+    def _add_dep_row(self, parent_frame, dep):
+        row = ctk.CTkFrame(parent_frame, fg_color="#1a1a1a", corner_radius=6)
+        row.pack(fill="x", pady=5, padx=5)
+
+        name = dep["name"]
+        auto = dep.get("auto", False)
+        command = dep.get("command", "")
+
+        ctk.CTkLabel(row, text=name, font=("Segoe UI", 12, "bold"), width=130, anchor="w").pack(side="left", padx=10, pady=10)
+
+        status_lbl = ctk.CTkLabel(row, text="Not installed", text_color="#e74c3c", font=("Segoe UI", 10), width=180, anchor="w")
+        status_lbl.pack(side="left", padx=5, pady=10, fill="x", expand=True)
+
+        self.dep_widgets[name] = {"label": status_lbl}
+
+        if auto:
+            btn = ctk.CTkButton(row, text="Install", width=80, height=28, command=lambda d=dep: self._install_one(d))
+            btn.pack(side="right", padx=10, pady=10)
+            self.dep_widgets[name]["btn"] = btn
+        else:
+            cmd_lbl = ctk.CTkLabel(row, text=command, font=("Segoe UI", 10), wraplength=180, anchor="e")
+            cmd_lbl.pack(side="right", padx=10, pady=10)
+            self.dep_widgets[name]["cmd"] = cmd_lbl
+
+    def _install_one(self, dep):
+        name = dep["name"]
+        widgets = self.dep_widgets.get(name, {})
+        btn = widgets.get("btn")
+        lbl = widgets.get("label")
+
+        if btn:
+            btn.configure(state="disabled", text="...")
+        if lbl:
+            lbl.configure(text="Installing...", text_color="#3498db")
+
+        def task():
+            try:
+                if name == "N_m3u8DL-RE":
+                    asyncio.run(capture_m3u8.update_nm3u8dl_re())
+                elif name == "FFmpeg":
+                    asyncio.run(capture_m3u8.update_ffmpeg())
+                elif name == "MKVToolNix":
+                    asyncio.run(capture_m3u8.update_mkvtoolnix())
+                else:
+                    raise RuntimeError("No updater available")
+
+                # Verify
+                path = capture_m3u8.find_binary(dep["binary"], dep["key"])
+                if path and os.path.exists(path):
+                    self.after(0, lambda n=name: self._mark_done(n))
+                else:
+                    self.after(0, lambda n=name: self._mark_failed(n, "Not found after install"))
+            except Exception as e:
+                self.after(0, lambda n=name, err=str(e): self._mark_failed(n, err))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _install_all(self):
+        for dep in self.deps:
+            if dep.get("auto"):
+                self._install_one(dep)
+
+    def _mark_done(self, name):
+        widgets = self.dep_widgets.get(name, {})
+        btn = widgets.get("btn")
+        lbl = widgets.get("label")
+        if lbl:
+            lbl.configure(text="Installed ✅", text_color="#2ecc71")
+        if btn:
+            btn.configure(state="disabled", text="Done")
+
+    def _mark_failed(self, name, error):
+        widgets = self.dep_widgets.get(name, {})
+        btn = widgets.get("btn")
+        lbl = widgets.get("label")
+        short_err = error[:40] + "..." if len(error) > 40 else error
+        if lbl:
+            lbl.configure(text=f"Failed: {short_err}", text_color="#e74c3c")
+        if btn:
+            btn.configure(state="normal", text="Retry")
+
+    def _open_tools(self):
+        self.destroy()
+        self.parent.open_settings(open_tab="Tools")
+
 
 class M3U8DownloaderApp(ctk.CTk):
     def __init__(self):
@@ -437,6 +679,46 @@ class M3U8DownloaderApp(ctk.CTk):
         # Start Log Monitor
         self.after(100, self.process_log_queue)
 
+        # Startup check: if critical binaries are missing, nudge user to Tools tab
+        self.after(600, self.check_missing_binaries)
+
+    def _get_package_command(self, package_name):
+        """Return the appropriate package manager command for the current platform."""
+        if sys.platform == 'darwin':
+            return f"brew install {package_name}"
+        # Linux — detect package manager
+        if shutil.which("apt") or shutil.which("apt-get"):
+            return f"sudo apt install {package_name}"
+        elif shutil.which("pacman"):
+            return f"sudo pacman -S {package_name}"
+        elif shutil.which("dnf"):
+            return f"sudo dnf install {package_name}"
+        elif shutil.which("zypper"):
+            return f"sudo zypper install {package_name}"
+        return f"Install {package_name} via your package manager"
+
+    def check_missing_binaries(self):
+        """Detect missing binaries and show the DependencyInstallerDialog."""
+        is_win = sys.platform == 'win32'
+        deps = []
+
+        def check(name, binary, key, pkg_name=None, auto=None):
+            path = capture_m3u8.find_binary(binary, key)
+            if not path or not os.path.exists(path):
+                dep = {"name": name, "binary": binary, "key": key, "auto": auto if auto is not None else is_win}
+                if not dep["auto"] and pkg_name:
+                    dep["command"] = self._get_package_command(pkg_name)
+                deps.append(dep)
+
+        check("N_m3u8DL-RE", "N_m3u8DL-RE", "nm3u8dl_re_path", auto=True)
+        check("FFmpeg", "ffmpeg", "ffmpeg_path", "ffmpeg")
+        check("FFprobe", "ffprobe", "ffprobe_path", "ffmpeg")
+        check("MKVPropEdit", "mkvpropedit", "mkvpropedit_path", "mkvtoolnix")
+        check("MKVMerge", "mkvmerge", "mkvmerge_path", "mkvtoolnix")
+
+        if deps:
+            DependencyInstallerDialog(self, deps)
+
     def create_widgets(self):
         # --- Top Section: Input ---
         self.input_frame = ctk.CTkFrame(self)
@@ -468,10 +750,24 @@ class M3U8DownloaderApp(ctk.CTk):
         # Bind Enter key to search
         self.url_entry.bind("<Return>", lambda e: self.search_content())
 
-        self.status_bar = ctk.CTkFrame(self, height=30)
+        # ── Professional Status Bar ──
+        self.status_bar = ctk.CTkFrame(self, height=42, fg_color="#1a1a1a", corner_radius=6)
         self.status_bar.pack(fill="x", padx=10, pady=(0, 5))
-        self.progress_lbl = ctk.CTkLabel(self.status_bar, text="Status: Idle", text_color="cyan")
-        self.progress_lbl.pack(side="left", padx=15)
+        self.status_bar.grid_propagate(False)
+        for c, w in [(0, 0), (1, 0), (2, 1), (3, 0), (4, 0)]:
+            self.status_bar.grid_columnconfigure(c, weight=w)
+
+        self.status_icon = ctk.CTkLabel(self.status_bar, text="🔵", font=("Segoe UI", 14), width=28)
+        self.status_icon.grid(row=0, column=0, padx=(10, 2), pady=5)
+        self.status_text = ctk.CTkLabel(self.status_bar, text="Idle", font=("Segoe UI", 12, "bold"), text_color="#3498db")
+        self.status_text.grid(row=0, column=1, padx=(0, 10), pady=5, sticky="w")
+        self.progress_bar = ctk.CTkProgressBar(self.status_bar, height=16, corner_radius=8)
+        self.progress_bar.set(0)
+        self.progress_bar.grid(row=0, column=2, padx=10, pady=5, sticky="ew")
+        self.counter_lbl = ctk.CTkLabel(self.status_bar, text="—", font=("Segoe UI", 11, "bold"), width=70)
+        self.counter_lbl.grid(row=0, column=3, padx=(5, 5), pady=5)
+        self.title_lbl = ctk.CTkLabel(self.status_bar, text="Waiting for input...", font=("Segoe UI", 10, "italic"), text_color="#888888")
+        self.title_lbl.grid(row=0, column=4, padx=(5, 15), pady=5, sticky="e")
 
         # --- Bottom Section: Logs ---
         self.log_header_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -507,11 +803,13 @@ class M3U8DownloaderApp(ctk.CTk):
         if hasattr(widget, "_entry"):
             widget._entry.bind("<Button-3>", show_menu)
 
-    def open_settings(self):
+    def open_settings(self, open_tab=None):
         if self.settings_window is None or not self.settings_window.winfo_exists():
-            self.settings_window = SettingsWindow(self)
+            self.settings_window = SettingsWindow(self, open_tab=open_tab)
         else:
             self.settings_window.focus()
+            if open_tab:
+                self.settings_window.tabs.set(open_tab)
 
     def save_settings(self):
         """Save current configuration to disk."""
@@ -543,8 +841,47 @@ class M3U8DownloaderApp(ctk.CTk):
         for i, name in enumerate(names, 1):
             self.log_callback(f"   {i}. {name}\n")
 
+    STATUS_MAP = {
+        "Idle":        ("#3498db", "🔵", "Idle"),
+        "Hunting":     ("#e67e22", "🟠", "Hunting..."),
+        "Downloading": ("#2ecc71", "🟢", "Downloading"),
+        "Cooling":     ("#9b59b6", "⏳", "Cooling down"),
+        "Error":       ("#e74c3c", "❌", "Error"),
+        "Success":     ("#2ecc71", "✅", "Success"),
+    }
+
+    def update_status_bar(self, state=None, message=None, progress=None, counter=None, title=None):
+        """Unified status bar updater. Call from any thread via self.after()."""
+        def _apply():
+            if state and state in self.STATUS_MAP:
+                color, icon, default_text = self.STATUS_MAP[state]
+                self.status_text.configure(text=message or default_text, text_color=color)
+                self.status_icon.configure(text=icon)
+            elif message:
+                self.status_text.configure(text=message)
+            if progress is not None:
+                self.progress_bar.set(float(progress))
+            if counter is not None:
+                self.counter_lbl.configure(text=counter)
+            if title is not None:
+                self.title_lbl.configure(text=title[:50] if title else "Waiting for input...")
+        self.after(0, _apply)
+
     def status_callback(self, message):
-        self.after(0, lambda: self.start_btn.configure(text=message))
+        # Route CLI status messages to the status bar without hijacking the Start button
+        msg_lower = message.lower()
+        if "hunting" in msg_lower:
+            self.update_status_bar("Hunting")
+        elif "download" in msg_lower or "dl:" in msg_lower:
+            self.update_status_bar("Downloading")
+        elif "cool" in msg_lower:
+            self.update_status_bar("Cooling")
+        elif "error" in msg_lower:
+            self.update_status_bar("Error")
+        elif "success" in msg_lower:
+            self.update_status_bar("Success")
+        else:
+            self.update_status_bar(message=message)
 
     def check_stop_callback(self):
         return self.stop_event.is_set()
@@ -552,6 +889,16 @@ class M3U8DownloaderApp(ctk.CTk):
     def process_log_queue(self):
         while not self.log_queue.empty():
             msg = str(self.log_queue.get())
+
+            # Sync status bar title with "🎬 Title: ..." log lines
+            if '🎬 Title:' in msg:
+                try:
+                    title = msg.split('🎬 Title:')[1].strip()
+                    if title:
+                        self.update_status_bar(title=title)
+                except Exception:
+                    pass
+
             self.log_box.configure(state="normal")
             
             # Simple color mapping based on icons
@@ -646,7 +993,7 @@ class M3U8DownloaderApp(ctk.CTk):
         """Reset GUI state after processing is complete."""
         self.is_running = False
         self.stop_event.clear()
-        self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
+        self.update_status_bar("Idle")
         self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
         self.after(0, lambda: self.stop_btn.configure(state="disabled"))
         self.after(0, lambda: self.top250_btn.configure(state="normal"))
@@ -689,7 +1036,7 @@ class M3U8DownloaderApp(ctk.CTk):
 
             # Normal Single Video
             headless = self.config.get("headless", True)
-            self.after(0, lambda: self.progress_lbl.configure(text="Processing movie..."))
+            self.update_status_bar("Hunting", message="Processing movie...")
             asyncio.run(capture_m3u8.process_video(url, headless=headless, auto_mode=True))
             
         except Exception as e:
@@ -900,7 +1247,7 @@ class M3U8DownloaderApp(ctk.CTk):
                     continue
 
                 self.log_callback(f"\n--- Processing {i+1}/{len(queue_list)} ---\n")
-                self.after(0, lambda j=i+1, t=len(queue_list): self.progress_lbl.configure(text=f"Processing file: {j}/{t}"))
+                self.update_status_bar("Downloading", counter=f"{i+1} / {len(queue_list)}", progress=(i+1)/len(queue_list))
                 success = await capture_m3u8.process_video(link, headless=headless, auto_mode=True)
                 
                 if isinstance(success, str) and success != "404":
@@ -1135,7 +1482,7 @@ class M3U8DownloaderApp(ctk.CTk):
                     self.log_callback("\n🛑 Batch processing stopped by user.\n")
                     break
                 self.log_callback(f"\n--- Processing {i+1}/{len(movies)}: {m['title']} ---\n")
-                self.after(0, lambda j=i+1, t=len(movies): self.progress_lbl.configure(text=f"Processing file: {j}/{t}"))
+                self.update_status_bar("Downloading", counter=f"{i+1} / {len(movies)}", progress=(i+1)/len(movies))
                 asyncio.run(capture_m3u8.process_video(m['url'], headless=headless, auto_mode=True))
                 
                 if i < len(movies) - 1:
@@ -1147,7 +1494,7 @@ class M3U8DownloaderApp(ctk.CTk):
         except Exception as e:
             self.log_callback(f"\n❌ Batch Error: {e}\n")
         finally:
-            self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
+            self.update_status_bar("Idle")
             self.is_running = False
             self.stop_event.clear()
             self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
@@ -1319,7 +1666,7 @@ class M3U8DownloaderApp(ctk.CTk):
                     self.log_callback(f"⏭️  Skipping ({skip_reason}): {url}\n")
                     continue
                 self.log_callback(f"\n--- Processing {i+1}/{len(urls)} ---\n")
-                self.after(0, lambda j=i+1, t=len(urls): self.progress_lbl.configure(text=f"Processing file: {j}/{t}"))
+                self.update_status_bar("Downloading", counter=f"{i+1} / {len(urls)}", progress=(i+1)/len(urls))
                 
                 success = asyncio.run(capture_m3u8.process_video(url, headless=headless, auto_mode=True))
                 
@@ -1346,7 +1693,7 @@ class M3U8DownloaderApp(ctk.CTk):
         except Exception as e:
             self.log_callback(f"\n❌ Queue Error: {e}\n")
         finally:
-            self.after(0, lambda: self.progress_lbl.configure(text="Status: Idle"))
+            self.update_status_bar("Idle")
             self.is_running = False
             self.stop_event.clear()
             self.after(0, lambda: self.start_btn.configure(state="normal", text="Start / Analyze"))
@@ -1552,7 +1899,7 @@ class M3U8DownloaderApp(ctk.CTk):
 
     def run_movie_append(self, movie_url, meta):
         """Append a movie URL to a .quu file."""
-        self.after(0, lambda: self.progress_lbl.configure(text="Status: Queueing..."))
+        self.update_status_bar(message="Queueing...")
         
         def pick_and_append():
             finder = capture_m3u8.MasterM3U8Finder()
@@ -1599,7 +1946,7 @@ class M3U8DownloaderApp(ctk.CTk):
                 num_seasons = meta.get('seasons', 1)
                 for s in range(1, num_seasons + 1):
                     # Update status
-                    self.after(0, lambda s_num=s: self.progress_lbl.configure(text=f"Fetching S{s_num:02d}..."))
+                    self.update_status_bar(message=f"Fetching S{s:02d}...")
                     ep_count = await capture_m3u8.get_season_episodes(imdb_id, s)
                     for e in range(1, ep_count + 1):
                         link = f"https://vidsrcme.ru/embed/tv?imdb={imdb_id}&season={s}&episode={e}"

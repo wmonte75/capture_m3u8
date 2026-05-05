@@ -12,6 +12,7 @@ from xml.dom import minidom
 import tkinter as tk
 from tkinter import messagebox
 from contextlib import redirect_stdout
+from PIL import Image, ImageStat
 import io
 
 # --- Parity Imports ---
@@ -93,7 +94,8 @@ def load_config():
             "mkvpropedit_path": "",
             "tmdb_api_key": "",
             "fanart_api_key": "",
-            "omdb_api_key": ""
+            "omdb_api_key": "",
+            "language": "en"
         }
         
         updated = False
@@ -302,10 +304,12 @@ def fetch_tmdb_config():
 def get_best_image_path(image_list, language='en'):
     if not image_list: 
         return None
-    en_images = [img for img in image_list if img.get('iso_639_1') == language and img.get('file_path')]
-    if en_images:
-        en_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
-        return en_images[0]['file_path']
+    
+    pref_lang = CONFIG.get('language', language)
+    lang_images = [img for img in image_list if img.get('iso_639_1') == pref_lang and img.get('file_path')]
+    if lang_images:
+        lang_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
+        return lang_images[0]['file_path']
     all_images = [img for img in image_list if img.get('file_path')]
     if all_images:
         all_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
@@ -508,14 +512,24 @@ def set_mkv_title(filepath, title):
     except Exception as e: 
         print(f"❌ Error during mkvpropedit: {e}")
 
+def is_image_too_dark(image_path, threshold=35):
+    """Checks if an image is too dark using mean brightness (0-255)."""
+    try:
+        with Image.open(image_path) as img:
+            # Convert to grayscale to calculate luminosity
+            stat = ImageStat.Stat(img.convert('L'))
+            brightness = stat.mean[0]
+            return brightness < threshold
+    except Exception:
+        return False
+
 def extract_video_thumb(video_path, output_path, percent=0.40):
-    print(f"   --> 🎞️  Extracting frame {int(percent*100)}% ...")
-    
     # Hide window on Windows
     creation_flags = 0
     if os.name == 'nt':
         creation_flags = 0x08000000 # CREATE_NO_WINDOW
     
+    duration = 0.0
     try:
         # Get duration
         probe_cmd = [
@@ -527,40 +541,49 @@ def extract_video_thumb(video_path, output_path, percent=0.40):
         ]
         result = subprocess.run(probe_cmd, capture_output=True, text=True, creationflags=creation_flags)
         duration_str = result.stdout.strip()
-        timestamp = float(duration_str) * percent if duration_str else 60
-        
-        # Extract frame
-        ff_cmd = [
-            FFMPEG_PATH,
-            "-ss", str(timestamp),
-            "-i", video_path,
-            "-frames:v", "1",
-            "-q:v", "2",
-            output_path,
-            "-y",
-            "-loglevel", "error"
-        ]
-        
-        process = subprocess.Popen(
-            ff_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            creationflags=creation_flags
-        )
-        
-        stdout, _ = process.communicate()
-        
-        if process.returncode == 0:
-            return True
-        else:
-            if stdout:
+        if duration_str:
+            duration = float(duration_str)
+
+        # Try extracting and check for dark frames. 
+        # If dark, increment percentage by 1% (0.01) up to 15 times.
+        for attempt in range(15):
+            current_percent = min(percent + (attempt * 0.01), 0.95)
+            timestamp = duration * current_percent if duration > 0 else (60 + (attempt * 60))
+            
+            print(f"   --> 🎞️  Extracting frame at {int(current_percent*100)}% ...")
+
+            ff_cmd = [
+                FFMPEG_PATH,
+                "-ss", str(timestamp),
+                "-i", video_path,
+                "-frames:v", "1",
+                "-q:v", "2",
+                output_path,
+                "-y",
+                "-loglevel", "error"
+            ]
+            
+            process = subprocess.Popen(
+                ff_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=creation_flags
+            )
+            stdout, _ = process.communicate()
+            
+            if process.returncode == 0 and os.path.exists(output_path):
+                if is_image_too_dark(output_path) and attempt < 14:
+                    print(f"      ⚠️  Frame at {int(current_percent*100)}% is too dark. Nudging +1%...")
+                    continue
+                return True
+            elif stdout:
                 print(f"      FFmpeg: {stdout.strip()}")
-            return False
-                
+
     except Exception as e:
         print(f"   --> ❌ FFmpeg Error: {e}")
         return False
+    return False
 
 def fetch_and_download_all_movie_assets(movie_id, media_dir, media_filepath=None):
     if not TMDB_IMAGE_BASE:
@@ -682,6 +705,7 @@ def handle_asset_downloads(parsed_data, tmdb_info, media_filepath, show_id=None,
         write_episode_nfo(media_filepath, tmdb_info, show_id)
         if show_info and show_id: 
             fetch_and_download_all_show_assets(show_id, show_dir, show_info) 
+            fetch_and_download_season_assets(show_id, parsed_data['season_num'], show_dir, media_dir)
         if show_id: 
             create_tmdb_link(show_dir, 'tv', show_id)
             
@@ -732,6 +756,103 @@ def write_episode_nfo(media_filepath, episode_info, show_id):
     pretty_xml = minidom.parseString(tostring(root, 'utf-8')).toprettyxml(indent="  ")
     with open(nfo_path, 'w', encoding='utf-8') as f: 
         f.write(pretty_xml)
+
+def fetch_and_download_season_assets(show_id, season_num, show_dir, season_dir):
+    """Downloads season-specific posters and fanart to both the series root and the season folder with professional fallbacks."""
+    root_poster = os.path.join(show_dir, f"Season{season_num:02d}-poster.jpg")
+    folder_poster = os.path.join(season_dir, "folder.jpg")
+    root_fanart = os.path.join(show_dir, f"Season{season_num:02d}-fanart.jpg")
+    folder_fanart = os.path.join(season_dir, "fanart.jpg")
+    series_fanart = os.path.join(show_dir, "fanart.jpg")
+    
+    fanart_data = fetch_fanart_assets('tv', show_id)
+    if not TMDB_IMAGE_BASE:
+        fetch_tmdb_config()
+    api_key = CONFIG.get('tmdb_api_key')
+
+    # Process Posters and Fanart (Thumbs)
+    asset_types = [
+        ('poster', 'seasonposter', 'posters', POSTER_SIZE, root_poster, folder_poster),
+        ('fanart', 'seasonthumb', 'backdrops', BACKDROP_SIZE, root_fanart, folder_fanart)
+    ]
+
+    for label, fanart_key, tmdb_key, size, r_path, f_path in asset_types:
+        # Skip if both already exist
+        if os.path.exists(r_path) and os.path.exists(f_path):
+            continue
+
+        print(f"   --> 🖼️ Searching for Season {season_num} {label}...")
+        url = None
+
+        # 1. Try Fanart.tv first (Priority)
+        if fanart_data and fanart_key in fanart_data:
+            assets = [p for p in fanart_data[fanart_key] if p.get('season') == str(season_num)]
+            if assets:
+                assets.sort(key=lambda x: int(x.get('likes', 0)), reverse=True)
+                url = assets[0]['url']
+                print(f"   --> Found Season {season_num} {label} on Fanart.tv")
+
+        # 2. Try TMDB Fallback
+        if not url and api_key:
+            tmdb_url = f"{TMDB_API_BASE}/tv/{show_id}/season/{season_num}/images"
+            try:
+                resp = requests.get(tmdb_url, params={'api_key': api_key}, timeout=10).json()
+                tmdb_assets = resp.get(tmdb_key, [])
+                path = get_best_image_path(tmdb_assets)
+                if path:
+                    url = f"{TMDB_IMAGE_BASE}{size}{path}"
+                    print(f"   --> Found Season {season_num} {label} on TMDB")
+            except:
+                pass
+
+        # 3. Try Episode 1 Stills (Only for Fanart/Backdrops)
+        if not url and label == 'fanart' and api_key:
+            ep_img_url = f"{TMDB_API_BASE}/tv/{show_id}/season/{season_num}/episode/1/images"
+            try:
+                ep_resp = requests.get(ep_img_url, params={'api_key': api_key}, timeout=10).json()
+                stills = ep_resp.get('stills', [])
+                path = get_best_image_path(stills)
+                if path:
+                    url = f"{TMDB_IMAGE_BASE}{size}{path}"
+                    print(f"   --> Found Season {season_num} backdrop from Episode 1 Stills")
+            except:
+                pass
+
+        # 3. Download and Duplicate
+        if url:
+            if download_image(url, r_path):
+                try:
+                    shutil.copyfile(r_path, f_path)
+                    print(f"   --> ✅ Season {label} saved to root and season folder.")
+                except Exception as e:
+                    print(f"   ⚠️ Could not copy season {label}: {e}")
+        else:
+            print(f"   --> ℹ️ Season {season_num} {label} not found.")
+
+    # Fallback: Inherit Series Fanart or Generate from video
+    if not os.path.exists(root_fanart) and not os.path.exists(folder_fanart):
+        # 1. Try to copy the main show fanart (Much better than video capture)
+        if os.path.exists(series_fanart):
+            print(f"   --> 📎 Using series-level fanart as season fallback...")
+            try:
+                shutil.copyfile(series_fanart, root_fanart)
+                shutil.copyfile(series_fanart, folder_fanart)
+                return
+            except:
+                pass
+
+        # 2. Last resort: Video capture
+        video_files = [f for f in os.listdir(season_dir) if f.endswith(('.mkv', '.mp4', '.ts'))]
+        if video_files:
+            sample_video = os.path.join(season_dir, video_files[0])
+            try:
+                if not os.path.exists(root_fanart):
+                    print(f"   --> 🎞️ Generating fallback season fanart from video...")
+                    extract_video_thumb(sample_video, root_fanart, percent=0.35) # Hit 35% for better chance of non-intro
+                if os.path.exists(root_fanart) and not os.path.exists(folder_fanart):
+                    shutil.copyfile(root_fanart, folder_fanart)
+            except Exception as e:
+                print(f"   ⚠️ Could not generate fallback season fanart: {e}")
 
 def write_movie_nfo(media_filepath, movie_info, omdb_info=None): 
     media_dir = os.path.dirname(media_filepath)

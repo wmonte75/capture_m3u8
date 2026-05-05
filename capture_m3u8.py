@@ -10,8 +10,11 @@ import importlib.util
 import ctypes
 import io
 import zipfile
+import tarfile
+import platform
 import urllib.parse
 from datetime import datetime, timedelta
+from pathlib import Path
 from contextlib import redirect_stdout, suppress
 from typing import List, Tuple, Dict, Optional, Set, Any, Union, Callable
 
@@ -37,24 +40,19 @@ except ImportError as e:
 def get_base_dir():
     """Returns the directory where the executable or script is located."""
     if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+        return Path(sys.executable).parent
+    return Path(__file__).parent.absolute()
 
 def get_resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = getattr(sys, '_MEIPASS', None) or os.path.dirname(os.path.abspath(__file__))
-    else:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
+    base_path = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
+    return str(base_path / relative_path)
 
 def get_log_dir():
     """Returns the absolute path to the Logs directory, creating it if needed."""
-    log_dir = os.path.join(get_base_dir(), "binaries", "Logs")
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
-    return log_dir
+    log_dir = get_base_dir() / "binaries" / "Logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return str(log_dir)
 
 # Handle SSL Certificates for Frozen Apps
 if getattr(sys, 'frozen', False):
@@ -113,26 +111,25 @@ def get_smart_browsers_path():
             return abs_conf
 
     # 2. Binaries Folder (Priority)
-    binaries_path = os.path.join(base_dir, "binaries", "playwright_browsers")
-    if os.path.exists(binaries_path) and os.listdir(binaries_path):
-        return binaries_path
+    binaries_path = Path(base_dir) / "binaries" / "playwright_browsers"
+    if binaries_path.exists() and any(binaries_path.iterdir()):
+        return str(binaries_path)
 
     # 3. Root Folder (Legacy/Default)
-    exe_path = os.path.join(base_dir, "playwright_browsers")
-    if os.path.exists(exe_path) and os.listdir(exe_path):
-        return exe_path
+    exe_path = Path(base_dir) / "playwright_browsers"
+    if exe_path.exists() and any(exe_path.iterdir()):
+        return str(exe_path)
         
     # 4. Bundled location (PyInstaller temporary folder)
     if getattr(sys, 'frozen', False):
         try:
-            bundle_path = os.path.join(getattr(sys, '_MEIPASS', ''), "playwright_browsers")
-            if bundle_path and os.path.exists(bundle_path) and os.listdir(bundle_path):
-                return bundle_path
+            bundle_path = Path(getattr(sys, '_MEIPASS', '')) / "playwright_browsers"
+            if bundle_path.exists() and any(bundle_path.iterdir()):
+                return str(bundle_path)
         except:
             pass
             
-    # Default back to binaries folder for future persistent downloads
-    return binaries_path
+    return str(binaries_path)
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = get_smart_browsers_path()
 
@@ -272,57 +269,71 @@ async def update_nm3u8dl_re():
     bin_dir = os.path.join(get_base_dir(), "binaries")
     os.makedirs(bin_dir, exist_ok=True)
     
-    keyword = "win-x64" if sys.platform == 'win32' else "linux-x64"
+    # Determine platform keyword for GitHub asset matching
+    if sys.platform == 'win32':
+        keyword = "win-x64"
+    elif sys.platform == 'darwin':
+        # Apple Silicon vs Intel Mac
+        keyword = "osx-arm64" if platform.machine() == 'arm64' else "osx-x64"
+    else:
+        keyword = "linux-x64"
+
     log(f"🔄 Checking GitHub for latest N_m3u8DL-RE release ({keyword})...")
-    
+
     try:
         api_url = f"https://api.github.com/repos/{repo}/releases/latest"
         resp = requests.get(api_url, headers={"User-Agent": USER_AGENT}, timeout=15)
         if resp.status_code == 404:
-            # Fallback if 'latest' flag is missing
             resp = requests.get(f"https://api.github.com/repos/{repo}/releases", headers={"User-Agent": USER_AGENT}, timeout=15)
             resp.raise_for_status()
             data = resp.json()[0]
         else:
             resp.raise_for_status()
             data = resp.json()
-            
+
         tag = data.get("tag_name", "Unknown")
         assets = data.get("assets", [])
-        
+
         download_url = next((a["browser_download_url"] for a in assets if keyword in a["name"].lower()), None)
-        
+
         if not download_url:
             log(f"   ❌ Could not find a suitable binary for {keyword} in release {tag}.")
             return
-            
+
         log(f"   ⬇️  Downloading version {tag}...")
         asset_resp = requests.get(download_url, stream=True, timeout=60)
         asset_resp.raise_for_status()
-        
+
         content = io.BytesIO(asset_resp.content)
-        
+        exe_name = "N_m3u8DL-RE.exe" if sys.platform == "win32" else "N_m3u8DL-RE"
+        target_path = os.path.join(bin_dir, exe_name)
+
         if download_url.endswith(".zip"):
             with zipfile.ZipFile(content) as z:
-                exe_name = "N_m3u8DL-RE.exe" if sys.platform == "win32" else "N_m3u8DL-RE"
-                # Find the executable inside the zip and extract it flat into binaries/
                 for zinfo in z.infolist():
                     if zinfo.filename.lower().endswith(exe_name.lower()):
-                        # We need to extract it without the internal zip folders
                         source = z.open(zinfo)
-                        target_path = os.path.join(bin_dir, exe_name)
-                        
-                        # Close the existing binary handle if it's currently "found"
+                        with open(target_path, "wb") as f:
+                            shutil.copyfileobj(source, f)
+                        break
+        elif download_url.endswith(".tar.gz"):
+            with tarfile.open(fileobj=content, mode="r:gz") as t:
+                for member in t.getmembers():
+                    if member.isfile() and member.name.lower().endswith(exe_name.lower()):
+                        source = t.extractfile(member)
                         with open(target_path, "wb") as f:
                             shutil.copyfileobj(source, f)
                         break
         else:
-            target_path = os.path.join(bin_dir, "N_m3u8DL-RE.exe" if sys.platform == "win32" else "N_m3u8DL-RE")
             with open(target_path, "wb") as f:
                 f.write(content.getbuffer())
 
+        # Ensure executable bit on Unix systems
+        if sys.platform != 'win32' and os.path.exists(target_path):
+            os.chmod(target_path, 0o755)
+
         log(f"   ✅ Successfully updated to {tag} in /binaries.")
-        
+
     except Exception as e:
         log(f"   ❌ Update failed: {e}")
 
@@ -498,6 +509,96 @@ def find_binary(name, config_key=None):
     # 3. System Path
     return shutil.which(name) or name
 
+def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = None) -> Tuple[Optional[str], Optional[Dict[int, str]], Optional[int]]:
+    """
+    Fetch the master.m3u8 manifest and inspect variant streams for RESOLUTION + variant URLs.
+    Returns (speed_cap, variants_dict, max_height) where variants_dict maps height -> variant URL.
+    Returns (None, None, None) on failure.
+    """
+    if not master_url or not master_url.startswith("http"):
+        return None, None, None
+
+    headers = {"User-Agent": USER_AGENT}
+    if referer:
+        headers["Referer"] = referer
+
+    try:
+        session = requests.Session()
+        if cookies:
+            session.cookies.update(cookies)
+        resp = session.get(master_url, headers=headers, timeout=10)
+        if not resp.ok:
+            return None, None, None
+        text = resp.text
+        if not text.strip().startswith("#EXTM3U"):
+            return None, None, None
+
+        variants: Dict[int, str] = {}
+        heights = []
+        lines = text.splitlines()
+
+        for i, line in enumerate(lines):
+            match = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+            if match:
+                height = int(match.group(2))
+                heights.append(height)
+                # Next non-comment line is the variant URL
+                if i + 1 < len(lines):
+                    variant_url = lines[i + 1].strip()
+                    if variant_url and not variant_url.startswith("#"):
+                        variants[height] = urllib.parse.urljoin(master_url, variant_url)
+
+        if not heights:
+            return None, None, None
+
+        max_height = max(heights)
+        caps = {
+            1080: CONFIG.get('speed_cap_1080', '2.5M'),
+            720:  CONFIG.get('speed_cap_720',  '2M'),
+            480:  CONFIG.get('speed_cap_480',  '1.5M'),
+            360:  CONFIG.get('speed_cap_360',  '1M'),
+        }
+
+        if max_height >= 1080:
+            speed = caps[1080]
+        elif max_height >= 720:
+            speed = caps[720]
+        elif max_height >= 480:
+            speed = caps[480]
+        else:
+            speed = caps[360]
+
+        log(f"   🎛️  Detected {max_height}p stream → PRO speed cap: {speed}")
+        return speed, variants, max_height
+    except Exception as e:
+        log(f"   ⚠️  Manifest parsing failed: {e}")
+        return None, None, None
+
+
+def get_speed_for_resolution(master_url: str, referer: str = None, cookies: dict = None) -> Optional[str]:
+    """Convenience wrapper that returns only the speed cap."""
+    speed, _, _ = parse_master_manifest(master_url, referer, cookies)
+    return speed
+
+
+def get_variant_for_resolution(master_url: str, prefer_height: int, referer: str = None, cookies: dict = None) -> Optional[str]:
+    """
+    Parse master.m3u8 and return the variant URL closest to prefer_height.
+    Returns None if parsing fails or no variants found.
+    """
+    speed, variants, max_height = parse_master_manifest(master_url, referer, cookies)
+    if not variants:
+        return None
+
+    if prefer_height in variants:
+        log(f"   🎯 Preferred resolution {prefer_height}p found → using exact variant")
+        return variants[prefer_height]
+
+    # Find closest available height
+    closest = min(variants.keys(), key=lambda h: abs(h - prefer_height))
+    log(f"   🎯 Preferred {prefer_height}p not found → using closest: {closest}p")
+    return variants[closest]
+
 def setup_interface(config_data=None, log_cb=None, input_cb=None, status_cb=None, stop_cb=None):
     global CONFIG, LOG_CALLBACK, INPUT_CALLBACK, STATUS_CALLBACK, STOP_CALLBACK
     if config_data: CONFIG.update(config_data)
@@ -579,9 +680,6 @@ def get_ignored_iframes():
         return default_ignores
 
     return ignored
-
-# Initialize the ignore list file on startup so users can edit it before the first scan
-get_ignored_iframes()
 
 class PluginManager:
     def __init__(self):
@@ -728,10 +826,11 @@ class MasterM3U8Finder:
         return safe.strip()
 
     async def save_cookies(self, context):
-        """Save session cookies to Netscape format for yt-dlp"""
+        """Save session cookies to Netscape format for yt-dlp and store dict for requests."""
         try:
             cookie_file = os.path.join(get_log_dir(), 'cookies.txt')
             cookies = await context.cookies()
+            self.cookies_dict = {c['name']: c['value'] for c in cookies}
             with open(cookie_file, 'w', encoding='utf-8') as f:
                 f.write("# Netscape HTTP Cookie File\n")
                 for c in cookies:
@@ -784,23 +883,50 @@ class MasterM3U8Finder:
 
         # Handle native speed control based on GUI setting
         limit_speed = CONFIG.get('download_speed', 'Unlimited')
-        
-        # Match the structure of your working command example
+        download_url = master_url
+        use_auto_select = True
+        preferred = CONFIG.get('preferred_resolution', 'Auto')
+
+        # Parse manifest once for both speed cap and resolution preference
+        speed, variants, max_height = parse_master_manifest(master_url, referer, getattr(self, 'cookies_dict', None))
+
+        if CONFIG.get('auto_speed_by_resolution', False):
+            if speed:
+                limit_speed = speed
+            else:
+                log(f"   ⚠️  Could not detect resolution. Fallback speed: {limit_speed}")
+
+        if preferred != 'Auto' and variants:
+            try:
+                pref_height = int(preferred.replace('p', ''))
+                if pref_height in variants:
+                    download_url = variants[pref_height]
+                    use_auto_select = False
+                    log(f"   📐 Preferred resolution: {pref_height}p (exact match)")
+                else:
+                    closest = min(variants.keys(), key=lambda h: abs(h - pref_height))
+                    download_url = variants[closest]
+                    use_auto_select = False
+                    log(f"   📐 Preferred {pref_height}p not found → using closest: {closest}p")
+            except Exception as e:
+                log(f"   ⚠️  Resolution preference failed: {e}")
+
         cmd = [
             binary_path,
-            master_url,
+            download_url,
             "--save-dir", save_dir,
-            "--save-name", f'"{save_name}"',
-            "--header", f"User-Agent: {USER_AGENT}",
-            "--auto-select",
+            "--save-name", save_name,
             "--binary-merge",
             "--del-after-done",
             "--download-retry-count", "20",
-            "--mux-after-done", "format=mkv"
+            '--mux-after-done', 'format=mkv:ffmpeg_args="-fflags +genpts"'
         ]
 
-        if referer:
-            cmd.extend(["--header", f"Referer: {referer}"])
+        if use_auto_select:
+            cmd.insert(2, "--auto-select")  # Insert after binary_path and URL
+
+        # if referer:
+        #     cmd.extend(["--header", f"Referer: {referer}"])
 
         if limit_speed != "Unlimited":
             # Speed control requires thread-count 1 for strict enforcement on many servers
@@ -860,6 +986,9 @@ class MasterM3U8Finder:
         log(f"🔍 Hunting for master.m3u8 at: {start_url}")
         mode = "hidden" if headless else "visible"
         log(f"🖥️  Browser mode: {mode}\n")
+        
+        # Initialize the ignore list file if it doesn't exist
+        get_ignored_iframes()
         
         # Use a persistent user data directory to save cookies/session
         # Use get_base_dir() so the session folder lives next to the .exe, not in CWD
@@ -964,25 +1093,43 @@ class MasterM3U8Finder:
 
             context.on("request", on_request)
 
-            # Inject safe stealth overrides. Only the 4 known-safe properties —
-            # permissions.query and navigator.platform overrides were found to
-            # interfere with cloudnestra's player JavaScript on Windows.
-            await page.add_init_script("""
+            # Inject stealth overrides at CONTEXT level so ALL pages/iframes get them.
+            # This runs before any page scripts execute.
+            await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins', {
                     get: () => [
-                        { name: 'Chrome PDF Plugin' },
-                        { name: 'Chrome PDF Viewer' },
-                        { name: 'Native Client' }
+                        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer2', description: 'Portable Document Format plugin' },
+                        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
                     ]
                 });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
                 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
                 Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-                Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' });
-                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+                Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+                window.chrome = window.chrome || {};
+                window.chrome.runtime = window.chrome.runtime || {};
+                window.chrome.csi = function() { return { onloadT: Date.now(), pageT: Date.now(), startE: Date.now() }; };
+                window.chrome.loadTimes = function() {
+                    return {
+                        commitLoadTime: performance.timing.domContentLoadedEventStart / 1000,
+                        connectionInfo: 'h2',
+                        finishDocumentLoadTime: performance.timing.domContentLoadedEventEnd / 1000,
+                        finishLoadTime: performance.timing.loadEventEnd / 1000,
+                        firstPaintAfterLoadTime: 0,
+                        firstPaintTime: performance.timing.domContentLoadedEventStart / 1000,
+                        navigationType: 'Other',
+                        npnNegotiatedProtocol: 'h2',
+                        requestTime: performance.timing.requestStart / 1000,
+                        startLoadTime: performance.timing.navigationStart / 1000,
+                        wasAlternateProtocolAvailable: false,
+                        wasFetchedViaSpdy: true
+                    };
+                };
 
-                // Fix HeadlessChrome in userAgent without recursion (Linux headless)
+                // Fix HeadlessChrome in userAgent without recursion
                 try {
                     const _origUA = navigator.userAgent;
                     if (_origUA.includes('HeadlessChrome')) {
@@ -1354,7 +1501,29 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
             f.write(f"Filename: {final_filename}\n")
             
             # Generate the exact manual command based on current speed settings
+            cmd_url = master_url
+            auto_flag = "--auto-select"
             limit_speed = CONFIG.get('download_speed', 'Unlimited')
+
+            # Parse manifest once for both speed and variant selection
+            speed, variants, _ = parse_master_manifest(master_url, referer, getattr(finder, 'cookies_dict', None))
+            if speed and CONFIG.get('auto_speed_by_resolution', False):
+                limit_speed = speed
+
+            preferred = CONFIG.get('preferred_resolution', 'Auto')
+            if preferred != 'Auto' and variants:
+                try:
+                    pref_height = int(preferred.replace('p', ''))
+                    if pref_height in variants:
+                        cmd_url = variants[pref_height]
+                        auto_flag = ""
+                    else:
+                        closest = min(variants.keys(), key=lambda h: abs(h - pref_height))
+                        cmd_url = variants[closest]
+                        auto_flag = ""
+                except Exception:
+                    pass
+
             ref_header = f" --header \"Referer: {referer}\"" if referer else ""
             
             if limit_speed != "Unlimited":
@@ -1362,7 +1531,7 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
             else:
                 speed_flags = "--thread-count 8 --download-retry-count 10"
 
-            f.write(f"Command: N_m3u8DL-RE \"{master_url}\" --save-dir \"{temp_dir}\" --save-name \"{os.path.splitext(filename)[0]}\" --header \"User-Agent: {USER_AGENT}\"{ref_header} --auto-select --binary-merge --del-after-done {speed_flags}\n")
+            f.write(f"Command: N_m3u8DL-RE \"{cmd_url}\" --save-dir \"{temp_dir}\" --save-name \"{os.path.splitext(filename)[0]}\" --header \"User-Agent: {USER_AGENT}\"{ref_header} {auto_flag} --binary-merge --del-after-done {speed_flags}\n")
             
         log(f"\n💾 Details saved to {txt_filename}")
         
@@ -1743,7 +1912,15 @@ def load_config():
         "subtitle_langs": "all",
         "session_reset_count": 5,
         "movie_template": "https://vsembed.ru/embed/movie?imdb={imdb}",
-        "tv_template": "https://vidsrcme.ru/embed/tv?imdb={imdb}&season={s}&episode={e}"
+        "tv_template": "https://vidsrcme.ru/embed/tv?imdb={imdb}&season={s}&episode={e}",
+        "auto_speed_by_resolution": False,
+        "speed_cap_1080": "2.5M",
+        "speed_cap_720": "2M",
+        "speed_cap_480": "1.5M",
+        "speed_cap_360": "1M",
+        "nm3u8dl_re_path": "",
+        "mkvmerge_path": "",
+        "preferred_resolution": "Auto",
     }
     
     if os.path.exists(config_file):

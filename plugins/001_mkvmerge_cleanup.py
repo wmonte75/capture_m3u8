@@ -74,12 +74,16 @@ def process(file_path):
     base_name, extension = os.path.splitext(file_path)
     output_path = f"{base_name}_Sanitized{extension}"
 
+    # Ensure output doesn't exist to prevent 'already exists' errors
+    if os.path.exists(output_path):
+        try: os.remove(output_path)
+        except Exception as e:
+            print(f"   ⚠️ Could not remove stale output: {e}")
+
     # Construct mkvmerge command
-    # --ui-language en: Keeps logs consistent
     # --output: The new clean file
     cmd = [
         mkvmerge_bin,
-        "--ui-language", "en",
         "--output", output_path,
         file_path
     ]
@@ -108,6 +112,8 @@ def process(file_path):
                         # Forward progress to the GUI/CLI log
                         sys.stdout.write(f"\r   {text}")
                         sys.stdout.flush()
+                    # elif text:
+                    #     print(f"   [mkvmerge] {text}")
                 except: pass
             print() # New line after progress
 

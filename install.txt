@@ -2,9 +2,6 @@
                M3U8 HUNTER & DOWNLOADER - INSTALLATION GUIDE
 ================================================================================
 
-This project is designed to be portable and self-healing. Follow these steps 
-to set up your environment and initialize the required binaries.
-
 1. PREREQUISITES
 --------------------------------------------------------------------------------
 - Python 3.8 or higher installed.
@@ -18,38 +15,58 @@ Open your terminal or command prompt in the program folder and run:
 
     pip install -r requirements.txt
 
-This will install Playwright, CustomTkinter, and other required libraries.
+This will install Playwright, CustomTkinter, Pillow, requests, and other 
+required libraries.
 
-3. INITIALIZE TOOLCHAIN (CRITICAL)
+3. INSTALL PLAYWRIGHT BROWSERS
 --------------------------------------------------------------------------------
-The program requires specific binaries (N_m3u8DL-RE, FFmpeg, mkvpropedit). 
-The program can download these automatically. Run the following command:
+Playwright requires browser binaries. Run:
+
+    playwright install chromium
+
+(Linux users may also need: playwright install-deps)
+
+4. FIRST RUN - DEPENDENCY INSTALLER
+--------------------------------------------------------------------------------
+When you first launch the app, a "Missing Dependencies" dialog will appear
+if N_m3u8DL-RE, FFmpeg, or other tools are not found. You can:
+
+    - Click "Install" to auto-download supported tools
+    - Click "Open Tools Tab" to browse for existing installations
+    - Click "Skip" to handle manually later
+
+On Windows, supported tools can be auto-downloaded. On Linux/macOS, the
+dialog shows the package manager commands you need to run.
+
+5. UPDATE TOOLS
+--------------------------------------------------------------------------------
+To manually check for updates to N_m3u8DL-RE and MKVToolNix:
 
     python capture_m3u8.py -U
 
-This command is OS-aware and will populate the 'binaries/' folder with the 
-correct versions for your system.
+This command is OS-aware and will populate the 'binaries/' folder with the
+correct versions for your system. macOS (.tar.gz) and Linux (binary) are
+both supported.
 
-4. CONFIGURATION (API KEYS)
+6. CONFIGURATION (API KEYS)
 --------------------------------------------------------------------------------
-To use the automated library organization and metadata features (TMDB plugin), 
+To use the automated library organization and metadata features (TMDB plugin),
 open 'config.json' and enter your free API keys:
 
     "tmdb_api_key": "YOUR_KEY",
     "fanart_api_key": "YOUR_KEY",
     "omdb_api_key": "YOUR_KEY"
 
-You can also set your default "movies_dir" and "tv_dir" paths here or via 
-the GUI settings window.
+You can also set your default "movies_dir" and "tv_dir" paths here or via
+the GUI Settings window.
 
-5. HOW TO RUN
+7. HOW TO RUN
 --------------------------------------------------------------------------------
 
 A) GRAPHICAL INTERFACE (GUI):
-   Run the following to launch the visual hunter and manager:
-   
-   Windows: python capture_m3u8_gui.py
-   Linux:   ./run_capture_m3u8_gui.sh (or python3 capture_m3u8_gui.py)
+   Windows:  run_capture_m3u8_gui.bat
+   Linux:    ./run_capture_m3u8_gui.sh
+   (or run python capture_m3u8_gui.py directly)
 
 B) COMMAND LINE (CLI):
    - To download a single title:
@@ -58,19 +75,24 @@ B) COMMAND LINE (CLI):
    - To process a batch list:
      python capture_m3u8.py my_queue.txt
 
-6. PROJECT STRUCTURE
---------------------------------------------------------------------------------
-- /binaries: Portable tools (FFmpeg, etc.) downloaded via the -U flag.
-- /binaries/Logs: Centralized logs (completed.log, TMDB.log).
-- /plugins: Sequence-based processing scripts (001, 002, 010).
-- /temp_downloads: Active workspace for downloads and manifest files.
+   - To update tools:
+     python capture_m3u8.py -U
 
-7. TROUBLESHOOTING
+8. PROJECT STRUCTURE
 --------------------------------------------------------------------------------
-- If a download fails to start, try running 'python capture_m3u8.py -U' again 
-  to ensure all tools are up to date.
-- All error details are logged to 'binaries/Logs/TMDB.log' and the console.
+- /binaries: Portable tools (FFmpeg, N_m3u8DL-RE, etc.) downloaded automatically.
+- /binaries/Logs: Centralized logs (completed.log, TMDB.log, download logs).
+- /plugins: Sequence-based processing scripts (001, 002, 010).
+- /temp_downloads: Active workspace for downloads, .txt commands, and .quu queues.
+- /browser_session: Persistent Playwright browser data (cookies, localStorage).
+
+9. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+- If a download fails to start, ensure tools are up to date via the Tools tab
+  or by running 'python capture_m3u8.py -U'.
+- All error details are logged to 'binaries/Logs/' and the console.
 - On Linux, if Playwright fails, run: playwright install-deps
+- If the browser gets stuck, use Settings > Tools > Clear Browser Session.
 
 --------------------------------------------------------------------------------
 Enjoy your high-quality library!
