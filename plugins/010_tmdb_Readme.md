@@ -33,9 +33,7 @@ Open `config.json` in the program root and fill in the following fields:
     "tv_dir": "/path/to/your/TV",
     "ffmpeg_path": "",
     "ffprobe_path": "",
-    "mkvpropedit_path": "",
-    "nm3u8dl_re_path": "",
-    "mkvmerge_path": ""
+    "mkvpropedit_path": ""
 }
 ```
 

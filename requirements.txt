@@ -4,3 +4,4 @@ beautifulsoup4
 certifi
 customtkinter
 Pillow
+paramiko

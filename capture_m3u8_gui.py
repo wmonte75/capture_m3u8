@@ -218,12 +218,19 @@ class SettingsWindow(ctk.CTkToplevel):
         self.resizable(False, False)
 
         parent.update_idletasks()
-        w, h = 640, 540
-        x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (w // 2)
-        y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (h // 2)
+        w, h = 640, 720
+        # Parse parent geometry directly for reliable centering
+        geo_match = re.match(r'(\d+)x(\d+)\+(\d+)\+(\d+)', parent.geometry())
+        if geo_match:
+            pw, ph, px, py = map(int, geo_match.groups())
+            x = px + (pw // 2) - (w // 2)
+            y = py + (ph // 2) - (h // 2)
+        else:
+            x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (w // 2)
+            y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (h // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
-        self.tabs = ctk.CTkTabview(self, width=600, height=440)
+        self.tabs = ctk.CTkTabview(self, width=600, height=780)
         self.tabs.pack(padx=15, pady=(15, 5), fill="both", expand=True)
 
         self.tabs.add("General")
@@ -288,6 +295,84 @@ class SettingsWindow(ctk.CTkToplevel):
         self.dark_mode_switch.pack(side="left")
         if self.parent.config.get("theme", "dark") == "dark": self.dark_mode_switch.select()
         else: self.dark_mode_switch.deselect()
+
+        # --- SCP / Remote Transfer Section ---
+        ctk.CTkLabel(tab, text="📡 Remote Transfer (SFTP)", font=("Segoe UI", 13, "bold")).grid(row=5, column=0, columnspan=3, padx=15, pady=(25, 10), sticky="w")
+
+        self.scp_enabled_chk = ctk.CTkCheckBox(tab, text="Enable Remote Transfer", command=self._toggle_scp)
+        self.scp_enabled_chk.grid(row=6, column=0, columnspan=3, padx=15, pady=(0, 5), sticky="w")
+        if self.parent.config.get("scp_enabled", False):
+            self.scp_enabled_chk.select()
+
+        self.scp_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        self.scp_frame.grid(row=7, column=0, columnspan=3, padx=15, pady=5, sticky="ew")
+        self.scp_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.scp_frame, text="Server Host:").grid(row=0, column=0, padx=(0, 5), pady=4, sticky="e")
+        self.scp_host_entry = ctk.CTkEntry(self.scp_frame, placeholder_text="e.g. 192.168.1.100 or nas.local")
+        self.scp_host_entry.grid(row=0, column=1, padx=5, pady=4, sticky="ew")
+        self.scp_host_entry.insert(0, self.parent.config.get("scp_host", ""))
+
+        ctk.CTkLabel(self.scp_frame, text="Username:").grid(row=1, column=0, padx=(0, 5), pady=4, sticky="e")
+        self.scp_user_entry = ctk.CTkEntry(self.scp_frame)
+        self.scp_user_entry.grid(row=1, column=1, padx=5, pady=4, sticky="ew")
+        self.scp_user_entry.insert(0, self.parent.config.get("scp_username", ""))
+
+        ctk.CTkLabel(self.scp_frame, text="Auth Type:").grid(row=2, column=0, padx=(0, 5), pady=4, sticky="e")
+        self.scp_auth_type = ctk.CTkOptionMenu(self.scp_frame, values=["SSH Key", "Password"], command=self._toggle_scp_auth)
+        self.scp_auth_type.grid(row=2, column=1, padx=5, pady=4, sticky="w")
+        self.scp_auth_type.set(self.parent.config.get("scp_auth_type", "SSH Key"))
+
+        self.scp_key_frame = ctk.CTkFrame(self.scp_frame, fg_color="transparent")
+        self.scp_key_frame.grid(row=3, column=0, columnspan=2, padx=0, pady=2, sticky="ew")
+        self.scp_key_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(self.scp_key_frame, text="Key File:").grid(row=0, column=0, padx=(0, 5), pady=4, sticky="e")
+        self.scp_key_entry = ctk.CTkEntry(self.scp_key_frame, placeholder_text="path to .pem or private key")
+        self.scp_key_entry.grid(row=0, column=1, padx=5, pady=4, sticky="ew")
+        self.scp_key_entry.insert(0, self.parent.config.get("scp_key_path", ""))
+        ctk.CTkButton(self.scp_key_frame, text="Browse", width=60, command=lambda: self._browse_file(self.scp_key_entry, "Select SSH Key", [("All Files", "*.*")])).grid(row=0, column=2, padx=5, pady=4)
+
+        self.scp_pw_frame = ctk.CTkFrame(self.scp_frame, fg_color="transparent")
+        self.scp_pw_frame.grid(row=4, column=0, columnspan=2, padx=0, pady=2, sticky="ew")
+        self.scp_pw_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(self.scp_pw_frame, text="Password:").grid(row=0, column=0, padx=(0, 5), pady=4, sticky="e")
+        self.scp_pw_entry = ctk.CTkEntry(self.scp_pw_frame, show="*")
+        self.scp_pw_entry.grid(row=0, column=1, padx=5, pady=4, sticky="ew")
+        self.scp_pw_entry.insert(0, self.parent.config.get("scp_password", ""))
+        ctk.CTkLabel(self.scp_pw_frame, text="⚠️ Stored in config.json", text_color="orange", font=("Segoe UI", 9)).grid(row=0, column=2, padx=5, pady=4)
+
+        ctk.CTkLabel(self.scp_frame, text="Remote Movies Path:").grid(row=5, column=0, padx=(0, 5), pady=4, sticky="e")
+        self.scp_remote_movie_entry = ctk.CTkEntry(self.scp_frame, placeholder_text="/mnt/media/movies")
+        self.scp_remote_movie_entry.grid(row=5, column=1, padx=5, pady=4, sticky="ew")
+        self.scp_remote_movie_entry.insert(0, self.parent.config.get("scp_remote_movies_dir", ""))
+
+        ctk.CTkLabel(self.scp_frame, text="Remote TV Path:").grid(row=6, column=0, padx=(0, 5), pady=4, sticky="e")
+        self.scp_remote_tv_entry = ctk.CTkEntry(self.scp_frame, placeholder_text="/mnt/media/tv")
+        self.scp_remote_tv_entry.grid(row=6, column=1, padx=5, pady=4, sticky="ew")
+        self.scp_remote_tv_entry.insert(0, self.parent.config.get("scp_remote_tv_dir", ""))
+
+        self.scp_delete_local_chk = ctk.CTkCheckBox(self.scp_frame, text="Delete local file after successful transfer")
+        self.scp_delete_local_chk.grid(row=7, column=0, columnspan=2, padx=0, pady=(8, 4), sticky="w")
+        if self.parent.config.get("scp_delete_local", False):
+            self.scp_delete_local_chk.select()
+
+        self._toggle_scp()
+        self._toggle_scp_auth()
+
+    def _toggle_scp(self):
+        if self.scp_enabled_chk.get() == 1:
+            self.scp_frame.grid()
+        else:
+            self.scp_frame.grid_remove()
+
+    def _toggle_scp_auth(self, choice=None):
+        auth = choice or self.scp_auth_type.get()
+        if auth == "SSH Key":
+            self.scp_key_frame.grid()
+            self.scp_pw_frame.grid_remove()
+        else:
+            self.scp_key_frame.grid_remove()
+            self.scp_pw_frame.grid()
 
     def _build_download_tab(self):
         tab = self.tabs.tab("Download")
@@ -470,6 +555,16 @@ class SettingsWindow(ctk.CTkToplevel):
             self.parent.config[key] = dd.get()
         for key, ent in self.tool_entries.items():
             self.parent.config[key] = ent.get().strip()
+
+        self.parent.config["scp_enabled"] = (self.scp_enabled_chk.get() == 1)
+        self.parent.config["scp_host"] = self.scp_host_entry.get().strip()
+        self.parent.config["scp_username"] = self.scp_user_entry.get().strip()
+        self.parent.config["scp_auth_type"] = self.scp_auth_type.get()
+        self.parent.config["scp_key_path"] = self.scp_key_entry.get().strip()
+        self.parent.config["scp_password"] = self.scp_pw_entry.get()
+        self.parent.config["scp_remote_movies_dir"] = self.scp_remote_movie_entry.get().strip()
+        self.parent.config["scp_remote_tv_dir"] = self.scp_remote_tv_entry.get().strip()
+        self.parent.config["scp_delete_local"] = (self.scp_delete_local_chk.get() == 1)
 
         self.parent.save_settings()
         self.destroy()
@@ -1202,6 +1297,13 @@ class M3U8DownloaderApp(ctk.CTk):
                 self.log_callback(f"⚠️ Failed to auto-save .quu file: {e}\n")
 
             self.log_callback(f"🚀 Queued {len(queue_list)} episodes. Starting batch...\n")
+            # Ensure UI state is correct before batch processing
+            self.is_running = True
+            self.after(0, lambda: self.start_btn.configure(state="disabled", text="Running..."))
+            self.after(0, lambda: self.stop_btn.configure(state="normal"))
+            self.after(0, lambda: self.top250_btn.configure(state="disabled"))
+            self.after(0, lambda: self.queue_btn.configure(state="disabled"))
+            self.after(0, lambda: self.check_btn.configure(state="disabled"))
             # Process Queue
             headless = self.config.get("headless", True)
             
@@ -1702,13 +1804,45 @@ class M3U8DownloaderApp(ctk.CTk):
             self.after(0, lambda: self.queue_btn.configure(state="normal"))
             self.after(0, lambda: self.check_btn.configure(state="normal"))
 
+    def _confirm_quit(self):
+        """Custom Yes/Cancel quit confirmation dialog."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Quit")
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+        x = self.winfo_x() + (self.winfo_width() // 2) - 150
+        y = self.winfo_y() + (self.winfo_height() // 2) - 80
+        dialog.geometry(f"300x130+{x}+{y}")
+
+        ctk.CTkLabel(dialog, text="A download is in progress.\nDo you want to stop and quit?",
+                     font=("Segoe UI", 12)).pack(pady=(15, 10))
+
+        result = False
+        def on_yes():
+            nonlocal result
+            result = True
+            dialog.destroy()
+        def on_cancel():
+            dialog.destroy()
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=10)
+        ctk.CTkButton(btn_frame, text="Yes", command=on_yes, width=80,
+                      fg_color="#e74c3c", hover_color="#c0392b").pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side="left", padx=10)
+
+        self.wait_window(dialog)
+        return result
+
     def on_closing(self):
         self.save_settings()
         if self.is_running:
-            if messagebox.askokcancel("Quit", "A download is in progress. Do you want to stop and quit?"):
+            if self._confirm_quit():
                 self.stop_process()
+                capture_m3u8.terminate_all_downloads()
                 self.destroy()
         else:
+            capture_m3u8.terminate_all_downloads()
             capture_m3u8.clear_session(reason="GUI shutdown")
             self.destroy()
 

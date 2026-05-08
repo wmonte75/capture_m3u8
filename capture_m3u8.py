@@ -18,6 +18,13 @@ from pathlib import Path
 from contextlib import redirect_stdout, suppress
 from typing import List, Tuple, Dict, Optional, Set, Any, Union, Callable
 
+# Soft import for optional SCP/SFTP support
+try:
+    import paramiko
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    PARAMIKO_AVAILABLE = False
+
 # Dependency Check
 try:
     from playwright.async_api import async_playwright
@@ -191,6 +198,9 @@ INPUT_CALLBACK = None
 STATUS_CALLBACK = None
 STOP_CALLBACK = None
 CONFIG = {}
+
+# Track active N_m3u8DL-RE subprocesses for clean shutdown
+_active_download_processes: Set[asyncio.subprocess.Process] = set()
 
 def is_process_running(pid: int) -> bool:
     """OS-aware check to see if a process ID is currently active."""
@@ -947,6 +957,7 @@ class MasterM3U8Finder:
         log(f"\n⬇️  Starting download with N_m3u8DL-RE...")
         report_status(f"{status_prefix}Downloading (RE)...")
 
+        process = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -954,6 +965,7 @@ class MasterM3U8Finder:
                 stderr=asyncio.subprocess.STDOUT,
                 creationflags=creation_flags
             )
+            _active_download_processes.add(process)
 
             while True:
                 check_stop()
@@ -972,6 +984,9 @@ class MasterM3U8Finder:
         except Exception as e:
             log(f"❌ N_m3u8DL-RE download error: {e}")
             return False
+        finally:
+            if process is not None:
+                _active_download_processes.discard(process)
 
     async def capture(self, start_url: str, headless: bool = False) -> Tuple[Optional[str], str, Optional[str], str]:
         """
@@ -1416,6 +1431,79 @@ def get_output_paths(title: str, url: str) -> Tuple[str, str]:
         
     return final_dir, filename
 
+def scp_transfer(local_path: str, remote_path: str, host: str, username: str,
+                 auth_type: str = "SSH Key", key_path: str = "", password: str = "") -> bool:
+    """Upload a local file to a remote server via SFTP (SSH). Returns True on success."""
+    if not PARAMIKO_AVAILABLE:
+        log("⚠️  paramiko is not installed. Run: pip install paramiko")
+        return False
+    client = None
+    try:
+        log(f"\n📡 Connecting to {host} via SFTP...")
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        connect_kwargs = {
+            "hostname": host,
+            "username": username,
+            "look_for_keys": False,
+            "allow_agent": False,
+            "timeout": 30,
+        }
+        if auth_type == "SSH Key":
+            if not key_path or not os.path.exists(key_path):
+                log(f"❌ SSH key not found: {key_path}")
+                return False
+            connect_kwargs["key_filename"] = key_path
+        else:
+            connect_kwargs["password"] = password
+        client.connect(**connect_kwargs)
+        sftp = client.open_sftp()
+        remote_dir = os.path.dirname(remote_path).replace("\\", "/")
+        if remote_dir:
+            dirs_to_create = []
+            d = remote_dir
+            while d and d != "/":
+                try:
+                    sftp.stat(d)
+                    break
+                except IOError:
+                    dirs_to_create.append(d)
+                    d = os.path.dirname(d)
+            for d in reversed(dirs_to_create):
+                try:
+                    sftp.mkdir(d)
+                except IOError:
+                    pass
+        file_size = os.path.getsize(local_path)
+        log(f"📤 Uploading {os.path.basename(local_path)} ({file_size / (1024*1024):.1f} MB)")
+        last_pct = -1
+        def progress_callback(sent, total):
+            nonlocal last_pct
+            pct = int((sent / total) * 100) if total else 0
+            if pct != last_pct and pct % 10 == 0:
+                log(f"   ↳ Upload progress: {pct}%")
+                last_pct = pct
+        sftp.put(local_path, remote_path, callback=progress_callback)
+        sftp.close()
+        log(f"✅ Remote transfer complete.")
+        return True
+    except paramiko.PasswordRequiredException:
+        log("❌ SSH key requires a passphrase. Please use an unencrypted key or switch to Password auth.")
+    except paramiko.AuthenticationException:
+        log("❌ SFTP authentication failed. Check your username/password or SSH key.")
+    except paramiko.SSHException as e:
+        log(f"❌ SSH connection error: {e}")
+    except Exception as e:
+        log(f"❌ SFTP transfer failed: {e}")
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+    return False
+
+
 async def process_video(url: str, headless: bool = True, auto_mode: bool = True) -> Union[bool, str]:
     """
     Orchestrates the download process for a single URL:
@@ -1630,7 +1718,55 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                             os.remove(final_filename)
                         shutil.move(temp_filename, final_filename)
                         log(f"✅ Move complete.")
-                        
+
+                        # --- Remote SFTP Transfer ---
+                        if CONFIG.get("scp_enabled"):
+                            try:
+                                scp_host = CONFIG.get("scp_host", "").strip()
+                                scp_username = CONFIG.get("scp_username", "").strip()
+                                scp_auth_type = CONFIG.get("scp_auth_type", "SSH Key")
+                                scp_key_path = CONFIG.get("scp_key_path", "")
+                                scp_password = CONFIG.get("scp_password", "")
+                                scp_delete_local = CONFIG.get("scp_delete_local", False)
+                                if scp_host and scp_username:
+                                    local_movies = CONFIG.get("movies_dir", "")
+                                    if not local_movies or local_movies == ".":
+                                        local_movies = os.path.join(get_base_dir(), "Movies")
+                                    local_tv = CONFIG.get("tv_dir", "")
+                                    if not local_tv or local_tv == ".":
+                                        local_tv = os.path.join(get_base_dir(), "TV")
+                                    remote_movies = CONFIG.get("scp_remote_movies_dir", "")
+                                    remote_tv = CONFIG.get("scp_remote_tv_dir", "")
+                                    remote_base = None
+                                    local_base = None
+                                    norm_final = os.path.normpath(final_filename)
+                                    if remote_movies and norm_final.startswith(os.path.normpath(local_movies)):
+                                        remote_base = remote_movies
+                                        local_base = local_movies
+                                    elif remote_tv and norm_final.startswith(os.path.normpath(local_tv)):
+                                        remote_base = remote_tv
+                                        local_base = local_tv
+                                    if remote_base and local_base:
+                                        rel_path = os.path.relpath(final_filename, local_base)
+                                        remote_path = remote_base.replace("\\", "/").rstrip("/") + "/" + rel_path.replace("\\", "/")
+                                        scp_ok = scp_transfer(
+                                            final_filename, remote_path,
+                                            scp_host, scp_username,
+                                            auth_type=scp_auth_type,
+                                            key_path=scp_key_path,
+                                            password=scp_password
+                                        )
+                                        if scp_ok and scp_delete_local:
+                                            try:
+                                                os.remove(final_filename)
+                                                log(f"🗑️  Local file deleted after remote transfer.")
+                                            except Exception as e:
+                                                log(f"⚠️  Could not delete local file: {e}")
+                                    else:
+                                        log("⚠️  SCP enabled but could not map local path to remote base directory. Check remote path settings.")
+                            except Exception as e:
+                                log(f"⚠️  Remote transfer error (local file kept): {e}")
+
                         if os.path.exists(txt_filename):
                             try:
                                 os.remove(txt_filename)
@@ -1864,6 +2000,27 @@ async def get_season_episodes(imdb_id: str, season: int, page=None) -> int:
         except:
             await browser.close()
             return 0
+
+def terminate_all_downloads():
+    """Force-terminate all active N_m3u8DL-RE download processes and clean up the download lock."""
+    for proc in list(_active_download_processes):
+        try:
+            if proc.returncode is None:
+                proc.kill()
+                log("🛑 Terminated active download process.")
+        except Exception:
+            pass
+    _active_download_processes.clear()
+
+    # Remove our download lock so the next session doesn't wait on a dead PID
+    lock_file = os.path.join(get_log_dir(), "download.lock")
+    with suppress(OSError):
+        if os.path.exists(lock_file):
+            with open(lock_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+            if content.startswith(f"{os.getpid()}|"):
+                os.remove(lock_file)
+                log("🔒 Download lock removed.")
 
 def clear_session(reason="", target_dir=None):
     if target_dir:
