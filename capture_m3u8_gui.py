@@ -230,7 +230,7 @@ class SettingsWindow(ctk.CTkToplevel):
             y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (h // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
-        self.tabs = ctk.CTkTabview(self, width=600, height=780)
+        self.tabs = ctk.CTkTabview(self, width=600, height=620)
         self.tabs.pack(padx=15, pady=(15, 5), fill="both", expand=True)
 
         self.tabs.add("General")
