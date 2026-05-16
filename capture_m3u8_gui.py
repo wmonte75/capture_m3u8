@@ -1066,7 +1066,6 @@ class M3U8DownloaderApp(ctk.CTk):
         if not url:
             return
 
-        self.save_settings()
         self.stop_event.clear()
         self.is_running = True
         self.start_btn.configure(state="disabled", text="Running...")
@@ -1835,7 +1834,17 @@ class M3U8DownloaderApp(ctk.CTk):
         return result
 
     def on_closing(self):
-        self.save_settings()
+        # Only persist window geometry on close to avoid clobbering manual edits
+        try:
+            latest_config, _ = capture_m3u8.load_config()
+        except Exception:
+            latest_config = {}
+        latest_config["window_geometry"] = self.geometry()
+        try:
+            capture_m3u8.save_config(latest_config)
+        except Exception as e:
+            self.log_callback(f"Failed to save config: {e}")
+
         if self.is_running:
             if self._confirm_quit():
                 self.stop_process()

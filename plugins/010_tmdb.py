@@ -106,9 +106,9 @@ def load_config():
                 
         if updated:
             try:
-                with open(config_path, 'w', encoding='utf-8') as f:
-                    json.dump(CONFIG, f, indent=4)
-                print(f"🔌 [010_tmdb] Updated config.json with missing fields.")
+                import capture_m3u8
+                capture_m3u8.save_config(CONFIG)
+                print(f"🔌 [010_tmdb] Updated config.json with missing fields (safely).")
             except Exception as e:
                 print(f"🔌 [010_tmdb] Error writing config.json: {e}")
 

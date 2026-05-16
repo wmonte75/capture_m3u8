@@ -2082,7 +2082,7 @@ def load_config():
     
     if os.path.exists(config_file):
         try:
-            with open(config_file, 'r') as f:
+            with open(config_file, 'r', encoding='utf-8') as f:
                 user_config = json.load(f)
                 default_config.update(user_config)
                 log_messages.append("⚙️  Loaded config.json")
@@ -2116,10 +2116,8 @@ def save_config(new_data):
     try:
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(current_disk_config, f, indent=4)
-        # On Windows, os.replace is atomic; on Linux, os.rename is atomic
-        if os.name == 'nt' and os.path.exists(config_file):
-            os.remove(config_file)
-        os.rename(temp_file, config_file)
+        # os.replace is atomic on both Windows and modern Unix systems.
+        os.replace(temp_file, config_file)
         return True
     except Exception as e:
         print(f"❌ Failed to save config: {e}")
