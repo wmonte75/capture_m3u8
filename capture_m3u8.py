@@ -3057,7 +3057,15 @@ async def main():
         if url:
             # Single movie download - flush cache before start
             flush_imdb_cache()
-            await process_video(url, headless=headless, auto_mode=auto_mode)
+            result = await process_video(url, headless=headless, auto_mode=auto_mode)
+            
+            # Log successful single downloads to completed.log just like queue mode
+            completed_log = os.path.join(get_log_dir(), "completed.log")
+            if isinstance(result, str) and result != "404":
+                if os.path.exists(result) and os.path.getsize(result) > 5 * 1024 * 1024:
+                    with open(completed_log, 'a', encoding='utf-8') as f:
+                        f.write(f"{url}\n")
+                    print("✅ Marked as complete.")
 
 if __name__ == "__main__":
     try:

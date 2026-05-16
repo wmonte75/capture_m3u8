@@ -1172,7 +1172,18 @@ class M3U8DownloaderApp(ctk.CTk):
             # Normal Single Video
             headless = self.config.get("headless", True)
             self.update_status_bar("Hunting", message="Processing movie...")
-            asyncio.run(capture_m3u8.process_video(url, headless=headless, auto_mode=True))
+            success = asyncio.run(capture_m3u8.process_video(url, headless=headless, auto_mode=True))
+            
+            # Log successful single downloads to completed.log
+            completed_log = os.path.join(capture_m3u8.get_log_dir(), "completed.log")
+            if isinstance(success, str) and success != "404":
+                if os.path.exists(success) and os.path.getsize(success) > 5 * 1024 * 1024:
+                    try:
+                        with open(completed_log, 'a', encoding='utf-8') as f:
+                            f.write(f"{url}\n")
+                        self.log_callback("✅ Marked as complete.\n")
+                    except Exception as e:
+                        self.log_callback(f"⚠️ Failed to update completed.log: {e}\n")
             
         except Exception as e:
             self.log_callback(f"\n❌ Error: {e}\n")
@@ -1625,7 +1636,17 @@ class M3U8DownloaderApp(ctk.CTk):
                     break
                 self.log_callback(f"\n--- Processing {i+1}/{len(movies)}: {m['title']} ---\n")
                 self.update_status_bar("Downloading", counter=f"{i+1} / {len(movies)}", progress=(i+1)/len(movies))
-                asyncio.run(capture_m3u8.process_video(m['url'], headless=headless, auto_mode=True))
+                success = asyncio.run(capture_m3u8.process_video(m['url'], headless=headless, auto_mode=True))
+                
+                # Log successful downloads to completed.log
+                if isinstance(success, str) and success != "404":
+                    if os.path.exists(success) and os.path.getsize(success) > 5 * 1024 * 1024:
+                        try:
+                            with open(completed_log, 'a', encoding='utf-8') as f:
+                                f.write(f"{m['url']}\n")
+                            self.log_callback("   ✅ Marked as complete.\n")
+                        except Exception as e:
+                            self.log_callback(f"   ⚠️ Failed to update completed.log: {e}\n")
                 
                 if i < len(movies) - 1:
                     wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])
