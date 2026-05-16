@@ -781,7 +781,7 @@ class M3U8DownloaderApp(ctk.CTk):
 
         # Set window icon synchronously
         try:
-            icon_path = capture_m3u8.get_resource_path('icon2.ico')
+            icon_path = capture_m3u8.get_resource_path('binaries/icon2.ico')
             if sys.platform.startswith('linux'):
                 # Linux doesn't support .ico for window icons well, use PIL to set it
                 from PIL import Image, ImageTk
