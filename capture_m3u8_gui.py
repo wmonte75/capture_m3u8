@@ -504,6 +504,22 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkLabel(tab, text="🗑️ Session", font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=15, pady=(20, 8))
         ctk.CTkButton(tab, text="Clear Browser Session", fg_color="#e74c3c", hover_color="#c0392b", width=150, command=lambda: capture_m3u8.clear_session(reason="user request")).pack(anchor="w", padx=20, pady=2)
 
+        # Auto-fill discovered paths after the tab is built
+        self._refresh_tool_paths()
+
+    def _refresh_tool_paths(self):
+        """Auto-discover binary locations and populate the Tools tab entries."""
+        for dep in capture_m3u8.REQUIRED_BINARIES:
+            key = dep["config_key"]
+            if key not in self.tool_entries:
+                continue
+            path = capture_m3u8.find_binary(dep["binary"], key)
+            if path and os.path.exists(path):
+                ent = self.tool_entries[key]
+                ent.delete(0, "end")
+                ent.insert(0, path)
+                self.parent.config[key] = path
+
     def _toggle_theme(self):
         theme = "dark" if self.dark_mode_switch.get() == 1 else "light"
         ctk.set_appearance_mode(theme)
@@ -535,6 +551,7 @@ class SettingsWindow(ctk.CTkToplevel):
                 self.parent.log_callback(f"❌ Update task failed: {e}\n")
             finally:
                 self.after(0, lambda: self.update_btn.configure(state="normal", text="Check & Update Tools"))
+                self.after(0, self._refresh_tool_paths)
         threading.Thread(target=update_task, daemon=True).start()
 
     def save_and_close(self):
@@ -602,6 +619,8 @@ class DependencyInstallerDialog(ctk.CTkToplevel):
         has_auto = any(d.get("auto") for d in deps)
         if has_auto:
             ctk.CTkButton(btn_frame, text="Install All Possible", fg_color="#27ae60", hover_color="#2ecc71", command=self._install_all).pack(side="left", padx=5)
+        if sys.platform == 'win32':
+            ctk.CTkButton(btn_frame, text="Try Fallback Bundle", fg_color="#e67e22", hover_color="#d35400", command=self._try_fallback).pack(side="left", padx=5)
         ctk.CTkButton(btn_frame, text="Open Tools Tab", fg_color="#34495e", hover_color="#2c3e50", command=self._open_tools).pack(side="left", padx=5)
         ctk.CTkButton(btn_frame, text="Skip", fg_color="transparent", border_width=1, command=self.destroy).pack(side="left", padx=5)
 
@@ -629,7 +648,7 @@ class DependencyInstallerDialog(ctk.CTkToplevel):
             cmd_lbl.pack(side="right", padx=10, pady=10)
             self.dep_widgets[name]["cmd"] = cmd_lbl
 
-    def _install_one(self, dep):
+    def _install_one(self, dep, rescan_all=False):
         name = dep["name"]
         widgets = self.dep_widgets.get(name, {})
         btn = widgets.get("btn")
@@ -642,30 +661,66 @@ class DependencyInstallerDialog(ctk.CTkToplevel):
 
         def task():
             try:
-                if name == "N_m3u8DL-RE":
+                updater = dep.get("updater")
+                if updater == "nm3u8dl":
                     asyncio.run(capture_m3u8.update_nm3u8dl_re())
-                elif name == "FFmpeg":
+                elif updater == "ffmpeg":
                     asyncio.run(capture_m3u8.update_ffmpeg())
-                elif name == "MKVToolNix":
+                elif updater == "mkvtoolnix":
                     asyncio.run(capture_m3u8.update_mkvtoolnix())
                 else:
                     raise RuntimeError("No updater available")
 
-                # Verify
-                path = capture_m3u8.find_binary(dep["binary"], dep["key"])
-                if path and os.path.exists(path):
-                    self.after(0, lambda n=name: self._mark_done(n))
+                if rescan_all:
+                    # Re-scan every dep in the dialog — one updater may install multiple binaries
+                    still_missing = capture_m3u8.get_missing_binaries()
+                    still_names = {d["name"] for d in still_missing}
+                    for d in self.deps:
+                        n = d["name"]
+                        if n not in still_names:
+                            self.after(0, lambda name=n: self._mark_done(name))
+                        else:
+                            self.after(0, lambda name=n: self._mark_failed(name, "Not found after install"))
                 else:
-                    self.after(0, lambda n=name: self._mark_failed(n, "Not found after install"))
+                    # Verify only this dep
+                    path = capture_m3u8.find_binary(dep["binary"], dep.get("config_key"))
+                    if path and os.path.exists(path):
+                        self.after(0, lambda n=name: self._mark_done(n))
+                    else:
+                        self.after(0, lambda n=name: self._mark_failed(n, "Not found after install"))
             except Exception as e:
                 self.after(0, lambda n=name, err=str(e): self._mark_failed(n, err))
 
         threading.Thread(target=task, daemon=True).start()
 
+    def _try_fallback(self):
+        """Download the consolidated fallback bundle and refresh statuses."""
+        def task():
+            try:
+                asyncio.run(capture_m3u8.download_fallback_binaries())
+                # Re-check which are still missing
+                still_missing = capture_m3u8.get_missing_binaries()
+                still_names = {d["name"] for d in still_missing}
+                for dep in self.deps:
+                    n = dep["name"]
+                    if n not in still_names:
+                        self.after(0, lambda name=n: self._mark_done(name))
+                    else:
+                        self.after(0, lambda name=n: self._mark_failed(name, "Still missing after fallback"))
+            except Exception as e:
+                for dep in self.deps:
+                    n = dep["name"]
+                    self.after(0, lambda name=n, err=str(e): self._mark_failed(name, err))
+
+        threading.Thread(target=task, daemon=True).start()
+
     def _install_all(self):
+        """Install missing tools, deduplicating shared updaters to avoid races."""
+        seen_updaters = set()
         for dep in self.deps:
-            if dep.get("auto"):
-                self._install_one(dep)
+            if dep.get("auto") and dep.get("updater") not in seen_updaters:
+                seen_updaters.add(dep.get("updater"))
+                self._install_one(dep, rescan_all=True)
 
     def _mark_done(self, name):
         widgets = self.dep_widgets.get(name, {})
@@ -675,6 +730,14 @@ class DependencyInstallerDialog(ctk.CTkToplevel):
             lbl.configure(text="Installed ✅", text_color="#2ecc71")
         if btn:
             btn.configure(state="disabled", text="Done")
+        # Update parent config with the actual discovered path so settings show it
+        for dep in self.deps:
+            if dep["name"] == name:
+                path = capture_m3u8.find_binary(dep["binary"], dep.get("config_key"))
+                if path and os.path.exists(path):
+                    self.parent.config[dep["config_key"]] = path
+                break
+        self._check_all_done()
 
     def _mark_failed(self, name, error):
         widgets = self.dep_widgets.get(name, {})
@@ -685,6 +748,15 @@ class DependencyInstallerDialog(ctk.CTkToplevel):
             lbl.configure(text=f"Failed: {short_err}", text_color="#e74c3c")
         if btn:
             btn.configure(state="normal", text="Retry")
+        self._check_all_done()
+
+    def _check_all_done(self):
+        """Auto-close the dialog once every tracked binary is present locally."""
+        try:
+            if not capture_m3u8.get_missing_binaries():
+                self.after(600, self.destroy)
+        except Exception:
+            pass
 
     def _open_tools(self):
         self.destroy()
@@ -777,40 +849,9 @@ class M3U8DownloaderApp(ctk.CTk):
         # Startup check: if critical binaries are missing, nudge user to Tools tab
         self.after(600, self.check_missing_binaries)
 
-    def _get_package_command(self, package_name):
-        """Return the appropriate package manager command for the current platform."""
-        if sys.platform == 'darwin':
-            return f"brew install {package_name}"
-        # Linux — detect package manager
-        if shutil.which("apt") or shutil.which("apt-get"):
-            return f"sudo apt install {package_name}"
-        elif shutil.which("pacman"):
-            return f"sudo pacman -S {package_name}"
-        elif shutil.which("dnf"):
-            return f"sudo dnf install {package_name}"
-        elif shutil.which("zypper"):
-            return f"sudo zypper install {package_name}"
-        return f"Install {package_name} via your package manager"
-
     def check_missing_binaries(self):
         """Detect missing binaries and show the DependencyInstallerDialog."""
-        is_win = sys.platform == 'win32'
-        deps = []
-
-        def check(name, binary, key, pkg_name=None, auto=None):
-            path = capture_m3u8.find_binary(binary, key)
-            if not path or not os.path.exists(path):
-                dep = {"name": name, "binary": binary, "key": key, "auto": auto if auto is not None else is_win}
-                if not dep["auto"] and pkg_name:
-                    dep["command"] = self._get_package_command(pkg_name)
-                deps.append(dep)
-
-        check("N_m3u8DL-RE", "N_m3u8DL-RE", "nm3u8dl_re_path", auto=True)
-        check("FFmpeg", "ffmpeg", "ffmpeg_path", "ffmpeg")
-        check("FFprobe", "ffprobe", "ffprobe_path", "ffmpeg")
-        check("MKVPropEdit", "mkvpropedit", "mkvpropedit_path", "mkvtoolnix")
-        check("MKVMerge", "mkvmerge", "mkvmerge_path", "mkvtoolnix")
-
+        deps = capture_m3u8.get_missing_binaries()
         if deps:
             DependencyInstallerDialog(self, deps)
 

@@ -482,8 +482,15 @@ async def update_ffmpeg():
     except Exception as e:
         log(f"   ❌ FFmpeg update failed: {e}")
 
-def find_binary(name, config_key=None):
-    """Robust binary discovery (Priority: Config -> Binaries Folder -> Root -> System Path)."""
+def find_binary(name, config_key=None, local_only=False):
+    """
+    Robust binary discovery (Priority: Config -> Binaries Folder -> Root -> System Path).
+    
+    local_only=True restricts the search to config paths and local directories
+    (./binaries/, ./).  Use this for dependency-checking so the GUI/CLI only
+    reports binaries that are actually bundled/configured, not whatever happens
+    to be installed globally on the system PATH.
+    """
     base_dir = get_base_dir()
     is_win = sys.platform == 'win32'
     
@@ -516,8 +523,192 @@ def find_binary(name, config_key=None):
                 if os.path.exists(local_path):
                     return os.path.abspath(local_path)
                     
-    # 3. System Path
+    # 3. System Path (skipped when checking for bundled dependencies)
+    if local_only:
+        return None
     return shutil.which(name) or name
+
+
+# ── Shared Binary Registry ───────────────────────────────────────────────────
+REQUIRED_BINARIES = [
+    {"name": "N_m3u8DL-RE", "binary": "N_m3u8DL-RE", "config_key": "nm3u8dl_re_path", "pkg_name": None, "updater": "nm3u8dl"},
+    {"name": "FFmpeg",     "binary": "ffmpeg",     "config_key": "ffmpeg_path",     "pkg_name": "ffmpeg",     "updater": "ffmpeg"},
+    {"name": "FFprobe",    "binary": "ffprobe",    "config_key": "ffprobe_path",    "pkg_name": "ffmpeg",     "updater": "ffmpeg"},
+    {"name": "MKVPropEdit","binary": "mkvpropedit","config_key": "mkvpropedit_path","pkg_name": "mkvtoolnix", "updater": "mkvtoolnix"},
+    {"name": "MKVMerge",   "binary": "mkvmerge",   "config_key": "mkvmerge_path",   "pkg_name": "mkvtoolnix", "updater": "mkvtoolnix"},
+]
+
+FALLBACK_BUNDLE_URL = "http://files.wmonte75.com:8080/Project_Binaries/capture_m3u8_binaries.zip"
+
+
+def get_package_command(package_name: str) -> str:
+    """Return the appropriate package manager command for the current platform."""
+    if sys.platform == 'darwin':
+        return f"brew install {package_name}"
+    if shutil.which("apt") or shutil.which("apt-get"):
+        return f"sudo apt install {package_name}"
+    elif shutil.which("pacman"):
+        return f"sudo pacman -S {package_name}"
+    elif shutil.which("dnf"):
+        return f"sudo dnf install {package_name}"
+    elif shutil.which("zypper"):
+        return f"sudo zypper install {package_name}"
+    return f"Install {package_name} via your package manager"
+
+
+def _is_auto_updatable(dep: dict) -> bool:
+    """Determine whether this dep can be auto-downloaded on the current OS."""
+    is_win = sys.platform == 'win32'
+    updater = dep.get("updater")
+    # N_m3u8DL-RE updater works on all platforms; ffmpeg/mkvtoolnix are Windows-only
+    if updater == "nm3u8dl":
+        return True
+    return is_win and updater in ("ffmpeg", "mkvtoolnix")
+
+
+def get_missing_binaries() -> list:
+    """
+    Scan REQUIRED_BINARIES and return a list of missing dependency dicts.
+    Only checks local/config paths (ignores system PATH) so the app reports
+    what is actually bundled, not what happens to be installed globally.
+    Each dict contains: name, binary, config_key, updater, auto, command (if manual).
+    """
+    missing = []
+    for dep in REQUIRED_BINARIES:
+        path = find_binary(dep["binary"], dep["config_key"], local_only=True)
+        if path and os.path.exists(path):
+            continue
+        entry = {
+            "name": dep["name"],
+            "binary": dep["binary"],
+            "config_key": dep["config_key"],
+            "updater": dep.get("updater"),
+            "auto": _is_auto_updatable(dep),
+        }
+        pkg = dep.get("pkg_name")
+        if pkg and not entry["auto"]:
+            entry["command"] = get_package_command(pkg)
+        missing.append(entry)
+    return missing
+
+
+async def download_fallback_binaries() -> list:
+    """
+    Download the consolidated fallback bundle and extract only the binaries
+    we track into ./binaries/. Returns list of extracted filenames.
+    """
+    bin_dir = os.path.join(get_base_dir(), "binaries")
+    os.makedirs(bin_dir, exist_ok=True)
+
+    # Build a set of expected filenames (with and without .exe)
+    expected = set()
+    for dep in REQUIRED_BINARIES:
+        expected.add(dep["binary"].lower())
+        expected.add(dep["binary"].lower() + ".exe")
+
+    log(f"🔄 Trying fallback bundle: {FALLBACK_BUNDLE_URL}")
+    try:
+        resp = requests.get(FALLBACK_BUNDLE_URL, stream=True, timeout=120)
+        resp.raise_for_status()
+        content = io.BytesIO(resp.content)
+
+        extracted = []
+        with zipfile.ZipFile(content) as z:
+            for zinfo in z.infolist():
+                if zinfo.is_dir():
+                    continue
+                filename = os.path.basename(zinfo.filename)
+                if filename.lower() in expected:
+                    target_path = os.path.join(bin_dir, filename)
+                    with z.open(zinfo) as source, open(target_path, "wb") as f:
+                        shutil.copyfileobj(source, f)
+                    extracted.append(filename)
+
+        if extracted:
+            log(f"   ✅ Fallback bundle extracted: {', '.join(extracted)}")
+        else:
+            log("   ⚠️  Fallback bundle downloaded but no tracked binaries found inside.")
+        return extracted
+    except Exception as e:
+        log(f"   ❌ Fallback bundle failed: {e}")
+        return []
+
+
+async def ensure_binaries(cli_mode: bool = True) -> list:
+    """
+    Unified binary resolver.
+    • cli_mode=True  → prompts via terminal, auto-installs, returns final missing list.
+    • cli_mode=False → meant for GUI; just returns the missing list (GUI handles its own dialog).
+    """
+    missing = get_missing_binaries()
+    if not missing:
+        return []
+
+    is_win = sys.platform == 'win32'
+    is_tty = sys.stdin.isatty()
+
+    # ── Print summary ──
+    log("\n" + "=" * 60)
+    log("⚠️  Missing required binaries:")
+    for dep in missing:
+        if dep.get("auto"):
+            status = "Auto-install available"
+        else:
+            status = dep.get("command", "Manual install required")
+        log(f"   • {dep['name']}: {status}")
+    log("=" * 60)
+
+    auto_missing = [d for d in missing if d.get("auto")]
+
+    # ── Try normal auto-installers ──
+    if auto_missing and is_tty:
+        if cli_mode:
+            choice = input("\nAuto-install supported tools now? (y/n): ").strip().lower()
+            run_auto = (choice == 'y')
+        else:
+            run_auto = False
+
+        if run_auto:
+            # Run each updater once (they cover multiple binaries)
+            ran = set()
+            for dep in auto_missing:
+                updater = None
+                for reg in REQUIRED_BINARIES:
+                    if reg["name"] == dep["name"]:
+                        updater = reg.get("updater")
+                        break
+                if not updater or updater in ran:
+                    continue
+                ran.add(updater)
+
+                if updater == "nm3u8dl":
+                    await update_nm3u8dl_re()
+                elif updater == "ffmpeg":
+                    await update_ffmpeg()
+                elif updater == "mkvtoolnix":
+                    await update_mkvtoolnix()
+
+            missing = get_missing_binaries()
+            auto_missing = [d for d in missing if d.get("auto")]
+
+    # ── Fallback bundle (Windows only) ──
+    if is_win and auto_missing and is_tty and cli_mode:
+        choice = input(
+            "\nOfficial downloads failed or incomplete. Try fallback bundle from wmonte75.com? (y/n): "
+        ).strip().lower()
+        if choice == 'y':
+            await download_fallback_binaries()
+            missing = get_missing_binaries()
+
+    # ── Final report ──
+    if missing:
+        log("\n⚠️  Still missing after install attempts:")
+        for dep in missing:
+            cmd = dep.get("command", "")
+            log(f"   • {dep['name']}" + (f": {cmd}" if cmd else ""))
+
+    return missing
+
 
 def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = None) -> Tuple[Optional[str], Optional[Dict[int, str]], Optional[int]]:
     """
@@ -2510,6 +2701,10 @@ async def main():
         log(msg)
     setup_interface(config_data=loaded_config)
     COOLDOWN_RANGE = (loaded_config['min_cooldown'], loaded_config['max_cooldown'])
+
+    # ── Unified binary check (skip if user explicitly ran -U) ──
+    if not (len(sys.argv) > 1 and sys.argv[1].strip() == '-U'):
+        await ensure_binaries(cli_mode=True)
 
     # Default settings
     url = None
