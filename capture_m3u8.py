@@ -805,6 +805,7 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
 
     variants: Dict[int, str] = {}
     heights: List[int] = []
+    widths: List[int] = []
     bandwidths: List[Tuple[int, str]] = []  # (bandwidth, variant_url)
     is_media_playlist = False
 
@@ -848,7 +849,9 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
             # --- Resolution parsing ---
             match = re.search(r'RESOLUTION=(\d+)x(\d+)', line_stripped)
             if match:
+                width = int(match.group(1))
                 height = int(match.group(2))
+                widths.append(width)
                 heights.append(height)
                 # Scan forward for the next non-comment, non-empty line (variant URL)
                 variant_url = None
@@ -886,6 +889,7 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
         for bw, vurl in bandwidths:
             est_height = _bandwidth_to_height(bw)
             heights.append(est_height)
+            widths.append(int(est_height * 16 / 9))
             if est_height not in variants:
                 variants[est_height] = vurl
             # Prefer the higher bandwidth for the same estimated height
@@ -901,8 +905,9 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
         if probe:
             width, height = probe
             heights.append(height)
+            widths.append(width)
             variants[height] = master_url
-            log(f"   🎛️  ffprobe detected {height}p stream → PRO speed cap")
+            log(f"   🎛️  ffprobe detected {width}w x {height}h stream → PRO speed cap")
         elif bandwidths:
             # ffprobe on master failed but we have bandwidth variants; try ffprobe on the highest bandwidth variant
             best_variant = max(bandwidths, key=lambda x: x[0])[1]
@@ -910,8 +915,9 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
             if probe:
                 width, height = probe
                 heights.append(height)
+                widths.append(width)
                 variants[height] = best_variant
-                log(f"   🎛️  ffprobe detected {height}p stream (via variant) → PRO speed cap")
+                log(f"   🎛️  ffprobe detected {width}w x {height}h stream (via variant) → PRO speed cap")
         elif is_media_playlist:
             # Media playlist with no variants — already tried ffprobe on master_url above
             pass
@@ -920,25 +926,27 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
         log("   ⚠️  Could not detect resolution via manifest, bandwidth, or ffprobe.")
         return None, None, None
 
+    # Use width for speed cap determination; fallback to height if no widths available
     max_height = max(heights)
+    max_width = max(widths) if widths else int(max_height * 16 / 9)
     caps = {
-        1080: CONFIG.get('speed_cap_1080', '2.5M'),
-        720:  CONFIG.get('speed_cap_720',  '2M'),
-        480:  CONFIG.get('speed_cap_480',  '1.5M'),
-        360:  CONFIG.get('speed_cap_360',  '1M'),
+        1920: CONFIG.get('speed_cap_1080', '2.5M'),
+        1280: CONFIG.get('speed_cap_720',  '2M'),
+        854:  CONFIG.get('speed_cap_480',  '1.5M'),
+        640:  CONFIG.get('speed_cap_360',  '1M'),
     }
 
-    if max_height >= 1080:
-        speed = caps[1080]
-    elif max_height >= 720:
-        speed = caps[720]
-    elif max_height >= 480:
-        speed = caps[480]
+    if max_width >= 1920:
+        speed = caps[1920]
+    elif max_width >= 1280:
+        speed = caps[1280]
+    elif max_width >= 854:
+        speed = caps[854]
     else:
-        speed = caps[360]
+        speed = caps[640]
 
-    log(f"   🎛️  Detected {max_height}p stream → PRO speed cap: {speed}")
-    return speed, variants, max_height
+    log(f"   🎛️  Detected {max_width}w stream → PRO speed cap: {speed}")
+    return speed, variants, max_width
 
 
 def get_speed_for_resolution(master_url: str, referer: str = None, cookies: dict = None, fallback_text: str = None) -> Optional[str]:
