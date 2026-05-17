@@ -1195,8 +1195,13 @@ class MasterM3U8Finder:
         """Convert title to safe filename"""
         safe = re.sub(r'[<>:"/\\|?*]', '', title)
         safe = re.sub(r'\.+', '.', safe)
-        if len(safe) > 50:
-            safe = safe[:50]
+        # Preserve trailing year in parentheses if we need to truncate
+        year_match = re.search(r'\((?:19|20)\d{2}\)\s*$', safe)
+        year_suffix = year_match.group(0) if year_match else ''
+        max_len = 255
+        if len(safe) > max_len:
+            safe = safe[:max_len - len(year_suffix)].strip()
+            safe = safe + year_suffix
         return safe.strip()
 
     async def save_cookies(self, context):
@@ -1276,7 +1281,7 @@ class MasterM3U8Finder:
         
         return self.master_url if self.master_url else None
 
-    async def run_nm3u8dl_re(self, binary_path, master_url, output_file, referer=None, status_prefix=""):
+    async def run_nm3u8dl_re(self, binary_path, master_url, output_file, referer=None, status_prefix="", parsed_speed=None, parsed_variants=None):
         """Execute download using N_m3u8DL-RE with native speed control logic."""
         check_stop()
         save_dir = os.path.dirname(output_file)
@@ -1291,16 +1296,21 @@ class MasterM3U8Finder:
         # Check for locally saved manifest from browser session
         local_manifest = getattr(self, 'local_manifest_path', None)
         base_url = getattr(self, 'base_url', None)
-        manifest_text = None
-        if local_manifest and os.path.exists(local_manifest):
-            try:
-                with open(local_manifest, 'r', encoding='utf-8') as f:
-                    manifest_text = f.read()
-            except Exception as e:
-                log(f"   ⚠️  Failed to read local manifest: {e}")
 
-        # Parse manifest once for both speed cap and resolution preference
-        speed, variants, max_height = parse_master_manifest(master_url, referer, getattr(self, 'cookies_dict', None), fallback_text=manifest_text)
+        if parsed_speed is not None:
+            speed = parsed_speed
+            variants = parsed_variants
+        else:
+            manifest_text = None
+            if local_manifest and os.path.exists(local_manifest):
+                try:
+                    with open(local_manifest, 'r', encoding='utf-8') as f:
+                        manifest_text = f.read()
+                except Exception as e:
+                    log(f"   ⚠️  Failed to read local manifest: {e}")
+
+            # Parse manifest once for both speed cap and resolution preference
+            speed, variants, _ = parse_master_manifest(master_url, referer, getattr(self, 'cookies_dict', None), fallback_text=manifest_text)
 
         if CONFIG.get('auto_speed_by_resolution', False):
             if speed:
@@ -2007,6 +2017,17 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
         txt_filename = os.path.join(temp_dir, f"{os.path.splitext(filename)[0]}.txt")
         temp_filename = os.path.join(temp_dir, filename)
         final_filename = os.path.join(final_dir, filename)
+
+        # Load local manifest once and parse for both command file and downloader
+        manifest_text = None
+        if getattr(finder, 'local_manifest_path', None) and os.path.exists(finder.local_manifest_path):
+            try:
+                with open(finder.local_manifest_path, 'r', encoding='utf-8') as f_manifest:
+                    manifest_text = f_manifest.read()
+            except Exception:
+                pass
+
+        parsed_speed, parsed_variants, _ = parse_master_manifest(master_url, referer, getattr(finder, 'cookies_dict', None), fallback_text=manifest_text)
             
         with open(txt_filename, 'w', encoding='utf-8') as f:
             f.write(f"Title: {title}\n")
@@ -2018,30 +2039,19 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
             auto_flag = "--auto-select"
             limit_speed = CONFIG.get('download_speed', 'Unlimited')
 
-            # Load local manifest if browser saved one
-            manifest_text = None
-            if getattr(finder, 'local_manifest_path', None) and os.path.exists(finder.local_manifest_path):
-                try:
-                    with open(finder.local_manifest_path, 'r', encoding='utf-8') as f_manifest:
-                        manifest_text = f_manifest.read()
-                except Exception:
-                    pass
-
-            # Parse manifest once for both speed and variant selection
-            speed, variants, _ = parse_master_manifest(master_url, referer, getattr(finder, 'cookies_dict', None), fallback_text=manifest_text)
-            if speed and CONFIG.get('auto_speed_by_resolution', False):
-                limit_speed = speed
+            if parsed_speed and CONFIG.get('auto_speed_by_resolution', False):
+                limit_speed = parsed_speed
 
             preferred = CONFIG.get('preferred_resolution', 'Auto')
-            if preferred != 'Auto' and variants:
+            if preferred != 'Auto' and parsed_variants:
                 try:
                     pref_height = int(preferred.replace('p', ''))
-                    if pref_height in variants:
-                        cmd_url = variants[pref_height]
+                    if pref_height in parsed_variants:
+                        cmd_url = parsed_variants[pref_height]
                         auto_flag = ""
                     else:
-                        closest = min(variants.keys(), key=lambda h: abs(h - pref_height))
-                        cmd_url = variants[closest]
+                        closest = min(parsed_variants.keys(), key=lambda h: abs(h - pref_height))
+                        cmd_url = parsed_variants[closest]
                         auto_flag = ""
                 except Exception:
                     pass
@@ -2098,7 +2108,7 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
 
                 # Apply the OS-aware Download Lock
                 async with DownloadLock(title):
-                    success = await finder.run_nm3u8dl_re(nm3u8_path, master_url, temp_filename, referer=referer, status_prefix=status_prefix)
+                    success = await finder.run_nm3u8dl_re(nm3u8_path, master_url, temp_filename, referer=referer, status_prefix=status_prefix, parsed_speed=parsed_speed, parsed_variants=parsed_variants)
                 
                 cookie_file = os.path.join(get_log_dir(), 'cookies.txt')
                 if os.path.exists(cookie_file):
