@@ -895,7 +895,7 @@ class M3U8DownloaderApp(ctk.CTk):
         self.status_bar = ctk.CTkFrame(self, height=42, fg_color="#1a1a1a", corner_radius=6)
         self.status_bar.pack(fill="x", padx=10, pady=(0, 5))
         self.status_bar.grid_propagate(False)
-        for c, w in [(0, 0), (1, 0), (2, 1), (3, 0), (4, 0)]:
+        for c, w in [(0, 0), (1, 0), (2, 1), (3, 0)]:
             self.status_bar.grid_columnconfigure(c, weight=w)
 
         self.status_icon = ctk.CTkLabel(self.status_bar, text="🔵", font=("Segoe UI", 14), width=28)
@@ -906,9 +906,14 @@ class M3U8DownloaderApp(ctk.CTk):
         self.progress_bar.set(0)
         self.progress_bar.grid(row=0, column=2, padx=10, pady=5, sticky="ew")
         self.counter_lbl = ctk.CTkLabel(self.status_bar, text="—", font=("Segoe UI", 11, "bold"), width=70)
-        self.counter_lbl.grid(row=0, column=3, padx=(5, 5), pady=5)
-        self.title_lbl = ctk.CTkLabel(self.status_bar, text="Waiting for input...", font=("Segoe UI", 10, "italic"), text_color="#888888")
-        self.title_lbl.grid(row=0, column=4, padx=(5, 15), pady=5, sticky="e")
+        self.counter_lbl.grid(row=0, column=3, padx=(5, 15), pady=5, sticky="e")
+
+        # --- Current Title Display (full width, between status bar and logs) ---
+        self.current_title_frame = ctk.CTkFrame(self, fg_color="transparent", height=28)
+        self.current_title_frame.pack(fill="x", padx=10, pady=(5, 0))
+        self.current_title_frame.pack_propagate(False)
+        self.current_title_lbl = ctk.CTkLabel(self.current_title_frame, text="", font=("Segoe UI", 11, "bold"), text_color="#dddddd", anchor="w")
+        self.current_title_lbl.pack(side="left", padx=10, fill="x", expand=True)
 
         # --- Bottom Section: Logs ---
         self.log_header_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -1005,7 +1010,7 @@ class M3U8DownloaderApp(ctk.CTk):
             if counter is not None:
                 self.counter_lbl.configure(text=counter)
             if title is not None:
-                self.title_lbl.configure(text=title[:50] if title else "Waiting for input...")
+                self.current_title_lbl.configure(text=title if title else "")
         self.after(0, _apply)
 
     def status_callback(self, message):
