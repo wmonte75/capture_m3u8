@@ -8,6 +8,7 @@ import json
 import random
 import importlib.util
 import ctypes
+import signal
 import io
 import zipfile
 import tarfile
@@ -710,9 +711,82 @@ async def ensure_binaries(cli_mode: bool = True) -> list:
     return missing
 
 
+def _probe_resolution(url: str, referer: str = None, cookies: dict = None) -> Optional[Tuple[int, int]]:
+    """
+    Use ffprobe to detect video resolution from a URL (HLS master/media playlist or direct stream).
+    Returns (width, height) or None on failure.
+    """
+    ffprobe_bin = find_binary("ffprobe", "ffprobe_path")
+    if not ffprobe_bin or not os.path.exists(ffprobe_bin):
+        log("   ⚠️  ffprobe binary not found; skipping probe fallback.")
+        return None
+
+    headers_list = [f"User-Agent: {USER_AGENT}"]
+    if referer:
+        headers_list.append(f"Referer: {referer}")
+    if cookies:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        headers_list.append(f"Cookie: {cookie_str}")
+    headers_str = "\r\n".join(headers_list)
+
+    cmd = [
+        ffprobe_bin,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        "-headers", headers_str,
+        "-analyzeduration", "5000000",
+        "-probesize", "5000000",
+        url,
+    ]
+    try:
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=creation_flags,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if result.stderr else ""
+            if stderr:
+                log(f"   ⚠️  ffprobe failed: {stderr[:200]}")
+            return None
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        if not streams:
+            return None
+        width = streams[0].get("width")
+        height = streams[0].get("height")
+        if width and height:
+            return int(width), int(height)
+    except Exception as e:
+        log(f"   ⚠️  ffprobe exception: {e}")
+    return None
+
+
+def _bandwidth_to_height(bandwidth: int) -> int:
+    """Roughly estimate video height from HLS bandwidth (bits/sec)."""
+    # Approximate ranges for AVC; HEVC/VP9 may be lower but this is a safe fallback.
+    if bandwidth >= 3_500_000:
+        return 1080
+    elif bandwidth >= 1_500_000:
+        return 720
+    elif bandwidth >= 800_000:
+        return 480
+    elif bandwidth >= 400_000:
+        return 360
+    else:
+        return 240
+
+
 def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = None) -> Tuple[Optional[str], Optional[Dict[int, str]], Optional[int]]:
     """
     Fetch the master.m3u8 manifest and inspect variant streams for RESOLUTION + variant URLs.
+    Falls back to bandwidth estimation and ffprobe probing if resolution tags are missing
+    or if the manifest cannot be fetched at all.
     Returns (speed_cap, variants_dict, max_height) where variants_dict maps height -> variant URL.
     Returns (None, None, None) on failure.
     """
@@ -723,57 +797,134 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
     if referer:
         headers["Referer"] = referer
 
+    text = ""
+    fetch_failed = False
     try:
         session = requests.Session()
         if cookies:
             session.cookies.update(cookies)
         resp = session.get(master_url, headers=headers, timeout=10)
         if not resp.ok:
-            return None, None, None
-        text = resp.text
-        if not text.strip().startswith("#EXTM3U"):
-            return None, None, None
+            log(f"   ⚠️  Manifest fetch returned HTTP {resp.status_code}; will try ffprobe fallback.")
+            fetch_failed = True
+        else:
+            text = resp.text
+            # Strip BOM if present before checking header
+            if not text.lstrip('\ufeff').strip().startswith("#EXTM3U"):
+                log("   ⚠️  Manifest response is not a valid M3U8; will try ffprobe fallback.")
+                fetch_failed = True
+    except Exception as e:
+        log(f"   ⚠️  Manifest fetch failed: {e}; will try ffprobe fallback.")
+        fetch_failed = True
 
-        variants: Dict[int, str] = {}
-        heights = []
+    variants: Dict[int, str] = {}
+    heights: List[int] = []
+    bandwidths: List[Tuple[int, str]] = []  # (bandwidth, variant_url)
+    is_media_playlist = False
+
+    if not fetch_failed and text:
         lines = text.splitlines()
-
         for i, line in enumerate(lines):
-            match = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+            line_stripped = line.strip()
+
+            # Detect media playlist segments (not a master playlist)
+            if line_stripped.startswith("#EXTINF"):
+                is_media_playlist = True
+
+            # --- Resolution parsing ---
+            match = re.search(r'RESOLUTION=(\d+)x(\d+)', line_stripped)
             if match:
                 height = int(match.group(2))
                 heights.append(height)
-                # Next non-comment line is the variant URL
-                if i + 1 < len(lines):
-                    variant_url = lines[i + 1].strip()
-                    if variant_url and not variant_url.startswith("#"):
-                        variants[height] = urllib.parse.urljoin(master_url, variant_url)
+                # Scan forward for the next non-comment, non-empty line (variant URL)
+                variant_url = None
+                for j in range(i + 1, len(lines)):
+                    candidate = lines[j].strip()
+                    if not candidate:
+                        continue
+                    if candidate.startswith("#"):
+                        continue
+                    variant_url = candidate
+                    break
+                if variant_url:
+                    variants[height] = urllib.parse.urljoin(master_url, variant_url)
+                continue
 
-        if not heights:
-            return None, None, None
+            # --- Bandwidth parsing (fallback metadata) ---
+            bw_match = re.search(r'BANDWIDTH=(\d+)', line_stripped)
+            if bw_match:
+                bandwidth = int(bw_match.group(1))
+                variant_url = None
+                for j in range(i + 1, len(lines)):
+                    candidate = lines[j].strip()
+                    if not candidate:
+                        continue
+                    if candidate.startswith("#"):
+                        continue
+                    variant_url = candidate
+                    break
+                if variant_url:
+                    bandwidths.append((bandwidth, urllib.parse.urljoin(master_url, variant_url)))
 
-        max_height = max(heights)
-        caps = {
-            1080: CONFIG.get('speed_cap_1080', '2.5M'),
-            720:  CONFIG.get('speed_cap_720',  '2M'),
-            480:  CONFIG.get('speed_cap_480',  '1.5M'),
-            360:  CONFIG.get('speed_cap_360',  '1M'),
-        }
+    # --- Fallback 1: estimate height from bandwidth ---
+    if not heights and bandwidths:
+        log("   🔍 No RESOLUTION tags found; estimating from BANDWIDTH...")
+        for bw, vurl in bandwidths:
+            est_height = _bandwidth_to_height(bw)
+            heights.append(est_height)
+            if est_height not in variants:
+                variants[est_height] = vurl
+            # Prefer the higher bandwidth for the same estimated height
+            else:
+                existing_bw = next((b for b, u in bandwidths if u == variants[est_height]), 0)
+                if bw > existing_bw:
+                    variants[est_height] = vurl
 
-        if max_height >= 1080:
-            speed = caps[1080]
-        elif max_height >= 720:
-            speed = caps[720]
-        elif max_height >= 480:
-            speed = caps[480]
-        else:
-            speed = caps[360]
+    # --- Fallback 2: ffprobe the URL directly ---
+    if not heights:
+        log("   🔍 Probing resolution with ffprobe...")
+        probe = _probe_resolution(master_url, referer, cookies)
+        if probe:
+            width, height = probe
+            heights.append(height)
+            variants[height] = master_url
+            log(f"   🎛️  ffprobe detected {height}p stream → PRO speed cap")
+        elif bandwidths:
+            # ffprobe on master failed but we have bandwidth variants; try ffprobe on the highest bandwidth variant
+            best_variant = max(bandwidths, key=lambda x: x[0])[1]
+            probe = _probe_resolution(best_variant, referer, cookies)
+            if probe:
+                width, height = probe
+                heights.append(height)
+                variants[height] = best_variant
+                log(f"   🎛️  ffprobe detected {height}p stream (via variant) → PRO speed cap")
+        elif is_media_playlist:
+            # Media playlist with no variants — already tried ffprobe on master_url above
+            pass
 
-        log(f"   🎛️  Detected {max_height}p stream → PRO speed cap: {speed}")
-        return speed, variants, max_height
-    except Exception as e:
-        log(f"   ⚠️  Manifest parsing failed: {e}")
+    if not heights:
+        log("   ⚠️  Could not detect resolution via manifest, bandwidth, or ffprobe.")
         return None, None, None
+
+    max_height = max(heights)
+    caps = {
+        1080: CONFIG.get('speed_cap_1080', '2.5M'),
+        720:  CONFIG.get('speed_cap_720',  '2M'),
+        480:  CONFIG.get('speed_cap_480',  '1.5M'),
+        360:  CONFIG.get('speed_cap_360',  '1M'),
+    }
+
+    if max_height >= 1080:
+        speed = caps[1080]
+    elif max_height >= 720:
+        speed = caps[720]
+    elif max_height >= 480:
+        speed = caps[480]
+    else:
+        speed = caps[360]
+
+    log(f"   🎛️  Detected {max_height}p stream → PRO speed cap: {speed}")
+    return speed, variants, max_height
 
 
 def get_speed_for_resolution(master_url: str, referer: str = None, cookies: dict = None) -> Optional[str]:
@@ -1174,10 +1325,22 @@ class MasterM3U8Finder:
             return process.returncode == 0 and any(os.path.exists(os.path.join(save_dir, f"{save_name}{ext}")) for ext in ['.mkv', '.ts', '.mp4'])
         except Exception as e:
             log(f"❌ N_m3u8DL-RE download error: {e}")
+            if process is not None and process.returncode is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                _kill_process_tree(process.pid)
             return False
         finally:
             if process is not None:
                 _active_download_processes.discard(process)
+                # Safety net: if the process is still alive at this point, force-kill it
+                if process.returncode is None:
+                    try:
+                        _kill_process_tree(process.pid)
+                    except Exception:
+                        pass
 
     async def capture(self, start_url: str, headless: bool = False) -> Tuple[Optional[str], str, Optional[str], str]:
         """
@@ -2192,12 +2355,37 @@ async def get_season_episodes(imdb_id: str, season: int, page=None) -> int:
             await browser.close()
             return 0
 
+def _kill_process_tree(pid: int):
+    """Kill a process and all its descendants. Windows-aware."""
+    if sys.platform == 'win32':
+        try:
+            # taskkill /T kills the process and all child processes
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=10,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+
+
 def terminate_all_downloads():
     """Force-terminate all active N_m3u8DL-RE download processes and clean up the download lock."""
     for proc in list(_active_download_processes):
         try:
             if proc.returncode is None:
-                proc.kill()
+                # Try graceful terminate first, then force-kill the whole tree
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                _kill_process_tree(proc.pid)
                 log("🛑 Terminated active download process.")
         except Exception:
             pass
