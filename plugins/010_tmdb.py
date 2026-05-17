@@ -310,18 +310,28 @@ def get_best_image_path(image_list, language='en'):
     if lang_images:
         lang_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
         return lang_images[0]['file_path']
-    all_images = [img for img in image_list if img.get('file_path')]
-    if all_images:
-        all_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
-        return all_images[0]['file_path']
+    # Fallback to English, then neutral
+    for fallback in ['en', None]:
+        fb_images = [img for img in image_list if img.get('iso_639_1') == fallback and img.get('file_path')]
+        if fb_images:
+            fb_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
+            return fb_images[0]['file_path']
     return None
 
 def get_best_fanart_asset(asset_list, name):
     if not asset_list: 
         return None, None
+    
+    pref_lang = CONFIG.get('language', 'en')
+    # Filter by preferred language, then English, then neutral
+    for lang_filter in [pref_lang, 'en', '']:
+        filtered = [a for a in asset_list if a.get('lang', '').lower() == lang_filter.lower()]
+        if filtered:
+            filtered.sort(key=lambda x: int(x.get('likes', 0)), reverse=True)
+            return filtered[0]['url'], os.path.splitext(filtered[0]['url'])[1]
+    # Absolute fallback: highest likes regardless of language
     asset_list.sort(key=lambda x: int(x.get('likes', 0)), reverse=True)
-    url = asset_list[0]['url']
-    return url, os.path.splitext(url)[1]
+    return asset_list[0]['url'], os.path.splitext(asset_list[0]['url'])[1]
 
 def verify_season_exists(show_id, season_num):
     """NEW: Verify the TV show actually has the requested season before selecting it."""
@@ -593,9 +603,13 @@ def fetch_and_download_all_movie_assets(movie_id, media_dir, media_filepath=None
     fanart_data = fetch_fanart_assets('movie', movie_id)
     
     try:
+        pref_lang = CONFIG.get('language', 'en')
         tmdb_image_data = requests.get(
             tmdb_images_url, 
-            params={'api_key': CONFIG.get('tmdb_api_key')}, 
+            params={
+                'api_key': CONFIG.get('tmdb_api_key'),
+                'include_image_language': f"{pref_lang},en,null"
+            }, 
             timeout=10
         ).json()
     except: 
@@ -654,9 +668,13 @@ def fetch_and_download_all_show_assets(show_id, show_dir, show_info):
     fanart_data = fetch_fanart_assets('tv', show_id)
     
     try:
+        pref_lang = CONFIG.get('language', 'en')
         tmdb_image_data = requests.get(
             tmdb_images_url, 
-            params={'api_key': CONFIG.get('tmdb_api_key')}, 
+            params={
+                'api_key': CONFIG.get('tmdb_api_key'),
+                'include_image_language': f"{pref_lang},en,null"
+            }, 
             timeout=10
         ).json()
     except: 
@@ -796,7 +814,7 @@ def fetch_and_download_season_assets(show_id, season_num, show_dir, season_dir):
         if not url and api_key:
             tmdb_url = f"{TMDB_API_BASE}/tv/{show_id}/season/{season_num}/images"
             try:
-                resp = requests.get(tmdb_url, params={'api_key': api_key}, timeout=10).json()
+                resp = requests.get(tmdb_url, params={'api_key': api_key, 'include_image_language': f"{CONFIG.get('language', 'en')},en,null"}, timeout=10).json()
                 tmdb_assets = resp.get(tmdb_key, [])
                 path = get_best_image_path(tmdb_assets)
                 if path:
@@ -809,7 +827,7 @@ def fetch_and_download_season_assets(show_id, season_num, show_dir, season_dir):
         if not url and label == 'fanart' and api_key:
             ep_img_url = f"{TMDB_API_BASE}/tv/{show_id}/season/{season_num}/episode/1/images"
             try:
-                ep_resp = requests.get(ep_img_url, params={'api_key': api_key}, timeout=10).json()
+                ep_resp = requests.get(ep_img_url, params={'api_key': api_key, 'include_image_language': f"{CONFIG.get('language', 'en')},en,null"}, timeout=10).json()
                 stills = ep_resp.get('stills', [])
                 path = get_best_image_path(stills)
                 if path:

@@ -292,9 +292,13 @@ class SettingsWindow(ctk.CTkToplevel):
         else: self.headless_chk.deselect()
 
         self.dark_mode_switch = ctk.CTkSwitch(row4, text="Dark Mode", command=self._toggle_theme)
-        self.dark_mode_switch.pack(side="left")
+        self.dark_mode_switch.pack(side="left", padx=(0, 20))
         if self.parent.config.get("theme", "dark") == "dark": self.dark_mode_switch.select()
         else: self.dark_mode_switch.deselect()
+
+        self.lang_opt = ctk.CTkOptionMenu(row4, values=["en", "es", "fr", "de", "it", "ja", "ko", "pt", "ru", "zh"], width=70)
+        self.lang_opt.set(self.parent.config.get("language", "en"))
+        self.lang_opt.pack(side="left")
 
         # --- SCP / Remote Transfer Section ---
         ctk.CTkLabel(tab, text="📡 Remote Transfer (SFTP)", font=("Segoe UI", 13, "bold")).grid(row=5, column=0, columnspan=3, padx=15, pady=(25, 10), sticky="w")
@@ -568,6 +572,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.parent.config["tv_template"] = self.tv_tpl_entry.get().strip()
         self.parent.config["auto_speed_by_resolution"] = (self.pro_switch.get() == 1)
         self.parent.config["preferred_resolution"] = self.pref_res.get()
+        self.parent.config["language"] = self.lang_opt.get()
         for key, dd in self.tier_widgets.items():
             self.parent.config[key] = dd.get()
         for key, ent in self.tool_entries.items():

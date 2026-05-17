@@ -782,7 +782,13 @@ def _bandwidth_to_height(bandwidth: int) -> int:
         return 240
 
 
-def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = None) -> Tuple[Optional[str], Optional[Dict[int, str]], Optional[int]]:
+def extract_base_url(url: str) -> str:
+    """Return the scheme + netloc (base domain) from a URL."""
+    parsed = urllib.parse.urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = None, fallback_text: str = None) -> Tuple[Optional[str], Optional[Dict[int, str]], Optional[int]]:
     """
     Fetch the master.m3u8 manifest and inspect variant streams for RESOLUTION + variant URLs.
     Falls back to bandwidth estimation and ffprobe probing if resolution tags are missing
@@ -797,33 +803,41 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
     if referer:
         headers["Referer"] = referer
 
-    text = ""
-    fetch_failed = False
-    try:
-        session = requests.Session()
-        if cookies:
-            session.cookies.update(cookies)
-        resp = session.get(master_url, headers=headers, timeout=10)
-        if not resp.ok:
-            log(f"   ⚠️  Manifest fetch returned HTTP {resp.status_code}; will try ffprobe fallback.")
-            fetch_failed = True
-        else:
-            text = resp.text
-            # Strip BOM if present before checking header
-            if not text.lstrip('\ufeff').strip().startswith("#EXTM3U"):
-                log("   ⚠️  Manifest response is not a valid M3U8; will try ffprobe fallback.")
-                fetch_failed = True
-    except Exception as e:
-        log(f"   ⚠️  Manifest fetch failed: {e}; will try ffprobe fallback.")
-        fetch_failed = True
-
     variants: Dict[int, str] = {}
     heights: List[int] = []
     bandwidths: List[Tuple[int, str]] = []  # (bandwidth, variant_url)
     is_media_playlist = False
 
-    if not fetch_failed and text:
-        lines = text.splitlines()
+    manifest_text = ""
+    if fallback_text:
+        manifest_text = fallback_text
+        log("   📄 Using locally saved manifest for parsing.")
+    else:
+        text = ""
+        fetch_failed = False
+        try:
+            session = requests.Session()
+            if cookies:
+                session.cookies.update(cookies)
+            resp = session.get(master_url, headers=headers, timeout=10)
+            if not resp.ok:
+                log(f"   ⚠️  Manifest fetch returned HTTP {resp.status_code}; will try fallback.")
+                fetch_failed = True
+            else:
+                text = resp.text
+                # Strip BOM if present before checking header
+                if not text.lstrip('\ufeff').strip().startswith("#EXTM3U"):
+                    log("   ⚠️  Manifest response is not a valid M3U8; will try fallback.")
+                    fetch_failed = True
+        except Exception as e:
+            log(f"   ⚠️  Manifest fetch failed: {e}; will try fallback.")
+            fetch_failed = True
+
+        if not fetch_failed and text:
+            manifest_text = text
+
+    if manifest_text:
+        lines = manifest_text.splitlines()
         for i, line in enumerate(lines):
             line_stripped = line.strip()
 
@@ -927,18 +941,18 @@ def parse_master_manifest(master_url: str, referer: str = None, cookies: dict = 
     return speed, variants, max_height
 
 
-def get_speed_for_resolution(master_url: str, referer: str = None, cookies: dict = None) -> Optional[str]:
+def get_speed_for_resolution(master_url: str, referer: str = None, cookies: dict = None, fallback_text: str = None) -> Optional[str]:
     """Convenience wrapper that returns only the speed cap."""
-    speed, _, _ = parse_master_manifest(master_url, referer, cookies)
+    speed, _, _ = parse_master_manifest(master_url, referer, cookies, fallback_text)
     return speed
 
 
-def get_variant_for_resolution(master_url: str, prefer_height: int, referer: str = None, cookies: dict = None) -> Optional[str]:
+def get_variant_for_resolution(master_url: str, prefer_height: int, referer: str = None, cookies: dict = None, fallback_text: str = None) -> Optional[str]:
     """
     Parse master.m3u8 and return the variant URL closest to prefer_height.
     Returns None if parsing fails or no variants found.
     """
-    speed, variants, max_height = parse_master_manifest(master_url, referer, cookies)
+    speed, variants, max_height = parse_master_manifest(master_url, referer, cookies, fallback_text)
     if not variants:
         return None
 
@@ -1197,6 +1211,33 @@ class MasterM3U8Finder:
         except Exception as e:
             log(f"   ⚠️ Failed to save cookies: {e}")
 
+    async def save_local_manifest(self, context, master_url: str) -> Optional[str]:
+        """Fetch master.m3u8 via browser context and save locally for parsing/download."""
+        if not master_url or not master_url.startswith("http"):
+            return None
+        try:
+            response = await context.request.get(master_url, timeout=10000)
+            if response.ok:
+                text = await response.text()
+                if text.lstrip('\ufeff').strip().startswith("#EXTM3U"):
+                    temp_dir = os.path.join(get_base_dir(), "temp_downloads")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    safe_name = self.sanitize_filename(self.title) if self.title and self.title != "Unknown" else "manifest"
+                    local_path = os.path.join(temp_dir, f"{safe_name}_master.m3u8")
+                    with open(local_path, 'w', encoding='utf-8') as f:
+                        f.write(text)
+                    self.local_manifest_path = local_path
+                    self.base_url = extract_base_url(master_url)
+                    log(f"   💾 Saved local manifest: {local_path}")
+                    return local_path
+                else:
+                    log("   ⚠️  Browser manifest response is not a valid M3U8.")
+            else:
+                log(f"   ⚠️  Browser manifest fetch returned HTTP {response.status}.")
+        except Exception as e:
+            log(f"   ⚠️  Failed to save local manifest: {e}")
+        return None
+
     async def get_working_url(self, context) -> Optional[str]:
         """Test all new candidates in parallel and return the first working one."""
         new_candidates = [u for u in self.candidates if u not in self.bad_candidates and u != self.master_url]
@@ -1239,8 +1280,19 @@ class MasterM3U8Finder:
         use_auto_select = True
         preferred = CONFIG.get('preferred_resolution', 'Auto')
 
+        # Check for locally saved manifest from browser session
+        local_manifest = getattr(self, 'local_manifest_path', None)
+        base_url = getattr(self, 'base_url', None)
+        manifest_text = None
+        if local_manifest and os.path.exists(local_manifest):
+            try:
+                with open(local_manifest, 'r', encoding='utf-8') as f:
+                    manifest_text = f.read()
+            except Exception as e:
+                log(f"   ⚠️  Failed to read local manifest: {e}")
+
         # Parse manifest once for both speed cap and resolution preference
-        speed, variants, max_height = parse_master_manifest(master_url, referer, getattr(self, 'cookies_dict', None))
+        speed, variants, max_height = parse_master_manifest(master_url, referer, getattr(self, 'cookies_dict', None), fallback_text=manifest_text)
 
         if CONFIG.get('auto_speed_by_resolution', False):
             if speed:
@@ -1263,6 +1315,17 @@ class MasterM3U8Finder:
             except Exception as e:
                 log(f"   ⚠️  Resolution preference failed: {e}")
 
+        # Use local manifest + base-url if available and auto-selecting
+        base_url_flag = []
+        if local_manifest and base_url:
+            if use_auto_select:
+                download_url = local_manifest
+                base_url_flag = ["--base-url", base_url]
+                log(f"   📁 Using local manifest with base URL: {base_url}")
+            else:
+                # Variant URL is already absolute from parse_master_manifest
+                pass
+
         cmd = [
             binary_path,
             download_url,
@@ -1272,7 +1335,7 @@ class MasterM3U8Finder:
             "--del-after-done",
             "--download-retry-count", "20",
             '--mux-after-done', 'format=mkv:ffmpeg_args="-fflags +genpts"'
-        ]
+        ] + base_url_flag
 
         if use_auto_select:
             cmd.insert(2, "--auto-select")  # Insert after binary_path and URL
@@ -1573,6 +1636,7 @@ class MasterM3U8Finder:
                 if self.title == "Unknown":
                     self.title = await self.extract_title(page)
                 log(f"   ⚡ Master URL found! Finalizing...")
+                await self.save_local_manifest(context, self.master_url)
                 await self.save_cookies(context)
                 await context.close()
                 return self.master_url, self.title, start_url, "success"
@@ -1732,16 +1796,15 @@ class MasterM3U8Finder:
                 verified = await self.get_working_url(context)
                 if verified:
                     self.master_url = verified
+                    await self.save_local_manifest(context, self.master_url)
 
-            # Add a default return to satisfy linter
             referer = page.url if 'page' in locals() else ""
             status = "success" if self.master_url else "timeout"
-            return self.master_url, self.title, referer, status
-            
+            if self.master_url and not getattr(self, 'local_manifest_path', None):
+                await self.save_local_manifest(context, self.master_url)
             await self.save_cookies(context)
             await context.close()
-            
-            return self.master_url, self.title, start_url, "success"
+            return self.master_url, self.title, referer, status
 
     def set_download_speed(self, speed):
         self.download_speed = speed
@@ -1947,8 +2010,17 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
             auto_flag = "--auto-select"
             limit_speed = CONFIG.get('download_speed', 'Unlimited')
 
+            # Load local manifest if browser saved one
+            manifest_text = None
+            if getattr(finder, 'local_manifest_path', None) and os.path.exists(finder.local_manifest_path):
+                try:
+                    with open(finder.local_manifest_path, 'r', encoding='utf-8') as f_manifest:
+                        manifest_text = f_manifest.read()
+                except Exception:
+                    pass
+
             # Parse manifest once for both speed and variant selection
-            speed, variants, _ = parse_master_manifest(master_url, referer, getattr(finder, 'cookies_dict', None))
+            speed, variants, _ = parse_master_manifest(master_url, referer, getattr(finder, 'cookies_dict', None), fallback_text=manifest_text)
             if speed and CONFIG.get('auto_speed_by_resolution', False):
                 limit_speed = speed
 
@@ -1966,6 +2038,14 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                 except Exception:
                     pass
 
+            # If using local manifest for auto-select, reflect that in the command file
+            local_manifest = getattr(finder, 'local_manifest_path', None)
+            base_url = getattr(finder, 'base_url', None)
+            base_url_cmd = ""
+            if local_manifest and base_url and auto_flag == "--auto-select":
+                cmd_url = local_manifest
+                base_url_cmd = f" --base-url \"{base_url}\""
+
             ref_header = f" --header \"Referer: {referer}\"" if referer else ""
             
             if limit_speed != "Unlimited":
@@ -1973,7 +2053,7 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
             else:
                 speed_flags = "--thread-count 8 --download-retry-count 10"
 
-            f.write(f"Command: N_m3u8DL-RE \"{cmd_url}\" --save-dir \"{temp_dir}\" --save-name \"{os.path.splitext(filename)[0]}\" --header \"User-Agent: {USER_AGENT}\"{ref_header} {auto_flag} --binary-merge --del-after-done {speed_flags}\n")
+            f.write(f"Command: N_m3u8DL-RE \"{cmd_url}\" --save-dir \"{temp_dir}\" --save-name \"{os.path.splitext(filename)[0]}\" --header \"User-Agent: {USER_AGENT}\"{ref_header} {auto_flag} --binary-merge --del-after-done{base_url_cmd} {speed_flags}\n")
             
         log(f"\n💾 Details saved to {txt_filename}")
         
@@ -2016,6 +2096,15 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                 if os.path.exists(cookie_file):
                     try:
                         os.remove(cookie_file)
+                    except:
+                        pass
+                
+                # Cleanup local manifest after download attempt
+                local_manifest = getattr(finder, 'local_manifest_path', None)
+                if local_manifest and os.path.exists(local_manifest):
+                    try:
+                        os.remove(local_manifest)
+                        log(f"   🧹 Cleaned up local manifest.")
                     except:
                         pass
                 
