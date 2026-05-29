@@ -1352,14 +1352,20 @@ class MasterM3U8Finder:
             "--binary-merge",
             "--del-after-done",
             "--download-retry-count", "20",
+            "--http-request-timeout", "300",
             '--mux-after-done', 'format=mkv:ffmpeg_args="-fflags +genpts"'
         ] + base_url_flag
 
         if use_auto_select:
             cmd.insert(2, "--auto-select")  # Insert after binary_path and URL
 
-        # if referer:
-        #     cmd.extend(["--header", f"Referer: {referer}"])
+        if referer:
+            cmd.extend(["--header", f"Referer: {referer}"])
+
+        cookies = getattr(self, 'cookies_dict', None)
+        if cookies:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            cmd.extend(["--header", f"Cookie: {cookie_str}"])
 
         if limit_speed != "Unlimited":
             # Speed control requires thread-count 1 for strict enforcement on many servers
