@@ -921,6 +921,9 @@ class M3U8DownloaderApp(ctk.CTk):
         
         ctk.CTkLabel(self.log_header_frame, text="Activity Log", font=("", 13, "bold")).pack(side="left")
 
+        self.copy_log_btn = ctk.CTkButton(self.log_header_frame, text="Copy", width=60, height=24, fg_color="transparent", border_width=1, command=self.copy_logs)
+        self.copy_log_btn.pack(side="right", padx=(0, 5))
+        
         self.clear_log_btn = ctk.CTkButton(self.log_header_frame, text="Clear", width=60, height=24, fg_color="transparent", border_width=1, command=self.clear_logs)
         self.clear_log_btn.pack(side="right")
 
@@ -974,6 +977,14 @@ class M3U8DownloaderApp(ctk.CTk):
     def log_callback(self, message):
         # We don't print to console here as the core logic's log() already does it via setup_interface
         self.log_queue.put(message)
+
+    def copy_logs(self):
+        self.log_box.configure(state="normal")
+        text = self.log_box.get("1.0", "end-1c")
+        self.log_box.configure(state="disabled")
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.log_callback("📋 Log copied to clipboard.\n")
 
     def clear_logs(self):
         self.log_box.configure(state="normal")
@@ -1211,13 +1222,15 @@ class M3U8DownloaderApp(ctk.CTk):
             capture_m3u8.ensure_playwright_browsers()
             
             async with async_playwright() as p:
-                if sys.platform.startswith('linux'):
+                if sys.platform.startswith('linux') or sys.platform == 'win32':
                     exec_path = capture_m3u8.get_browser_executable("firefox")
-                    if not exec_path: return
-                    browser = await p.firefox.launch(headless=True, executable_path=exec_path)
                 else:
                     exec_path = capture_m3u8.get_browser_executable("chromium")
-                    if not exec_path: return
+                if not exec_path: return
+                family = capture_m3u8.get_browser_family(exec_path)
+                if family == "firefox":
+                    browser = await p.firefox.launch(headless=True, executable_path=exec_path)
+                else:
                     browser = await p.chromium.launch(headless=True, executable_path=exec_path)
                 
                 shared_page = await browser.new_page(user_agent=capture_m3u8.USER_AGENT)
@@ -1425,6 +1438,10 @@ class M3U8DownloaderApp(ctk.CTk):
                         self.log_callback(f"⚠️ File missing or too small after processing. Not marking complete.\n")
                 elif success == "404":
                     self.log_callback(f"⏭️ Skipping 404 item...\n")
+                elif success is False:
+                    self.log_callback(f"\n⏸️  Queue paused — episode failed. Fix cookies or connection, then restart queue to resume.\n")
+                    self.update_status_bar("Paused", message="Episode failed — queue stopped")
+                    break
                 
                 if i < len(queue_list) - 1:
                     wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])
@@ -1638,6 +1655,7 @@ class M3U8DownloaderApp(ctk.CTk):
     def run_movie_batch(self, movies):
         self.log_callback(f"🚀 Starting batch download for {len(movies)} movies...\n")
         headless = self.config.get("headless", True)
+        completed_log = os.path.join(capture_m3u8.get_log_dir(), "completed.log")
         
         try:
             for i, m in enumerate(movies):
@@ -1657,6 +1675,10 @@ class M3U8DownloaderApp(ctk.CTk):
                             self.log_callback("   ✅ Marked as complete.\n")
                         except Exception as e:
                             self.log_callback(f"   ⚠️ Failed to update completed.log: {e}\n")
+                elif success is False:
+                    self.log_callback(f"\n⏸️  Queue paused — {m['title']} failed. Fix cookies or connection, then restart queue to resume.\n")
+                    self.update_status_bar("Paused", message="Movie failed — queue stopped")
+                    break
                 
                 if i < len(movies) - 1:
                     wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])
@@ -1855,6 +1877,9 @@ class M3U8DownloaderApp(ctk.CTk):
                         self.log_callback(f"⚠️ File missing or too small after processing. Not marking complete.\n")
                 elif success == "404":
                     self.log_callback(f"⏭️ Skipping 404 item...\n")
+                else:
+                    self.log_callback(f"\n⏸️  Queue paused — download failed. Fix cookies or connection, then restart queue to resume.\n")
+                    break
                 
                 if i < len(urls) - 1:
                     wait = random.randint(self.config['min_cooldown'], self.config['max_cooldown'])

@@ -14,6 +14,7 @@ from tkinter import messagebox
 from contextlib import redirect_stdout
 from PIL import Image, ImageStat
 import io
+import argparse
 
 # --- Parity Imports ---
 if os.name == 'nt':
@@ -63,7 +64,13 @@ class DualLogger:
 
 def get_log_dir():
     """Returns the absolute path to the Logs directory, creating it if needed."""
-    log_dir = os.path.join(get_base_dir(), "binaries", "Logs")
+    # Use configured log location if provided, otherwise default to tools/logs
+    log_location = CONFIG.get('log_dir', '').strip() if CONFIG else ''
+    if log_location:
+        log_dir = os.path.abspath(log_location)
+    else:
+        log_dir = os.path.join(get_base_dir(), "tools", "logs")
+    
     if not os.path.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)
     return log_dir
@@ -73,55 +80,82 @@ def setup_logging():
     log_file = os.path.join(log_dir, 'TMDB.log')
     if not isinstance(sys.stdout, DualLogger):
         sys.stdout = DualLogger(log_file, sys.stdout)
-    print(f"\n\n{'='*60}")
-    print(f"📄 PLUGIN LOG STARTED: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*60}\n")
 
 def load_config():
+    """Load configuration from tmdb.json (read-only)."""
     global CONFIG
-    config_path = os.path.join(get_base_dir(), 'config.json')
+    
+    # Config file lives next to the script or executable
+    if getattr(sys, 'frozen', False):
+        config_dir = os.path.dirname(sys.executable)
+    else:
+        config_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    config_path = os.path.join(config_dir, 'tmdb.json')
+    
+    defaults = {
+        "movies_dir": "Movie",
+        "tv_dir": "TV",
+        "unsorted_dir": "Unsorted",
+        "ffmpeg_path": "",
+        "ffprobe_path": "",
+        "mkvpropedit_path": "",
+        "language": "en",
+        "log_dir": ""
+    }
+    
+    CONFIG = dict(defaults)
+    
+    if not os.path.exists(config_path):
+        msg = f"[010_tmdb] Critical: Config file not found: {config_path}"
+        print(msg)
+        try:
+            root = tk.Tk(); root.withdraw()
+            messagebox.showerror("TMDB Plugin Configuration", msg)
+            root.destroy()
+        except: pass
+        sys.exit(1)
+    
     try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                CONFIG = json.load(f)
+        with open(config_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
         
-        required = {
-            "movies_dir": "Movie",
-            "tv_dir": "TV",
-            "unsorted_dir": "Unsorted",
-            "ffmpeg_path": "",
-            "ffprobe_path": "",
-            "mkvpropedit_path": "",
-            "tmdb_api_key": "",
-            "fanart_api_key": "",
-            "omdb_api_key": "",
-            "language": "en"
-        }
+        # Map tmdb.json nested structure to flat CONFIG
+        CONFIG['tmdb_api_key'] = data.get('TMDB', {}).get('API_KEY', '')
+        CONFIG['fanart_api_key'] = data.get('fanart.tv', {}).get('API_KEY', '')
+        CONFIG['omdb_api_key'] = data.get('OMDb', {}).get('API_KEY', '')
         
-        updated = False
-        for key, default in required.items():
-            if key not in CONFIG:
-                CONFIG[key] = default
-                updated = True
-                
-        if updated:
-            try:
-                import capture_m3u8
-                capture_m3u8.save_config(CONFIG)
-                print(f"🔌 [010_tmdb] Updated config.json with missing fields (safely).")
-            except Exception as e:
-                print(f"🔌 [010_tmdb] Error writing config.json: {e}")
-
-        if not CONFIG.get('tmdb_api_key'):
-            msg = "🔌 [010_tmdb] Critical: 'tmdb_api_key' is missing in config.json."
-            print(msg)
-            try:
-                root = tk.Tk(); root.withdraw()
-                messagebox.showerror("TMDB Plugin Configuration", msg)
-                root.destroy()
-            except: pass
+        paths = data.get('PATH', {})
+        # Preserve explicit null for UNSORTED (disabled), otherwise use default if missing
+        for path_key, config_key, default_val in [
+            ('TV', 'tv_dir', defaults['tv_dir']),
+            ('MOVIE', 'movies_dir', defaults['movies_dir']),
+            ('UNSORTED', 'unsorted_dir', defaults['unsorted_dir'])
+        ]:
+            if path_key in paths:
+                CONFIG[config_key] = paths[path_key]
+            else:
+                CONFIG[config_key] = default_val
+        
+        # Optional top-level settings override defaults
+        for key in ['ffmpeg_path', 'ffprobe_path', 'mkvpropedit_path', 'language', 'log_dir']:
+            if key in data:
+                CONFIG[key] = data[key]
+        
+        print(f"[010_tmdb] Loaded config: {config_path}")
     except Exception as e:
-        print(f"🔌 [010_tmdb] Warning: Could not load config.json: {e}")
+        print(f"[010_tmdb] Error loading config: {e}")
+        sys.exit(1)
+    
+    if not CONFIG.get('tmdb_api_key'):
+        msg = "[010_tmdb] Critical: TMDb API Key is missing in tmdb.json."
+        print(msg)
+        try:
+            root = tk.Tk(); root.withdraw()
+            messagebox.showerror("TMDB Plugin Configuration", msg)
+            root.destroy()
+        except: pass
+        sys.exit(1)
 
 def check_dependencies():
     """Verify presence of ffmpeg, ffprobe, and mkvpropedit."""
@@ -192,27 +226,37 @@ FILENAME_REGEX = re.compile(
     [Ss](?:eason)?\s*(?P<season>\d+)  # Season
     [.\s_-]*                          # Flexible separators
     [Ee](?:pisode)?\s*(?P<episode>\d+) # Episode
-    .*$ 
+    (?P<tv_tail>.*)$ 
     | 
     ^
     (?P<movie_title>.+?) 
     [.\s_\(-]+ 
     (?P<movie_year>(?:19|20)\d{2}) 
-    (?:[.\s_\)-]|$).* """,
+    (?P<movie_tail>.*)$ """,
     re.VERBOSE | re.IGNORECASE
 )
+
+def _normalize_separators(text):
+    """Replace common ASCII and Unicode separators/bullets with spaces."""
+    # Covers dots, underscores, brackets, and common bullets/dashes.
+    text = re.sub(r'[._\[\]·•‐‑‒–—―]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
 
 def parse_filename(filename):
     """Parse filename to extract media info. FIXED to handle years and multi-word titles."""
     basename = os.path.basename(filename)
     name_no_ext = os.path.splitext(basename)[0]
     
-    # FIXED: Also strip parentheses so regex can match them as separate tokens if needed,
-    # but we keep them for year extraction via regex groups
-    name_cleaned = re.sub(r'[._\[\]]', ' ', name_no_ext).strip()
+    # Normalize separators/bullets/dashes so the regex can treat them as whitespace.
+    name_cleaned = _normalize_separators(name_no_ext)
+
+    # Normalize common episode patterns: 2x03 -> S02E03
+    name_cleaned = re.sub(r'\b(\d+)[xX](\d+)\b', lambda m: f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}", name_cleaned)
 
     # Clean standard plugin suffixes to improve TMDB search accuracy
-    for suffix in ["Sanitized", "DualAudio", "Normalized"]:
+    for suffix in _PLUGIN_SUFFIXES:
         name_cleaned = re.sub(rf'\b{suffix}\b', '', name_cleaned, flags=re.IGNORECASE)
     name_cleaned = re.sub(r'\s+', ' ', name_cleaned).strip()
     
@@ -235,24 +279,39 @@ def parse_filename(filename):
         # If we didn't get year from middle, use the one from end of title
         if not year and extracted_year:
             year = extracted_year
+        
+        # Extract edition/version info, then strip quality/group tags from search title
+        edition, search_title = _extract_edition(search_title)
+        search_title = _clean_search_title(search_title)
             
         return {
             'type': 'tv', 
             'search_title': search_title, 
             'season_num': int(data['season']), 
             'episode_num': int(data['episode']),
-            'year': year
+            'year': year,
+            'edition': edition
         }
 
     # MOVIE PARSING
     elif data.get('movie_title'):
         raw_title = data['movie_title'].strip()
-        year = int(data.get('movie_year') or 0)
+        year = int(data.get('movie_year') or 0) or None
         search_title = re.sub(r'[\s._\(]+$', '', raw_title).strip()
+        search_title, _ = _clean_title_and_year_smart(search_title)
+        
+        # Extract edition/version info from both title and trailing text (e.g., after year),
+        # then strip quality/group tags from search title
+        edition_title, search_title = _extract_edition(search_title)
+        edition_tail, _ = _extract_edition(data.get('movie_tail', ''))
+        edition = ' '.join(filter(None, [edition_title, edition_tail]))
+        search_title = _clean_search_title(search_title)
+        
         return {
             'type': 'movie', 
             'search_title': search_title, 
-            'year': year
+            'year': year,
+            'edition': edition
         }
     return None
 
@@ -269,17 +328,109 @@ def _clean_title_and_year_smart(title_str):
         search_title = search_title[:paren_year_match.start()].strip()
         return search_title, found_year
 
-    # Look for standalone year at end: Title 2022
-    trailing_year_match = re.search(r'\s(19|20)\d{2}$', search_title)
-    if trailing_year_match:
-        found_year = int(trailing_year_match.group(0).strip())
-        search_title = search_title[:trailing_year_match.start()].strip()
+    # Look for year followed by trailing punctuation/separator at end: Title 2022 ·
+    punct_year_match = re.search(r'\s((?:19|20)\d{2})\W*$', search_title)
+    if punct_year_match:
+        found_year = int(punct_year_match.group(1))
+        search_title = search_title[:punct_year_match.start()].strip()
         return search_title, found_year
     
     # Remove country codes like (US), (UK) but keep the text
     search_title = re.sub(r'\([A-Z]{2}\)', '', search_title).strip()
     
     return search_title, found_year
+
+
+# Tags commonly found in filenames that should not be sent to TMDB
+_QUALITY_TAGS = [
+    r'1080p', r'720p', r'2160p', r'4K', r'UHD', r'\d+p',
+    r'BluRay', r'WEB[-]?DL', r'WEBRip', r'HDRip', r'BRRip', r'DVDRip', r'DVD', r'HDTV',
+    r'REMUX', r'WEB', r'HD', r'SD',
+    r'x264', r'x265', r'HEVC', r'H\.264', r'H\.265', r'AVC', r'VC-1',
+]
+
+_AUDIO_TAGS = [
+    r'AAC', r'AC3', r'DD[Pp]?[\d\.]+', r'DTS', r'TrueHD', r'Atmos', r'5\.1', r'7\.1',
+    r'2\.0', r'EAC3',
+]
+
+_EDITION_TAGS = [
+    r'Extended', r'Director\'?s Cut', r'Theatrical', r'Final Cut', r'IMAX',
+    r'Unrated', r'Remastered', r'Special Edition', r'Limited Edition',
+    r'Part One', r'Part Two', r'Part 1', r'Part 2',
+]
+
+_PLUGIN_SUFFIXES = ["Sanitized", "DualAudio", "Normalized", "CleanAudio", "HQ"]
+
+
+def _extract_edition(title_str):
+    """Extract edition/version keywords to preserve in final filename."""
+    matches = []
+    for pattern in _EDITION_TAGS:
+        for match in re.finditer(rf'\b({pattern})\b', title_str, re.IGNORECASE):
+            matches.append((match.start(), match.group(1)))
+    
+    if not matches:
+        return '', title_str
+    
+    # Preserve original order
+    matches.sort(key=lambda x: x[0])
+    edition_parts = [m[1] for m in matches]
+    
+    # Remove matches from title (in reverse order to preserve string indices)
+    remaining = title_str
+    for _, part in sorted(matches, key=lambda x: x[0], reverse=True):
+        remaining = re.sub(rf'\b{re.escape(part)}\b', '', remaining, flags=re.IGNORECASE, count=1)
+    
+    remaining = re.sub(r'\s+', ' ', remaining).strip()
+    return ' '.join(edition_parts), remaining
+
+
+def _clean_search_title(title_str):
+    """Prepare title for TMDB search by stripping quality, group, codec tags."""
+    cleaned = title_str
+    
+    # Remove standard plugin suffixes
+    for suffix in _PLUGIN_SUFFIXES:
+        cleaned = re.sub(rf'\b{suffix}\b', '', cleaned, flags=re.IGNORECASE)
+    
+    # Remove bracketed/parenthesized release group tags
+    cleaned = re.sub(r'[\(\[\{][^\)\]\}]{1,35}[\)\]\}]', ' ', cleaned)
+    
+    # Remove quality, codec, and audio tags
+    for tag in _QUALITY_TAGS + _AUDIO_TAGS:
+        cleaned = re.sub(rf'\b{tag}\b', ' ', cleaned, flags=re.IGNORECASE)
+    
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    cleaned = re.sub(r'\W+$', '', cleaned).strip()
+    return cleaned
+
+
+def _aggressive_title_clean(title):
+    """Last-resort title cleaning for TMDB search (removes years and leftover tags)."""
+    if not title:
+        return title
+
+    cleaned = _normalize_separators(title)
+    # Remove standard plugin suffixes
+    for suffix in _PLUGIN_SUFFIXES:
+        cleaned = re.sub(rf'\b{suffix}\b', '', cleaned, flags=re.IGNORECASE)
+
+    # Remove bracketed/parenthesized release group tags
+    cleaned = re.sub(r'[\(\[\{][^\)\]\}]{1,35}[\)\]\}]', ' ', cleaned)
+
+    # Remove any standalone 19xx/20xx year numbers
+    cleaned = re.sub(r'\b(19|20)\d{2}\b', ' ', cleaned)
+
+    # Remove quality, codec, and audio tags
+    for tag in _QUALITY_TAGS + _AUDIO_TAGS:
+        cleaned = re.sub(rf'\b{tag}\b', ' ', cleaned, flags=re.IGNORECASE)
+
+    # Collapse whitespace and strip trailing punctuation
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    cleaned = re.sub(r'\W+$', '', cleaned).strip()
+    return cleaned
+
 
 # ==============================================================================
 # 🔍 TMDB API LOGIC
@@ -310,28 +461,18 @@ def get_best_image_path(image_list, language='en'):
     if lang_images:
         lang_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
         return lang_images[0]['file_path']
-    # Fallback to English, then neutral
-    for fallback in ['en', None]:
-        fb_images = [img for img in image_list if img.get('iso_639_1') == fallback and img.get('file_path')]
-        if fb_images:
-            fb_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
-            return fb_images[0]['file_path']
+    all_images = [img for img in image_list if img.get('file_path')]
+    if all_images:
+        all_images.sort(key=lambda x: x.get('vote_count', 0), reverse=True)
+        return all_images[0]['file_path']
     return None
 
 def get_best_fanart_asset(asset_list, name):
     if not asset_list: 
         return None, None
-    
-    pref_lang = CONFIG.get('language', 'en')
-    # Filter by preferred language, then English, then neutral
-    for lang_filter in [pref_lang, 'en', '']:
-        filtered = [a for a in asset_list if a.get('lang', '').lower() == lang_filter.lower()]
-        if filtered:
-            filtered.sort(key=lambda x: int(x.get('likes', 0)), reverse=True)
-            return filtered[0]['url'], os.path.splitext(filtered[0]['url'])[1]
-    # Absolute fallback: highest likes regardless of language
     asset_list.sort(key=lambda x: int(x.get('likes', 0)), reverse=True)
-    return asset_list[0]['url'], os.path.splitext(asset_list[0]['url'])[1]
+    url = asset_list[0]['url']
+    return url, os.path.splitext(url)[1]
 
 def verify_season_exists(show_id, season_num):
     """NEW: Verify the TV show actually has the requested season before selecting it."""
@@ -388,6 +529,46 @@ def input_with_timeout(prompt, timeout=45):
         else: 
             return 's'
 
+def _score_candidate(candidate, parsed_data):
+    """Score a TMDB result by how well it matches the parsed filename."""
+    score = 0
+    candidate_name = candidate.get('name') or candidate.get('title', '')
+    search_title = parsed_data.get('search_title', '').lower().strip()
+    candidate_lower = candidate_name.lower().strip()
+    
+    if not search_title or not candidate_lower:
+        return score
+    
+    # Title match
+    if candidate_lower == search_title:
+        score += 100
+    elif candidate_lower.startswith(search_title + ' '):
+        score += 80
+    elif ' ' in search_title and search_title in candidate_lower:
+        score += 60
+    elif search_title in candidate_lower:
+        score += 40
+    
+    # Year proximity
+    filename_year = parsed_data.get('year') or 0
+    if filename_year:
+        date = candidate.get('first_air_date') or candidate.get('release_date', '')
+        candidate_year = int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None
+        if candidate_year:
+            if candidate_year == filename_year:
+                score += 30
+            elif abs(candidate_year - filename_year) <= 1:
+                score += 15
+    
+    # Popularity tie-breaker (capped)
+    score += min(candidate.get('popularity', 0) * 0.5, 15)
+    
+    # Vote average tie-breaker (capped)
+    score += min(candidate.get('vote_average', 0), 10)
+    
+    return score
+
+
 def prompt_user_selection(results, media_type):
     if not results: 
         return None
@@ -421,20 +602,55 @@ def fetch_tmdb_metadata(parsed_data):
         'include_adult': 'false'
     }
     
+    year = parsed_data.get('year')
+    year_label = str(year) if year else 'any'
+    print(f"SEARCH: TMDB {endpoint.upper()} query='{parsed_data['search_title']}' filename_year={year_label}")
+    
     # FIXED: Properly pass year parameters
-    if parsed_data.get('year'):
+    if year:
         if parsed_data['type'] == 'tv': 
-            params['first_air_date_year'] = parsed_data['year']
+            params['first_air_date_year'] = year
         else: 
-            params['year'] = parsed_data['year']
+            params['year'] = year
         
     try:
         resp = requests.get(url, params=params, timeout=10).json()
         results = resp.get('results', [])
-        return results
     except Exception as e:
         print(f"🔌 [010_tmdb] API Error: {e}")
-    return []
+        return []
+    
+    # Fallback: if a year filter produced no results, retry without it.
+    # The year in a filename is often the episode air year for TV or a wrong
+    # metadata year, not necessarily the series/movie release year.
+    if not results and parsed_data.get('year'):
+        print(f"WARNING: No results with year {parsed_data['year']}. Retrying without year filter...")
+        params.pop('year', None)
+        params.pop('first_air_date_year', None)
+        try:
+            resp = requests.get(url, params=params, timeout=10).json()
+            results = resp.get('results', [])
+        except Exception as e:
+            print(f"🔌 [010_tmdb] API Error on fallback: {e}")
+            return []
+    
+    # Final fallback: aggressively clean the title (strip years, trailing
+    # punctuation, and leftover tags) and search without a year filter.
+    if not results:
+        aggressive_title = _aggressive_title_clean(parsed_data['search_title'])
+        if aggressive_title and aggressive_title != parsed_data['search_title']:
+            print(f"WARNING: No results. Retrying with cleaned title: {aggressive_title}")
+            params['query'] = aggressive_title
+            params.pop('year', None)
+            params.pop('first_air_date_year', None)
+            try:
+                resp = requests.get(url, params=params, timeout=10).json()
+                results = resp.get('results', [])
+            except Exception as e:
+                print(f"🔌 [010_tmdb] API Error on final fallback: {e}")
+                return []
+    
+    return results
 
 def fetch_tmdb_episode(tmdb_id, season, episode):
     api_key = CONFIG.get('tmdb_api_key')
@@ -444,21 +660,52 @@ def fetch_tmdb_episode(tmdb_id, season, episode):
     except:
         return None
 
-def fetch_omdb_data(title, year=None, media_type=None):
+def _is_placeholder_title(title):
+    """Detect generic/placeholder titles from IMDb that should not override TMDB."""
+    if not title or not title.strip():
+        return True
+    t = title.strip()
+    # Generic episode placeholders: "Episode #3.3", "Episode 3", "Ep. 3", "Ep 1.2"
+    if re.match(r'^(Episode|Ep\.?)\s*#?\s*\d+(\.\d+)?$', t, re.IGNORECASE):
+        return True
+    # Just a number like "3" or "3.3"
+    if re.match(r'^\d+(\.\d+)?$', t):
+        return True
+    # Common generic placeholders
+    if t.lower() in ('tbd', 'untitled', 'n/a', 'unknown'):
+        return True
+    return False
+
+
+def fetch_omdb_data(title, year=None, media_type=None, season=None, episode=None, imdb_id=None):
     if not CONFIG.get('omdb_api_key'): 
         return None
     params = {
         'apikey': CONFIG['omdb_api_key'], 
-        't': title, 
         'plot': 'full',
         'r': 'json'
     }
+    
+    # Prefer IMDB ID for precision, fall back to title
+    if imdb_id:
+        params['i'] = imdb_id
+    elif title:
+        params['t'] = title
+    else:
+        return None
+    
     if year: 
         params['y'] = str(year)
     if media_type == 'movie': 
         params['type'] = 'movie'
     elif media_type == 'tv': 
         params['type'] = 'series'
+    
+    # Episode-specific lookup
+    if season is not None:
+        params['Season'] = str(season)
+    if episode is not None:
+        params['Episode'] = str(episode)
 
     try:
         response = requests.get("http://www.omdbapi.com/", params=params, timeout=10)
@@ -505,6 +752,24 @@ def create_tmdb_link(target_dir, media_type, tmdb_id):
 # ==============================================================================
 # 🎬 PROCESSING & ORGANIZATION
 # ==============================================================================
+
+def _unique_target_path(target_dir, base_filename, ext):
+    """Generate a unique target path, appending - Copy, - Copy (2), etc."""
+    target_path = os.path.join(target_dir, f"{base_filename}{ext}")
+    if not os.path.exists(target_path):
+        return target_path
+    
+    counter = 1
+    while True:
+        if counter == 1:
+            candidate = f"{base_filename} - Copy{ext}"
+        else:
+            candidate = f"{base_filename} - Copy ({counter}){ext}"
+        candidate_path = os.path.join(target_dir, candidate)
+        if not os.path.exists(candidate_path):
+            return candidate_path
+        counter += 1
+
 
 def set_mkv_title(filepath, title):
     if not MKVPROPEDIT_PATH: 
@@ -603,13 +868,9 @@ def fetch_and_download_all_movie_assets(movie_id, media_dir, media_filepath=None
     fanart_data = fetch_fanart_assets('movie', movie_id)
     
     try:
-        pref_lang = CONFIG.get('language', 'en')
         tmdb_image_data = requests.get(
             tmdb_images_url, 
-            params={
-                'api_key': CONFIG.get('tmdb_api_key'),
-                'include_image_language': f"{pref_lang},en,null"
-            }, 
+            params={'api_key': CONFIG.get('tmdb_api_key')}, 
             timeout=10
         ).json()
     except: 
@@ -668,13 +929,9 @@ def fetch_and_download_all_show_assets(show_id, show_dir, show_info):
     fanart_data = fetch_fanart_assets('tv', show_id)
     
     try:
-        pref_lang = CONFIG.get('language', 'en')
         tmdb_image_data = requests.get(
             tmdb_images_url, 
-            params={
-                'api_key': CONFIG.get('tmdb_api_key'),
-                'include_image_language': f"{pref_lang},en,null"
-            }, 
+            params={'api_key': CONFIG.get('tmdb_api_key')}, 
             timeout=10
         ).json()
     except: 
@@ -814,7 +1071,7 @@ def fetch_and_download_season_assets(show_id, season_num, show_dir, season_dir):
         if not url and api_key:
             tmdb_url = f"{TMDB_API_BASE}/tv/{show_id}/season/{season_num}/images"
             try:
-                resp = requests.get(tmdb_url, params={'api_key': api_key, 'include_image_language': f"{CONFIG.get('language', 'en')},en,null"}, timeout=10).json()
+                resp = requests.get(tmdb_url, params={'api_key': api_key}, timeout=10).json()
                 tmdb_assets = resp.get(tmdb_key, [])
                 path = get_best_image_path(tmdb_assets)
                 if path:
@@ -827,7 +1084,7 @@ def fetch_and_download_season_assets(show_id, season_num, show_dir, season_dir):
         if not url and label == 'fanart' and api_key:
             ep_img_url = f"{TMDB_API_BASE}/tv/{show_id}/season/{season_num}/episode/1/images"
             try:
-                ep_resp = requests.get(ep_img_url, params={'api_key': api_key, 'include_image_language': f"{CONFIG.get('language', 'en')},en,null"}, timeout=10).json()
+                ep_resp = requests.get(ep_img_url, params={'api_key': api_key}, timeout=10).json()
                 stills = ep_resp.get('stills', [])
                 path = get_best_image_path(stills)
                 if path:
@@ -1000,29 +1257,32 @@ def get_tmdb_title(parsed_data, original_filepath):
         print(f"⚠️ No TMDB results found for: {parsed_data['search_title']}")
         return None
         
+    print(f"   RESULTS: TMDB returned {len(results)} candidate(s)")
+    
     # NEW: Filter TV results by season existence
     if parsed_data['type'] == 'tv':
         valid_results = []
         for r in results[:5]:  # Check top 5 results
             show_id = r['id']
             show_name = r.get('name', 'Unknown')
+            first_air = r.get('first_air_date', '????')[:4]
             
             if verify_season_exists(show_id, parsed_data['season_num']):
+                print(f"   OK: Season {parsed_data['season_num']} confirmed for: {show_name} ({first_air})")
                 valid_results.append(r)
             else:
-                print(f"⛔ Rejected: {show_name} (Does not have Season {parsed_data['season_num']})")
+                print(f"   REJECTED: {show_name} ({first_air}) - No Season {parsed_data['season_num']}")
         
         if valid_results:
             results = valid_results
         elif results:
-            print(f"⚠️ Warning: None of the top results have Season {parsed_data['season_num']}")
+            print(f"   ⚠️ Warning: None of the top results have Season {parsed_data['season_num']}")
             # Continue with original results but user will have to pick carefully
     
     selected = None
     
-    # Smart Matching Logic
+    # 1. TV-only: Try to match by episode name in filename (very high confidence)
     if parsed_data['type'] == 'tv' and len(results) > 1:
-        # Try to match by episode name in filename
         for candidate in results[:3]:
             try:
                 ep_url = f"{TMDB_API_BASE}/tv/{candidate['id']}/season/{parsed_data['season_num']}/episode/{parsed_data['episode_num']}"
@@ -1031,40 +1291,47 @@ def get_tmdb_title(parsed_data, original_filepath):
                     params={'api_key': api_key}, 
                     timeout=5
                 ).json()
-                ep_name = ep_resp.get('name', '').lower()
-                if ep_name and ep_name in basename.lower().replace('_', ' '):
-                    print(f"\n⚡ Smart Match by Episode Name: {candidate.get('name')}")
+                ep_name = ep_resp.get('name', '')
+                ep_name_lower = ep_name.lower()
+                candidate_name = candidate.get('name', 'Unknown')
+                if ep_name_lower and ep_name_lower in basename.lower().replace('_', ' '):
+                    print(f"\n⚡ Smart Match by Episode Name: {candidate_name} -> '{ep_name}'")
                     selected = candidate
                     break
+                elif ep_name:
+                    print(f"   INFO: Episode '{ep_name}' on {candidate_name} does not match filename")
             except: 
                 continue
 
-    # Year Prioritization
-    if not selected and len(results) > 1 and parsed_data.get('year'):
-        for r in results:
-            date = r.get('first_air_date' if parsed_data['type'] == 'tv' else 'release_date', '')
-            if date.startswith(str(parsed_data['year'])):
-                print(f"\n⚡ Year Priority Match: {r.get('name') or r.get('title')} ({date[:4]})")
-                selected = r
-                break
-
-    # FIXED: Strict Exact Match (prevent "Fire" matching "Fire Country")
+    # 2. Score candidates and either auto-select or prompt
     if not selected:
-        first = results[0]
-        first_name = first.get('name') or first.get('title', '')
-        search_lower = parsed_data['search_title'].lower().strip()
-        first_lower = first_name.lower().strip()
+        scored = [(_score_candidate(r, parsed_data), r) for r in results]
+        scored.sort(key=lambda x: x[0], reverse=True)
         
-        # Exact match OR result starts with search term followed by space/end
-        if first_lower == search_lower:
-            print(f"\n⚡ Exact Match: {first_name}")
-            selected = first
-        elif len(results) == 1:
-            print(f"\n⚡ Single Result: {first_name}")
-            selected = first
-
-    if not selected: 
-        selected = prompt_user_selection(results, parsed_data['type'])
+        print("\n   CANDIDATE SCORES:")
+        for score, candidate in scored[:5]:
+            name = candidate.get('name') or candidate.get('title', 'Unknown')
+            date = candidate.get('first_air_date') or candidate.get('release_date', '????')
+            print(f"      {score:>6.1f}  {name} ({date[:4]})")
+        
+        best_score, best = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else 0
+        gap = best_score - second_score
+        best_name = best.get('name') or best.get('title', 'Unknown')
+        
+        if len(results) == 1:
+            selected = best
+            print(f"\n⚡ Single Result: {best_name}")
+        elif best_score >= 100:
+            selected = best
+            print(f"\n⚡ High-Confidence Match: {best_name} (score {best_score:.1f})")
+        elif gap >= 25 and best_score >= 70:
+            selected = best
+            print(f"\n⚡ Best Match (gap {gap:.1f}): {best_name} (score {best_score:.1f})")
+        else:
+            print(f"\n   UNCLEAR: best score {best_score:.1f}, gap {gap:.1f}. Prompting user...")
+            selected = prompt_user_selection([r for _, r in scored], parsed_data['type'])
+    
     if not selected: 
         return None
 
@@ -1092,6 +1359,26 @@ def get_tmdb_title(parsed_data, original_filepath):
         if 'success' in ep_info and not ep_info['success']:
             print(f"❌ Episode S{s_num:02d}E{e_num:02d} not found in API")
             return None
+        
+        # Cross-reference episode title with IMDb (OMDb) if available
+        omdb_ep = fetch_omdb_data(
+            title=show_info['name'],
+            media_type='tv',
+            season=s_num,
+            episode=e_num,
+            imdb_id=show_info.get('external_ids', {}).get('imdb_id')
+        )
+        if omdb_ep and omdb_ep.get('Title'):
+            tmdb_title = ep_info.get('name', '')
+            omdb_title = omdb_ep['Title']
+            
+            if _is_placeholder_title(omdb_title):
+                print(f"   TITLE CROSS-CHECK: IMDb returned placeholder '{omdb_title}'. Keeping TMDb title '{tmdb_title}'.")
+            elif omdb_title.lower().strip() != tmdb_title.lower().strip():
+                print(f"   TITLE CROSS-CHECK: TMDb='{tmdb_title}' -> IMDb='{omdb_title}'. Using IMDb.")
+                ep_info['name'] = omdb_title
+            else:
+                print(f"   TITLE CROSS-CHECK: TMDb and IMDb agree on '{omdb_title}'")
             
         ep_info['show_name'] = show_info['name']
         
@@ -1112,9 +1399,8 @@ def get_tmdb_title(parsed_data, original_filepath):
         target_path = os.path.join(target_dir, f"{base_fn}{ext}")
         
         if os.path.exists(target_path):
-            date_str = datetime.datetime.now().strftime('%m.%d.%Y')
-            target_path = os.path.join(target_dir, f"{base_fn} - {date_str}{ext}")
-            print(f"   --> ⚠️ File exists! Adding date suffix.")
+            target_path = _unique_target_path(target_dir, base_fn, ext)
+            print(f"   --> ⚠️ File exists! Using unique name: {os.path.basename(target_path)}")
         
         print(f"   🚚 Moving to: {target_path}")
         shutil.move(original_filepath, target_path)
@@ -1145,17 +1431,21 @@ def get_tmdb_title(parsed_data, original_filepath):
             str(CONFIG.get('movies_dir') or os.path.join(get_base_dir(), 'Movie')), 
             f"{safe_title} ({movie_year})"
         )
+        
+        # Preserve edition/version label (e.g., Extended, Director's Cut) in filename
+        edition = parsed_data.get('edition', '').strip()
+        edition_safe = re.sub(r'[\\/:*?"<>|]', '_', edition)
         base_filename = f"{safe_title} ({movie_year})"
+        if edition_safe:
+            base_filename += f" - {edition_safe}"
         
         os.makedirs(target_dir, exist_ok=True)
         ext = os.path.splitext(original_filepath)[1]
         target_path = os.path.join(target_dir, f"{base_filename}{ext}")
         
         if os.path.exists(target_path):
-            date_str = datetime.datetime.now().strftime("%m.%d.%Y")
-            new_filename = f"{base_filename} - {date_str}{ext}"
-            target_path = os.path.join(target_dir, new_filename)
-            print(f"   --> ⚠️ File exists! Renaming to: {new_filename}")
+            target_path = _unique_target_path(target_dir, base_filename, ext)
+            print(f"   --> ⚠️ File exists! Using unique name: {os.path.basename(target_path)}")
         
         print(f"   🚚 Moving to: {target_path}")
         shutil.move(original_filepath, target_path)
@@ -1167,9 +1457,17 @@ def get_tmdb_title(parsed_data, original_filepath):
 
     return None
 
-def process(file_path):
+def process(file_path, tv_dir=None, movie_dir=None, unsorted_dir=None):
     load_config()
     setup_logging()
+    
+    # Allow command-line overrides for output paths (config.json is the default)
+    if tv_dir:
+        CONFIG['tv_dir'] = tv_dir
+    if movie_dir:
+        CONFIG['movies_dir'] = movie_dir
+    if unsorted_dir:
+        CONFIG['unsorted_dir'] = unsorted_dir
     
     if not CONFIG.get('tmdb_api_key'): 
         return file_path
@@ -1184,7 +1482,7 @@ def process(file_path):
         print(f"⚠️ Could not parse filename format")
         return file_path
     
-    print(f"   Parsed: {parsed['search_title']} ({parsed.get('year') or 'Unknown Year'}) "
+    print(f"   Parsed: title='{parsed['search_title']}', filename_year={parsed.get('year') or 'none'}, "
           f"S{parsed.get('season_num', 0):02d}E{parsed.get('episode_num', 0):02d}")
     
     final_path = get_tmdb_title(parsed, file_path)
@@ -1194,11 +1492,9 @@ def process(file_path):
         unsorted = CONFIG.get('unsorted_dir')
         if unsorted:
             os.makedirs(unsorted, exist_ok=True)
-            target = os.path.join(unsorted, os.path.basename(file_path))
-            # Avoid collision in unsorted
-            if os.path.exists(target):
-                base, ext = os.path.splitext(target)
-                target = f"{base}_{int(time.time())}{ext}"
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            ext = os.path.splitext(file_path)[1]
+            target = _unique_target_path(unsorted, base_name, ext)
             print(f"   🚚 Moving to Unsorted: {target}")
             shutil.move(file_path, target)
             return target
@@ -1207,8 +1503,30 @@ def process(file_path):
     return final_path
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        process(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="Lookup metadata, rename, and organize media files using TMDB."
+    )
+    parser.add_argument('filepath', type=str, nargs='?', help='Path to media file')
+    parser.add_argument('-to', '--tv-output', type=str, help='Override TV output folder')
+    parser.add_argument('-mo', '--movie-output', type=str, help='Override Movie output folder')
+    parser.add_argument('-unsortedout', '--unsorted-output', type=str, help='Override Unsorted folder')
+    
+    def _show_usage_and_wait():
+        parser.print_help()
+        print("\nPress Enter to Exit...", end='')
+        input()
+    
+    if len(sys.argv) == 1:
+        _show_usage_and_wait()
     else:
-        load_config()
-        print(f"🔌 [010_tmdb] Configuration check complete.")
+        args = parser.parse_args()
+        
+        if args.filepath:
+            process(
+                args.filepath,
+                tv_dir=args.tv_output,
+                movie_dir=args.movie_output,
+                unsorted_dir=args.unsorted_output
+            )
+        else:
+            _show_usage_and_wait()

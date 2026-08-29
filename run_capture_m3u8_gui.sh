@@ -49,25 +49,46 @@ if [ ! -d "$VENV_DIR" ]; then
     fi
 fi
 
-# 5. Activate and Install Dependencies
+# 5. Activate and Install Python Dependencies
 echo "Activating virtual environment..."
 source "$VENV_DIR/bin/activate"
 
 if [ -f "requirements.txt" ]; then
-    echo "Updating dependencies..."
+    echo "Updating Python dependencies..."
     pip install --upgrade pip
     pip install -r requirements.txt
-    echo "[OK] Dependencies are ready."
+    echo "[OK] Python dependencies are ready."
 fi
 
-# 6. Launch the GUI
+# 6. Install Playwright Browser Engines and System Dependencies (first-run only)
+echo ""
+echo "Checking Playwright browser engines..."
+if [ ! -d "$HOME/.cache/ms-playwright" ]; then
+    echo "First-run: Installing Playwright system dependencies..."
+    playwright install-deps 2>/dev/null
+    echo "First-run: Downloading Playwright browser engines (this only happens once)..."
+    playwright install firefox
+    echo "[OK] Browser engines downloaded."
+else
+    echo "[OK] Browser engines already installed."
+fi
+
+# 7. Download Toolchain Binaries (FFmpeg, N_m3u8DL-RE, mkvmerge)
+echo ""
+echo "Checking toolchain binaries..."
+if [ ! -f "binaries/N_m3u8DL-RE" ] && [ ! -f "binaries/N_m3u8DL-RE.exe" ]; then
+    echo "First-run: Downloading required binaries (FFmpeg, N_m3u8DL-RE, mkvmerge)..."
+    python3 capture_m3u8.py -U
+    echo "[OK] Binaries downloaded."
+else
+    echo "[OK] Binaries already present."
+fi
+
+# 8. Launch the GUI
 echo ""
 echo "Launching Capture M3U8 GUI..."
-# Running with the venv's python explicitly
-python3 capture_m3u8_gui.py & 
+python3 capture_m3u8_gui.py &
 
-# Deactivate is not strictly necessary in a subshell but good practice
-# however, since we are backgrounding the process, we just exit the script.
 echo "Process started in background. You may close this terminal."
 
 exit 0

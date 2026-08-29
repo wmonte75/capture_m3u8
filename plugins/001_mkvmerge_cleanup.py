@@ -69,10 +69,12 @@ def process(file_path):
     # Note: We no longer strictly require .mkv extension here because 
     # mkvmerge can convert .ts or .mp4 files into sanitized .mkv files.
 
-    print(f"🔌 [Plugin] Sanitizing Container: {os.path.basename(file_path)}")
-
     base_name, extension = os.path.splitext(file_path)
-    output_path = f"{base_name}_Sanitized{extension}"
+    # mkvmerge always outputs a Matroska container. 
+    # We force the output extension to .mkv to ensure correct file typing.
+    output_path = f"{base_name}_Sanitized.mkv"
+
+    print(f"🔌 [Plugin] Sanitizing/Remuxing to MKV: {os.path.basename(file_path)}")
 
     # Ensure output doesn't exist to prevent 'already exists' errors
     if os.path.exists(output_path):

@@ -17,6 +17,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import redirect_stdout, suppress
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Dict, Optional, Set, Any, Union, Callable
 
 # Soft import for optional SCP/SFTP support
@@ -68,6 +69,186 @@ if getattr(sys, 'frozen', False):
     cert_path = certifi.where()
     os.environ["SSL_CERT_FILE"] = cert_path
     os.environ["REQUESTS_CA_BUNDLE"] = cert_path
+
+def _read_zen_cookie_rows():
+    """Read raw cookie rows from Zen Browser's SQLite database."""
+    import sqlite3
+    import glob
+
+    profiles_dir = os.path.join(os.environ.get("APPDATA", ""), "zen", "Profiles")
+    if not os.path.exists(profiles_dir):
+        return []
+
+    cookie_files = glob.glob(os.path.join(profiles_dir, "*", "cookies.sqlite"))
+    if not cookie_files:
+        return []
+
+    cookies_path = cookie_files[0]
+    temp_copy = cookies_path + ".tmp"
+    try:
+        shutil.copy2(cookies_path, temp_copy)
+    except Exception:
+        return []
+
+    try:
+        conn = sqlite3.connect(temp_copy)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT host, name, value, path, expiry, isSecure, isHttpOnly, sameSite
+            FROM moz_cookies
+            WHERE host LIKE '%cloudnestra%' 
+               OR host LIKE '%cloudorchestranova%'
+               OR host LIKE '%vidsrcme%'
+               OR host LIKE '%cloudflare%'
+               OR host LIKE '%yonder%'
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+    finally:
+        try:
+            os.remove(temp_copy)
+        except Exception:
+            pass
+
+
+def get_zen_cookies():
+    """Return Zen cookies as {name: value} dict for N_m3u8DL-RE."""
+    import time
+    rows = _read_zen_cookie_rows()
+    now = int(time.time())
+    result = {}
+    for row in rows:
+        host, name, value, path, expiry, secure, httponly, same_site = row
+        if expiry > 3000000000:
+            expiry = expiry // 1000
+        if expiry != 0 and expiry < now - 3600:
+            continue
+        result[name] = value
+    return result
+
+
+def get_zen_cookies_for_playwright():
+    """Return Zen cookies in Playwright context.add_cookies() format."""
+    import time
+    rows = _read_zen_cookie_rows()
+    now = int(time.time())
+    result = []
+    for row in rows:
+        host, name, value, path, expiry, secure, httponly, same_site = row
+        if expiry > 3000000000:
+            expiry = expiry // 1000
+        if expiry != 0 and expiry < now - 3600:
+            continue
+        # Firefox sameSite: 0=None, 1=Lax, 2=Strict
+        ss_map = {0: "None", 1: "Lax", 2: "Strict"}
+        same_site_str = ss_map.get(same_site, "None")
+        # Playwright expects expires in Unix seconds; -1 for session
+        expires = float(expiry) if expiry else -1.0
+        result.append({
+            "name": name,
+            "value": value,
+            "domain": host,
+            "path": path or "/",
+            "expires": expires,
+            "httpOnly": bool(httponly),
+            "secure": bool(secure),
+            "sameSite": same_site_str,
+        })
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SeleniumBase UC mode capture (Cloudflare bypass)
+# ---------------------------------------------------------------------------
+
+_uc_executor = None
+
+def _get_uc_executor():
+    global _uc_executor
+    if _uc_executor is None:
+        _uc_executor = ThreadPoolExecutor(max_workers=1)
+    return _uc_executor
+
+_M3U8_HOOK_JS = """
+window._capturedM3u8s = [];
+const _f = window.fetch;
+window.fetch = function(u,...a){
+    if (typeof u === 'string' && u.includes('.m3u8')) window._capturedM3u8s.push(u);
+    return _f.apply(this, [u, ...a]);
+};
+const _x = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function(m, u, ...r){
+    if (typeof u === 'string' && u.includes('.m3u8')) window._capturedM3u8s.push(u);
+    return _x.apply(this, [m, u, ...r]);
+};
+"""
+
+def _sync_capture_uc(start_url: str, referer: str = None):
+    """Synchronous SeleniumBase UC capture. Returns (master_url, cookies_dict, title)."""
+    from seleniumbase import SB
+    import json
+
+    with SB(uc=True, headless=False) as sb:
+        drv = sb.driver
+        try:
+            drv.minimize_window()
+        except Exception:
+            pass
+
+        # Inject m3u8 hook before any navigation
+        drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _M3U8_HOOK_JS})
+
+        if referer:
+            drv.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": referer}})
+
+        sb.open(start_url)
+
+        # Wait out Cloudflare challenge if present
+        for _ in range(15):
+            page_src = drv.page_source.lower()
+            if "challenge" not in drv.title.lower() and "just a moment" not in page_src and "turnstile" not in page_src:
+                break
+            sb.sleep(1)
+
+        # Wait for player to load and request m3u8
+        sb.sleep(3)
+        m3u8_url = None
+        for _ in range(20):
+            m3u8s = drv.execute_script("return window._capturedM3u8s;")
+            if m3u8s:
+                for url in m3u8s:
+                    if 'master.m3u8' in url.lower():
+                        m3u8_url = url
+                        break
+                if not m3u8_url:
+                    m3u8_url = m3u8s[0]
+                break
+            sb.sleep(1)
+
+        # Fallback: try to extract from page source
+        if not m3u8_url:
+            try:
+                matches = re.findall(r'https?://[^\s"\']+master\.m3u8[^\s"\']*', drv.page_source, re.IGNORECASE)
+                if matches:
+                    m3u8_url = matches[0]
+            except Exception:
+                pass
+
+        title = drv.title or "Unknown"
+        cookies = drv.get_cookies()
+        cookies_dict = {c["name"]: c["value"] for c in cookies}
+
+        return m3u8_url, cookies_dict, title
+
+
+async def capture_with_seleniumbase(start_url: str, referer: str = None):
+    """Async wrapper for SeleniumBase UC capture."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_get_uc_executor(), _sync_capture_uc, start_url, referer)
+
 
 def get_browser_executable(browser_type="chromium"):
     """
@@ -981,13 +1162,33 @@ def setup_interface(config_data=None, log_cb=None, input_cb=None, status_cb=None
     if status_cb: STATUS_CALLBACK = status_cb
     if stop_cb: STOP_CALLBACK = stop_cb
 
+# Global session log file (created on first use)
+SESSION_LOG_FILE = None
+
+def _get_session_log_file():
+    """Return the path to the current session log, creating it if needed."""
+    global SESSION_LOG_FILE
+    if SESSION_LOG_FILE is None:
+        log_dir = get_log_dir()
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        SESSION_LOG_FILE = os.path.join(log_dir, f"session_{timestamp}.log")
+    return SESSION_LOG_FILE
+
 def log(msg, end="\n"):
-    if LOG_CALLBACK: LOG_CALLBACK(str(msg) + end)
+    text = str(msg) + end
+    # Always persist to the session log file
+    try:
+        with open(_get_session_log_file(), "a", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+    if LOG_CALLBACK: 
+        LOG_CALLBACK(text)
     else:
         # Use sys.__stdout__ directly to bypass redirection and avoid infinite recursion in CLI
         try:
             if sys.__stdout__:
-                sys.__stdout__.write(str(msg) + end)
+                sys.__stdout__.write(text)
                 sys.__stdout__.flush()
             else:
                 print(msg, end=end)
@@ -1138,6 +1339,7 @@ class MasterM3U8Finder:
         self.bad_candidates: Set[str] = set()
         self.title: str = "Unknown"
         self._verify_in_progress: bool = False
+        self.candidate_referers: Dict[str, str] = {}
         
     def find_ytdlp(self):
         """Check if yt-dlp exists with priority: Config -> Root -> System Path"""
@@ -1225,33 +1427,46 @@ class MasterM3U8Finder:
             log(f"   ⚠️ Failed to save cookies: {e}")
 
     async def save_local_manifest(self, context, master_url: str) -> Optional[str]:
-        """Fetch master.m3u8 via browser context and save locally for parsing/download."""
+        """Fetch master.m3u8 via browser context or direct request and save locally for parsing/download."""
         if not master_url or not master_url.startswith("http"):
             return None
         try:
-            response = await context.request.get(master_url, timeout=10000)
-            if response.ok:
-                text = await response.text()
-                if text.lstrip('\ufeff').strip().startswith("#EXTM3U"):
-                    temp_dir = os.path.join(get_base_dir(), "temp_downloads")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    safe_name = self.sanitize_filename(self.title) if self.title and self.title != "Unknown" else "manifest"
-                    local_path = os.path.join(temp_dir, f"{safe_name}_master.m3u8")
-                    with open(local_path, 'w', encoding='utf-8') as f:
-                        f.write(text)
-                    self.local_manifest_path = local_path
-                    self.base_url = extract_base_url(master_url)
-                    log(f"   💾 Saved local manifest: {local_path}")
-                    return local_path
+            text = None
+            if context is not None:
+                response = await context.request.get(master_url, timeout=10000)
+                if response.ok:
+                    text = await response.text()
                 else:
-                    log("   ⚠️  Browser manifest response is not a valid M3U8.")
+                    log(f"   ⚠️  Browser manifest fetch returned HTTP {response.status}.")
             else:
-                log(f"   ⚠️  Browser manifest fetch returned HTTP {response.status}.")
+                # Fallback: fetch directly with requests when no Playwright context (e.g. SeleniumBase)
+                import requests
+                headers = {"User-Agent": USER_AGENT}
+                if getattr(self, 'cookies_dict', None):
+                    headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies_dict.items())
+                r = requests.get(master_url, headers=headers, timeout=10)
+                if r.status_code == 200:
+                    text = r.text
+                else:
+                    log(f"   ⚠️  Direct manifest fetch returned HTTP {r.status_code}.")
+            if text and text.lstrip('\ufeff').strip().startswith("#EXTM3U"):
+                temp_dir = os.path.join(get_base_dir(), "temp_downloads")
+                os.makedirs(temp_dir, exist_ok=True)
+                safe_name = self.sanitize_filename(self.title) if self.title and self.title != "Unknown" else "manifest"
+                local_path = os.path.join(temp_dir, f"{safe_name}_master.m3u8")
+                with open(local_path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                self.local_manifest_path = local_path
+                self.base_url = extract_base_url(master_url)
+                log(f"   💾 Saved local manifest: {local_path}")
+                return local_path
+            elif text:
+                log("   ⚠️  Manifest response is not a valid M3U8.")
         except Exception as e:
             log(f"   ⚠️  Failed to save local manifest: {e}")
         return None
 
-    async def get_working_url(self, context) -> Optional[str]:
+    async def get_working_url(self, context, referer: str = None) -> Optional[str]:
         """Test all new candidates in parallel and return the first working one."""
         new_candidates = [u for u in self.candidates if u not in self.bad_candidates and u != self.master_url]
         if not new_candidates:
@@ -1262,12 +1477,26 @@ class MasterM3U8Finder:
                 self.bad_candidates.add(url)
                 return None
             try:
+                headers = {}
+                if referer:
+                    headers["Referer"] = referer
                 # 2s timeout for fast rejection
-                response = await context.request.get(url, timeout=2000)
+                response = await context.request.get(url, timeout=2000, headers=headers)
                 if response.ok:
-                    return url
+                    text = await response.text()
+                    # Must actually be an m3u8 manifest, not an HTML error page or decoy
+                    if '#EXTM3U' in text or '#EXT-X-STREAM-INF' in text:
+                        return url
+                    log(f"   ⚠️  Decoy rejected (not m3u8): {url[:80]}...")
+                else:
+                    log(f"   ⚠️  Verification HTTP {response.status} for {url[:80]}...")
+                    # If browser got 403 on re-check but originally found it via on_request,
+                    # the CDN may just block API requests. Trust the browser's discovery.
+                    if response.status == 403:
+                        return url
                 self.bad_candidates.add(url)
-            except:
+            except Exception as e:
+                log(f"   ⚠️  Verification error: {e}")
                 self.bad_candidates.add(url)
             return None
 
@@ -1276,7 +1505,7 @@ class MasterM3U8Finder:
         
         for r in results:
             if r:
-                log(f"   ✅ Verified working: {r[:80]}")
+                log(f"   ✅ Verified working: {r}")
                 return r
         
         return self.master_url if self.master_url else None
@@ -1359,12 +1588,35 @@ class MasterM3U8Finder:
         if use_auto_select:
             cmd.insert(2, "--auto-select")  # Insert after binary_path and URL
 
+        # Pass the same User-Agent the browser used — CDNs often bind tokens to UA
+        cmd.extend(["--header", f"User-Agent: {USER_AGENT}"])
+        # Additional browser-like headers to avoid CDN fingerprint mismatch
+        cmd.extend(["--header", "Accept: */*"])
+        cmd.extend(["--header", "Accept-Language: en-US,en;q=0.5"])
+        cmd.extend(["--header", "Accept-Encoding: gzip, deflate, br"])
+        cmd.extend(["--header", "DNT: 1"])
+        cmd.extend(["--header", "Connection: keep-alive"])
+
         if referer:
             cmd.extend(["--header", f"Referer: {referer}"])
+            # Some CDNs (e.g. palindromepanorama.website) enforce Origin for cross-site segment reqs
+            try:
+                parsed_ref = urllib.parse.urlparse(referer)
+                origin = f"{parsed_ref.scheme}://{parsed_ref.netloc}"
+                cmd.extend(["--header", f"Origin: {origin}"])
+            except Exception:
+                pass
 
         cookies = getattr(self, 'cookies_dict', None)
         if cookies:
-            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            # N_m3u8DL-RE's .NET logger crashes on curly braces in cookie values.
+            # Also remove cf_clearance — it's fingerprint-bound to the browser that earned it
+            # (Zen Firefox vs Playwright Chromium), and sending a mismatched one causes 403.
+            safe_cookies = {
+                k: v for k, v in cookies.items()
+                if '{' not in v and '}' not in v and 'cf_clearance' not in k.lower()
+            }
+            cookie_str = "; ".join(f"{k}={v}" for k, v in safe_cookies.items())
             cmd.extend(["--header", f"Cookie: {cookie_str}"])
 
         if limit_speed != "Unlimited":
@@ -1459,13 +1711,12 @@ class MasterM3U8Finder:
         ensure_playwright_browsers()
 
         async with async_playwright() as p:
-            if sys.platform.startswith('linux'):
+            if sys.platform.startswith('linux') or sys.platform == 'win32':
                 exec_path = get_browser_executable("firefox")
                 if not exec_path:
                     return None, "", None, "error"
-                # Use Firefox on Linux — different TLS/browser fingerprint bypasses
-                # Cloudflare bot detection that blocks Chromium headless on Linux.
-                # Windows/Mac continue to use Chromium (proven working, unchanged).
+                # Use Firefox on Linux and Windows — better Cloudflare bypass,
+                # matches Zen's cookie format, and avoids Chromium detection.
                 context = await p.firefox.launch_persistent_context(
                     user_data_dir,
                     headless=headless,
@@ -1494,7 +1745,7 @@ class MasterM3U8Finder:
                 exec_path = get_browser_executable("chromium")
                 if not exec_path:
                     return None, "", None, "error"
-                # Chromium for Windows / Mac — proven working, unchanged
+                # Chromium for Mac only
                 context = await p.chromium.launch_persistent_context(
                     user_data_dir,
                     headless=headless,
@@ -1507,9 +1758,6 @@ class MasterM3U8Finder:
                         '--disable-features=IsolateOrigins,site-per-process',
                         '--autoplay-policy=no-user-gesture-required',
                         '--disable-blink-features=AutomationControlled',
-                        # Only minimize in headless mode. In visible mode, a minimized window
-                        # prevents Cloudflare from completing its JS challenge → about:blank
-                        *(['--start-minimized'] if headless else []),
                         '--disable-backgrounding-occluded-windows',
                         '--disable-renderer-backgrounding',
                         '--disable-background-timer-throttling',
@@ -1544,8 +1792,16 @@ class MasterM3U8Finder:
             def on_request(request):
                 url = request.url
                 if 'master.m3u8' in url.lower() and url not in self.candidates:
-                    log(f"   🔎 Candidate found: {url[:80]}")
+                    log(f"   🔎 Candidate found: {url}")
                     self.candidates.append(url)
+                    try:
+                        frame = request.frame
+                        if frame:
+                            frame_url = frame.url
+                            if frame_url and frame_url != 'about:blank':
+                                self.candidate_referers[url] = frame_url
+                    except Exception:
+                        pass
 
             context.on("request", on_request)
 
@@ -1596,6 +1852,15 @@ class MasterM3U8Finder:
                 } catch(e) {}
             """)
             
+            # Inject fresh Zen cookies so Cloudflare sees an authenticated session
+            zen_pw_cookies = get_zen_cookies_for_playwright()
+            if zen_pw_cookies:
+                try:
+                    await context.add_cookies(zen_pw_cookies)
+                    log(f"   🔑 Injected {len(zen_pw_cookies)} fresh Zen cookies into browser")
+                except Exception as e:
+                    log(f"   ⚠️  Failed to inject Zen cookies: {e}")
+            
             log("Step 1: Hunting for master.m3u8...")
             # Optimization: Load page concurrently with proactive link sniffing and interaction.
             goto_task = asyncio.create_task(page.goto(start_url, wait_until="commit", timeout=60000))
@@ -1603,7 +1868,7 @@ class MasterM3U8Finder:
             # Unified Hunting Loop: Polling, Clicking, and Iframe scanning all at once.
             self._verify_in_progress = False
             
-            for tick in range(600): # Max 60s total hunting
+            for tick in range(200): # Max 20s total hunting
                 check_stop()
                 
                 # 1. Parallel verification of network candidates
@@ -1615,7 +1880,7 @@ class MasterM3U8Finder:
                             # Use a helper task to verify in background
                             async def run_verify():
                                 try:
-                                    res = await self.get_working_url(context)
+                                    res = await self.get_working_url(context, referer=start_url)
                                     if res:
                                         self.master_url = res
                                 finally:
@@ -1628,16 +1893,53 @@ class MasterM3U8Finder:
                     break
 
                 # 2. Proactive "Wake-up" clicks (Every 1s) to trigger JS links
-                if tick > 0 and tick % 10 == 0:
+                #    Use TRUSTED events (page.mouse / locator.click) instead of
+                #    synthetic JS clicks so bot-protection gates (isTrusted check)
+                #    are satisfied.
+                if tick > 0 and tick % 5 == 0:
                     try:
-                        # Click the main body and any found iframes
-                        await page.evaluate("() => document.body.click()")
-                        iframes = page.locator('iframe')
-                        count = await iframes.count()
-                        for i in range(count):
-                            await iframes.nth(i).click(timeout=100)
+                        # Trusted click in the centre of the page
+                        vp = page.viewport_size or {"width": 1280, "height": 720}
+                        await page.mouse.click(vp["width"] // 2, vp["height"] // 2)
                     except:
                         pass
+
+                    # Wait ~2s before first frame-level click so the player iframe
+                    # has time to load its dynamic src and initialise the player.
+                    if tick >= 20:
+                        for frame in page.frames:
+                            try:
+                                if not frame.url or frame.url == 'about:blank':
+                                    continue
+                                # Skip non-video frames early
+                                low_url = frame.url.lower()
+                                if not any(x in low_url for x in ['embed', 'player', 'vidsrc', 'cloudnestra', 'rcp/']):
+                                    if 'about:blank' in low_url or low_url == page.url.lower():
+                                        continue
+                                # Trusted Playwright locator clicks (isTrusted = true)
+                                play_selectors = [
+                                    '.vjs-big-play-button', '.play-button',
+                                    'button[class*="play"]', '[class*="play"][role="button"]',
+                                    'video', '.plyr__control', '.jw-icon-playback',
+                                    '[data-testid="play-button"]', '.fp-play',
+                                    '.mejs-playpause-button', '[aria-label*="Play"]',
+                                    '[title*="Play"]',
+                                ]
+                                for sel in play_selectors:
+                                    try:
+                                        loc = frame.locator(sel).first
+                                        if await loc.is_visible(timeout=300):
+                                            await loc.click(timeout=1000)
+                                            break
+                                    except:
+                                        continue
+                            except:
+                                pass
+                        # Spacebar also triggers play on most players
+                        try:
+                            await page.keyboard.press(' ')
+                        except:
+                            pass
 
                 # 3. Check for late-discovered candidates in HTML
                 if tick % 30 == 0:
@@ -1663,7 +1965,8 @@ class MasterM3U8Finder:
                 await self.save_local_manifest(context, self.master_url)
                 await self.save_cookies(context)
                 await context.close()
-                return self.master_url, self.title, start_url, "success"
+                referer = self.candidate_referers.get(self.master_url, start_url)
+                return self.master_url, self.title, referer, "success"
             
             self.title = await self.extract_title(page)
             title_found = True
@@ -1712,7 +2015,7 @@ class MasterM3U8Finder:
                         if not any(x in low_url for x in video_patterns):
                             continue
 
-                        log(f"   Found iframe: {url[:80]}")
+                        log(f"   Found iframe: {url}")
                         iframe_urls.append(url)
                 except:
                     pass
@@ -1742,7 +2045,7 @@ class MasterM3U8Finder:
                     if self.master_url:
                         break
 
-                    log(f"   Navigating to: {iframe_url[:80]}...")
+                    log(f"   Navigating to: {iframe_url}...")
                     try:
                         await page.set_extra_http_headers({'Referer': start_url})
                         timeout = 10000 if headless else 15000
@@ -1756,53 +2059,54 @@ class MasterM3U8Finder:
                             self.title = iframe_title
                             log(f"   📝 Iframe Title: {self.title}")
 
-                        try:
-                            # More aggressive interaction including multiple clicks and keypress
-                            await page.evaluate("""() => {
-                                const video = document.querySelector('video');
-                                if (video) { video.muted = true; video.play().catch(e => {}); }
-                                const btn = document.querySelector('.vjs-big-play-button, .play-button, [class*="play"], [id*="play"]');
-                                if (btn) { btn.click(); }
-                                document.body.click();
-                            }""")
-                            # Extra fallback for persistent players
-                            await page.mouse.click(640, 360)
-                            await page.keyboard.press(' ') # Trigger play with space
-                        except:
-                            pass
+                        # Give the player a moment to initialize after domcontentloaded
+                        await asyncio.sleep(1)
 
-                        # Also try Playwright native click
-                        play_selectors = [
-                            '.vjs-big-play-button', '.play-button',
-                            'button[class*="play"]', '[class*="play"][role="button"]', 'video',
-                        ]
-                        for sel in play_selectors:
+                        # --- Trusted interaction loop (bot-protection safe) ---
+                        # Retry trusted clicks for up to 8 seconds to cover
+                        # slow player initialisation.
+                        for attempt in range(16):
+                            if self.master_url:
+                                break
+
+                            # 1. Trusted click at page centre (satisfies mousedown gates)
                             try:
-                                if await page.locator(sel).count() > 0:
-                                    await page.locator(sel).first.click(timeout=1000)
-                                    break
+                                vp = page.viewport_size or {"width": 1280, "height": 720}
+                                await page.mouse.click(vp["width"] // 2, vp["height"] // 2)
                             except:
-                                continue
+                                pass
 
-                        if headless:
-                            for tick in range(150):  # Max 15s wait, check every 0.1s
-                                verified = await self.get_working_url(context)
-                                if verified:
-                                    self.master_url = verified
-                                    break
-                                if tick > 0 and tick % 30 == 0:
-                                    try:
-                                        await page.evaluate("""() => {
-                                            const video = document.querySelector('video');
-                                            if (video) { video.muted = true; video.play().catch(()=>{}); }
-                                            const btn = document.querySelector('.vjs-big-play-button, .play-button, [class*="play"]');
-                                            if (btn) btn.click();
-                                        }""")
-                                    except:
-                                        pass
-                                await asyncio.sleep(0.1)
-                        else:
-                            await asyncio.sleep(5)
+                            # 2. Trusted locator clicks on known play-button selectors
+                            play_selectors = [
+                                '.vjs-big-play-button', '.play-button',
+                                'button[class*="play"]', '[class*="play"][role="button"]',
+                                'video', '.plyr__control', '.jw-icon-playback',
+                                '[data-testid="play-button"]', '.fp-play',
+                                '.mejs-playpause-button', '[aria-label*="Play"]',
+                                '[title*="Play"]',
+                            ]
+                            for sel in play_selectors:
+                                try:
+                                    loc = page.locator(sel).first
+                                    if await loc.is_visible(timeout=300):
+                                        await loc.click(timeout=1000)
+                                        break
+                                except:
+                                    continue
+
+                            # 3. Spacebar to trigger play
+                            try:
+                                await page.keyboard.press(' ')
+                            except:
+                                pass
+
+                            # Check if we already captured the m3u8
+                            verified = await self.get_working_url(context, referer=start_url)
+                            if verified:
+                                self.master_url = verified
+                                break
+
+                            await asyncio.sleep(0.5)
 
                     except Exception as e:
                         log(f"      Error: {str(e)[:60]}")
@@ -1810,6 +2114,16 @@ class MasterM3U8Finder:
             
             if not self.master_url:
                 log("Step 4: Checking page source...")
+                # Diagnostic: log what the iframe page actually contains
+                try:
+                    diag_title = await page.title()
+                    diag_content = await page.content()
+                    log(f"   📄 Iframe page title: {diag_title}")
+                    body_snippet = re.sub(r'<[^>]+>', ' ', diag_content)
+                    body_snippet = ' '.join(body_snippet.split())[:1200]
+                    log(f"   📄 Iframe body snippet: {body_snippet}")
+                except Exception as e:
+                    log(f"   ⚠️ Could not read iframe diagnostics: {e}")
                 content = await page.content()
                 matches = re.findall(r'https?://[^\s"\']+master\.m3u8[^\s"\']*', content, re.IGNORECASE)
                 for match in matches:
@@ -1817,7 +2131,7 @@ class MasterM3U8Finder:
                         log(f"   Found in HTML: {match}")
                         self.candidates.append(match)
                 
-                verified = await self.get_working_url(context)
+                verified = await self.get_working_url(context, referer=start_url)
                 if verified:
                     self.master_url = verified
                     await self.save_local_manifest(context, self.master_url)
@@ -2010,7 +2324,7 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
         log("✅ SUCCESS!")
         log("="*70)
         log(f"\n🎬 Title: {title}")
-        log(f"🔗 URL: {master_url[:80]}...")
+        log(f"🔗 URL: {master_url}")
         
         nm3u8_path = find_binary("N_m3u8DL-RE", "nm3u8dl_re_path")
         
@@ -2032,6 +2346,19 @@ async def process_video(url: str, headless: bool = True, auto_mode: bool = True)
                     manifest_text = f_manifest.read()
             except Exception:
                 pass
+
+        # If SeleniumBase UC mode already provided valid cookies (including rcp), keep them.
+        # Otherwise fall back to Zen browser cookies.
+        uc_cookies = getattr(finder, 'cookies_dict', None)
+        if not uc_cookies or 'rcp' not in uc_cookies:
+            fresh_cookies = get_zen_cookies()
+            if fresh_cookies:
+                log(f"   🔑 Fresh Zen cookies loaded ({len(fresh_cookies)} keys)")
+                finder.cookies_dict = fresh_cookies
+            else:
+                log("   ⚠️  No valid cookies found (Zen or UC)")
+        else:
+            log(f"   🔑 Using SeleniumBase UC cookies ({len(uc_cookies)} keys)")
 
         parsed_speed, parsed_variants, _ = parse_master_manifest(master_url, referer, getattr(finder, 'cookies_dict', None), fallback_text=manifest_text)
             
@@ -2278,6 +2605,141 @@ def flush_imdb_cache():
     IMDB_CACHE.clear()
     # log("🧹 IMDB cache flushed.")
 
+def _get_tmdb_id_from_imdb(imdb_id: str):
+    """
+    Resolve a TMDB ID and media type from an IMDb ID using the TMDB find API.
+    Returns (tmdb_id, media_type) or (None, None) on failure/no key.
+    """
+    api_key = CONFIG.get('tmdb_api_key')
+    if not api_key:
+        return None, None
+    url = f"https://api.themoviedb.org/3/find/{imdb_id}"
+    try:
+        resp = requests.get(url, params={
+            'api_key': api_key,
+            'external_source': 'imdb_id'
+        }, headers={"User-Agent": USER_AGENT}, timeout=10).json()
+        if resp.get('movie_results'):
+            return resp['movie_results'][0].get('id'), 'movie'
+        if resp.get('tv_results'):
+            return resp['tv_results'][0].get('id'), 'tv'
+    except Exception as e:
+        log(f"   ⚠️ TMDB find lookup failed for {imdb_id}: {str(e)[:120]}")
+    return None, None
+
+
+def _get_tmdb_season_episodes(tmdb_id: int, season: int) -> int:
+    """
+    Return the episode count for a specific TV season using TMDB.
+    """
+    api_key = CONFIG.get('tmdb_api_key')
+    if not api_key or not tmdb_id:
+        return 0
+    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}"
+    try:
+        resp = requests.get(url, params={'api_key': api_key}, headers={"User-Agent": USER_AGENT}, timeout=10).json()
+        if resp.get('success') is False:
+            return 0
+        episodes = resp.get('episodes', [])
+        return len(episodes)
+    except Exception as e:
+        log(f"   ⚠️ TMDB season lookup failed for S{season}: {str(e)[:120]}")
+    return 0
+
+
+async def get_imdb_info_api(imdb_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fast IMDb title metadata lookup using the IMDb suggestion API and TMDB.
+    Returns the same dict format as get_imdb_info:
+      {'type': 'movie'/'tv', 'title': str, 'seasons': int, 'total_episodes': int}
+    """
+    if not imdb_id or not imdb_id.startswith('tt'):
+        return None
+
+    # 1. Get title/type from the IMDb suggestion API (works with IMDb IDs too)
+    first_char = imdb_id[0].lower()
+    url = f"https://v2.sg.media-imdb.com/suggestion/titles/{first_char}/{imdb_id}.json"
+    log(f"🌐 Looking up IMDb metadata via API: {imdb_id}")
+
+    try:
+        response = requests.get(url, headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.imdb.com/"
+        }, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        log(f"   ⚠️ IMDb suggestion API lookup failed: {str(e)[:120]}")
+        return None
+
+    items = data.get('d', []) if isinstance(data, dict) else []
+    item = next((i for i in items if i.get('id') == imdb_id), None)
+    if not item:
+        log("   ⚠️ IMDb suggestion API did not return matching title.")
+        return None
+
+    title = item.get('l', '').strip()
+    if not title:
+        return None
+
+    q = item.get('q', '')
+    qid = item.get('qid', '')
+    qid_lower = (qid or '').lower()
+    q_lower = (q or '').lower()
+
+    is_tv = False
+    tv_qids = {
+        'tvseries', 'tvminiseries', 'tvepisode', 'tvspecial',
+        'tvmovie', 'tvshort', 'tvpilot', 'podcastseries', 'podcastepisode'
+    }
+    if qid_lower in tv_qids or qid_lower.startswith('tv'):
+        is_tv = True
+    elif any(kw in q_lower for kw in ['series', 'episode', 'mini-series', 'mini series']):
+        is_tv = True
+
+    # Append year/year range to title for display
+    year_val = ""
+    if item.get('yr'):
+        year_val = item['yr']
+    elif item.get('y'):
+        year_val = str(item['y'])
+    if year_val and year_val not in title:
+        title = f"{title} ({year_val})"
+
+    if not is_tv:
+        res = {'type': 'movie', 'title': title}
+        IMDB_CACHE[imdb_id] = res
+        log(f"   ✅ Identified as Movie: {title}")
+        return res
+
+    # 2. For TV, try TMDB for season/episode counts
+    tmdb_id, _ = _get_tmdb_id_from_imdb(imdb_id)
+    seasons = 1
+    total_episodes = 0
+    if tmdb_id:
+        try:
+            api_key = CONFIG.get('tmdb_api_key')
+            show_resp = requests.get(
+                f"https://api.themoviedb.org/3/tv/{tmdb_id}",
+                params={'api_key': api_key},
+                headers={"User-Agent": USER_AGENT},
+                timeout=10
+            ).json()
+            if show_resp.get('success') is not False:
+                seasons = show_resp.get('number_of_seasons', 1) or 1
+                total_episodes = show_resp.get('number_of_episodes', 0) or 0
+                log(f"   ✅ TMDB reports {seasons} season(s), {total_episodes} episode(s)")
+        except Exception as e:
+            log(f"   ⚠️ TMDB show lookup failed: {str(e)[:120]}")
+
+    res = {'type': 'tv', 'title': title, 'seasons': seasons, 'total_episodes': total_episodes}
+    IMDB_CACHE[imdb_id] = res
+    log(f"   ✅ Identified as TV Series: {title}")
+    return res
+
+
 async def get_imdb_info(imdb_id: str, page=None) -> Optional[Dict[str, Any]]:
     if imdb_id in IMDB_CACHE:
         res = IMDB_CACHE[imdb_id]
@@ -2286,9 +2748,17 @@ async def get_imdb_info(imdb_id: str, page=None) -> Optional[Dict[str, Any]]:
         if res.get('type') == 'movie' or (res.get('type') == 'tv' and 'seasons' in res):
             # log(f"🚀 Using cached metadata for: {imdb_id}")
             return res
+    
+    # Try the fast, key-less IMDb suggestion API + TMDB path first
+    try:
+        api_res = await get_imdb_info_api(imdb_id)
+        if api_res:
+            return api_res
+    except Exception as e:
+        log(f"   ⚠️ IMDb API info lookup failed, falling back to browser: {str(e)[:120]}")
         
     url = f"https://www.imdb.com/title/{imdb_id}/"
-    log(f"🕵️  Scanning IMDB: {url}")
+    log(f"🕵️  Scanning IMDB (browser fallback): {url}")
     
     async def _extract(p):
         # Enable resource blocking for this page
@@ -2423,8 +2893,21 @@ async def get_imdb_info(imdb_id: str, page=None) -> Optional[Dict[str, Any]]:
             await browser.close()
             return None
 async def get_season_episodes(imdb_id: str, season: int, page=None) -> int:
-    url = f"https://www.imdb.com/title/{imdb_id}/episodes?season={season}"
     log(f"   📖 Fetching episode count for Season {season}...")
+
+    # Fast TMDB path first (avoids IMDb WAF / page scraping)
+    try:
+        tmdb_id, media_type = _get_tmdb_id_from_imdb(imdb_id)
+        if tmdb_id and media_type == 'tv':
+            count = _get_tmdb_season_episodes(tmdb_id, season)
+            if count > 0:
+                log(f"   ✅ TMDB reports {count} episodes for Season {season}")
+                return count
+    except Exception as e:
+        log(f"   ⚠️ TMDB episode count failed, falling back to browser: {str(e)[:120]}")
+
+    # Legacy browser-based fallback
+    url = f"https://www.imdb.com/title/{imdb_id}/episodes?season={season}"
     
     async def _extract(p):
         await p.route("**/*", block_resources)
@@ -2618,14 +3101,154 @@ def save_config(new_data):
             except: pass
         return False
 
+async def search_imdb_api(query, filter_type='all'):
+    """
+    Searches IMDb using the public suggestion/autocomplete JSON API.
+    This endpoint is lightweight, returns structured JSON, and bypasses
+    the AWS WAF challenge that currently blocks the search HTML page.
+    """
+    if not query or not query.strip():
+        return []
+
+    query_clean = query.strip()
+    first_char = query_clean[0].lower()
+    if not first_char.isalnum():
+        first_char = '_'
+
+    encoded_query = urllib.parse.quote(query_clean)
+    url = f"https://v2.sg.media-imdb.com/suggestion/titles/{first_char}/{encoded_query}.json"
+
+    log(f"🔎 Searching IMDb suggestion API for: {query_clean}")
+    log(f"   🔗 API: {url}")
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://www.imdb.com/"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        log(f"   ⚠️ IMDb suggestion API request failed: {str(e)[:120]}")
+        return []
+
+    results = []
+    if not data or not isinstance(data.get('d'), list):
+        log("   ⚠️ IMDb suggestion API returned empty/invalid data.")
+        return results
+
+    for item in data['d']:
+        try:
+            imdb_id = item.get('id')
+            if not imdb_id or not imdb_id.startswith('tt'):
+                continue
+
+            title = item.get('l', '').strip()
+            if not title:
+                continue
+
+            q = item.get('q', '')
+            qid = item.get('qid', '')
+
+            # Determine media type (mirrors the legacy scraper logic)
+            qid_lower = (qid or '').lower()
+            q_lower = (q or '').lower()
+            is_tv = False
+            tv_qids = {
+                'tvseries', 'tvminiseries', 'tvepisode', 'tvspecial',
+                'tvmovie', 'tvshort', 'tvpilot', 'podcastseries', 'podcastepisode'
+            }
+            if qid_lower in tv_qids or qid_lower.startswith('tv'):
+                is_tv = True
+            elif any(kw in q_lower for kw in ['series', 'episode', 'mini-series', 'mini series']):
+                is_tv = True
+
+            media_type = 'tv' if is_tv else 'movie'
+
+            # Apply caller filter (legacy parameter)
+            if filter_type == 'movie' and media_type != 'movie':
+                continue
+            if filter_type == 'tv' and media_type != 'tv':
+                continue
+
+            # Year / year range for display
+            year_val = ""
+            if item.get('yr'):
+                year_val = item['yr']
+            elif item.get('y'):
+                year_val = str(item['y'])
+
+            # Human-readable type label
+            type_label_map = {
+                'feature': 'Movie',
+                'movie': 'Movie',
+                'video': 'Video',
+                'short': 'Short',
+                'tvseries': 'TV Series',
+                'tvminiseries': 'TV Mini Series',
+                'tvepisode': 'TV Episode',
+                'tvspecial': 'TV Special',
+                'tvmovie': 'TV Movie',
+                'tvshort': 'TV Short',
+                'tvpilot': 'TV Pilot',
+                'podcastseries': 'Podcast Series',
+                'podcastepisode': 'Podcast Episode',
+            }
+            type_label = type_label_map.get(qid_lower) or type_label_map.get(q_lower)
+            if not type_label:
+                type_label = "TV Series" if media_type == 'tv' else "Movie"
+
+            link = f"https://www.imdb.com/title/{imdb_id}/"
+            img_url = item.get('i', {}).get('imageUrl', "No Image")
+
+            display_title = f"{title} ({year_val})" if year_val else title
+            display_meta = type_label
+
+            # Proactively cache type (same as legacy scraper)
+            IMDB_CACHE[imdb_id] = {'type': media_type, 'title': title}
+
+            log(f"{img_url}: {title} - {link}")
+
+            results.append({
+                'title': display_title,
+                'url': link,
+                'img': img_url,
+                'id': imdb_id,
+                'meta': display_meta,
+                'type': media_type
+            })
+        except Exception:
+            continue
+
+    if results:
+        log(f"✅ IMDb suggestion API returned {len(results)} results.")
+    else:
+        log("   ⚠️ IMDb suggestion API returned no usable title results.")
+    return results
+
+
 async def search_imdb(query, filter_type='all', page=None):
     """
-    Searches IMDB for a query and returns a list of candidates using Playwright.
+    Searches IMDb for a query and returns a list of candidates.
+    Uses the lightweight IMDb suggestion API first; falls back to the
+    legacy Playwright page scraper if the API is unavailable.
     """
+    # Try the fast, WAF-resistant suggestion API first
+    try:
+        api_results = await search_imdb_api(query, filter_type)
+        if api_results:
+            return api_results
+    except Exception as e:
+        log(f"   ⚠️ IMDb API search failed, falling back to browser scraper: {str(e)[:120]}")
+
     encoded_query = urllib.parse.quote(query)
     url = f"https://www.imdb.com/find/?q={encoded_query}"
     
-    log(f"🔎 Searching IMDB for: {query} (Encoded: {encoded_query})")
+    log(f"🔎 Searching IMDB (browser fallback) for: {query} (Encoded: {encoded_query})")
     log(f"   🔗 Link: {url}")
 
     async def _extract(p):
@@ -2834,124 +3457,226 @@ def get_title_details(url):
         pass
     return {'year': ''}
 
-async def scrape_imdb_chart(chart_type, limit=250, page=None):
+async def scrape_imdb_chart_api(chart_type, limit=250):
     """
-    Scrapes IMDB Top 250 lists (Movies or TV).
-    - Extracts links.
-    - Saves them to a text file for batch processing.
+    Fallback chart scraper using TMDB's top-rated lists.
+    Returns the same format as scrape_imdb_chart: [{'title': ..., 'url': imdb_url}, ...]
+    This is used when the IMDb chart page is blocked by the AWS WAF challenge.
+    """
+    api_key = CONFIG.get('tmdb_api_key')
+    if not api_key:
+        log("   ⚠️ TMDB API key missing, cannot use chart fallback.")
+        return []
+
+    tmdb_endpoint = "movie/top_rated" if chart_type == 'movie' else "tv/top_rated"
+    media_type = 'movie' if chart_type == 'movie' else 'tv'
+    label = "Top 250 Movies" if chart_type == 'movie' else "Top 250 TV Shows"
+    log(f"🌐 Falling back to TMDB {label} (IMDb chart page blocked)")
+
+    results = []
+    page = 1
+    headers = {"User-Agent": USER_AGENT}
+    max_pages = 15  # Safety cap (15 pages * 20 items = 300 max)
+
+    while len(results) < limit and page <= max_pages:
+        try:
+            resp = requests.get(
+                f"https://api.themoviedb.org/3/{tmdb_endpoint}",
+                params={'api_key': api_key, 'page': page, 'language': 'en-US'},
+                headers=headers,
+                timeout=10
+            ).json()
+            items = resp.get('results', [])
+            if not items:
+                break
+
+            for item in items:
+                if len(results) >= limit:
+                    break
+
+                tmdb_id = item.get('id')
+                if not tmdb_id:
+                    continue
+
+                # Get IMDb ID from TMDB external IDs
+                try:
+                    ext_resp = requests.get(
+                        f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}/external_ids",
+                        params={'api_key': api_key},
+                        headers=headers,
+                        timeout=10
+                    ).json()
+                    imdb_id = ext_resp.get('imdb_id')
+                    if not imdb_id:
+                        continue
+                except Exception as e:
+                    log(f"   ⚠️ TMDB external IDs failed for {tmdb_id}: {str(e)[:100]}")
+                    continue
+
+                # Format title
+                title = item.get('title') or item.get('name', 'Unknown')
+                if chart_type == 'movie':
+                    date = item.get('release_date', '')
+                else:
+                    date = item.get('first_air_date', '')
+                year = date[:4] if date and len(date) >= 4 else ""
+
+                rating = item.get('vote_average', 0)
+                formatted_title = title
+                if year:
+                    formatted_title = f"{formatted_title} ({year})"
+                if rating:
+                    formatted_title = f"{formatted_title} - ★{rating:.1f}"
+
+                results.append({
+                    'title': formatted_title,
+                    'url': f"https://www.imdb.com/title/{imdb_id}/"
+                })
+
+                # Respect TMDB free-tier rate limit (40 requests / 10 sec ≈ 4/sec)
+                await asyncio.sleep(0.25)
+
+            page += 1
+
+        except Exception as e:
+            log(f"   ⚠️ TMDB chart page {page} failed: {str(e)[:120]}")
+            break
+
+    if results:
+        log(f"✅ TMDB chart fallback returned {len(results)} items.")
+    else:
+        log("   ⚠️ TMDB chart fallback returned no results.")
+    return results
+
+
+async def _apply_stealth(page):
+    """
+    Apply playwright-stealth evasions to a Playwright page if available.
+    Returns True if stealth was applied, False otherwise.
+    """
+    try:
+        from playwright_stealth.stealth import Stealth
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
+        return True
+    except Exception as e:
+        log(f"   ⚠️ playwright-stealth not applied: {str(e)[:120]}")
+        return False
+
+
+async def _scrape_imdb_chart_browser(chart_type, limit=250, page=None):
+    """
+    Browser-based IMDb chart scraper with optional playwright-stealth.
+    Returns [] if the page is blocked or no items are found.
     """
     if chart_type == 'movie':
         url = "https://www.imdb.com/chart/top/"
-        output_file = "imdb_top_250_movies.txt"
         label = "Top 250 Movies"
     else:
         url = "https://www.imdb.com/chart/toptv/"
-        output_file = "imdb_top_250_tv.txt"
         label = "Top 250 TV Shows"
-    
-    log(f"🚀 Starting scrape of: {label}")
-    log(f"   URL: {url}")
-    
+
+    log(f"🕵️  Trying IMDb chart scrape with browser: {label}")
+
     async def _extract(p):
         await p.route("**/*", block_resources)
         try:
-            await p.goto(url, timeout=60000)
-            try:
-                await p.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
-            except:
-                pass
-            
-            # Infinite Scroll Support: IMDb loads in batches. Scroll until we see the target count.
-            log("   Scrolling to load full list...")
-            max_scroll_attempts = 15
-            for attempt in range(max_scroll_attempts):
-                # Press End to jump to bottom and trigger load
-                await p.keyboard.press("End")
-                await asyncio.sleep(1.5) # Wait for Batch to load
-                
-                # Check current count
-                current_count = await p.locator('.ipc-metadata-list-summary-item').count()
-                log(f"   🔄 Batch {attempt + 1}: Loaded {current_count} items...")
-                
-                if current_count >= 250:
-                    log(f"   ✅ All {current_count} items loaded.")
-                    break
-
-            # Extract items to get both title and year metadata
-            items = await p.locator('.ipc-metadata-list-summary-item').all()
-            log(f"   Extracting details from {len(items)} items...")
-            
-            results = []
-            if items:
-                if limit and len(items) > limit:
-                    items = items[:limit]
-                
-                for idx, item in enumerate(items):
-                    try:
-                        if (idx + 1) % 50 == 0:
-                            log(f"   ✍️  Processing {idx + 1}/{len(items)}...")
-                        link_el = item.locator('a.ipc-title-link-wrapper')
-                        title = await link_el.inner_text()
-                        href = await link_el.get_attribute('href')
-                        
-                        # Clean title (remove "1. " rank)
-                        title = re.sub(r'^\d+[\.\s]+', '', title).strip()
-                        
-                        # Extract metadata from the metadata items
-                        meta_elements = await item.locator('.cli-title-metadata-item').all()
-                        year = ""
-                        runtime = ""
-                        rating = ""
-                        
-                        for m_el in meta_elements:
-                            text = (await m_el.inner_text()).strip()
-                            if re.search(r'^\d{4}$', text):
-                                year = text
-                            elif 'h' in text or 'm' in text:
-                                runtime = text
-                            else:
-                                rating = text
-                        
-                        # Extract Star Rating
-                        stars = ""
-                        try:
-                            star_el = item.locator('.ipc-rating-star--imdb')
-                            star_text = await star_el.inner_text()
-                            stars_match = re.search(r'(\d+\.\d+)', star_text)
-                            if stars_match:
-                                stars = stars_match.group(1)
-                        except:
-                            pass
-
-                        # Format title: Title (Year) - [Runtime] - [Rating] - ★Stars
-                        formatted_title = title
-                        if year:
-                            formatted_title = f"{formatted_title} ({year})"
-                        if runtime:
-                            formatted_title = f"{formatted_title} - [{runtime}]"
-                        if rating:
-                            formatted_title = f"{formatted_title} - [{rating}]"
-                        if stars:
-                            formatted_title = f"{formatted_title} - ★{stars}"
-                        
-                        if href:
-                            clean_url = "https://www.imdb.com" + href.split('?')[0]
-                            results.append({'title': formatted_title, 'url': clean_url})
-                    except:
-                        continue
-                
-                log(f"✅ Scraped {len(results)} items.")
-                return results
-            else:
-                log("❌ No items found. IMDB layout might have changed.")
-                return []
+            await p.goto(url, wait_until='networkidle', timeout=60000)
         except Exception as e:
-            log(f"❌ Error during scrape: {e}")
+            log(f"   ⚠️ IMDb chart load warning: {str(e)[:100]}")
+
+        title = await p.title()
+        log(f"   Page title: {title}")
+        if 'Human Verification' in title or 'Verification' in title:
+            log("   ⚠️ IMDb served a WAF verification page. Aborting browser scrape.")
             return []
+
+        try:
+            await p.wait_for_selector('.ipc-metadata-list-summary-item', timeout=10000)
+        except:
+            pass
+
+        # Infinite scroll support
+        log("   Scrolling to load full list...")
+        max_scroll_attempts = 15
+        empty_streak = 0
+        for attempt in range(max_scroll_attempts):
+            await p.keyboard.press("End")
+            await asyncio.sleep(1.5)
+            current_count = await p.locator('.ipc-metadata-list-summary-item').count()
+            log(f"   🔄 Batch {attempt + 1}: Loaded {current_count} items...")
+            if current_count == 0:
+                empty_streak += 1
+                if empty_streak >= 3:
+                    log("   ⚠️ No items loaded after 3 scroll attempts. Aborting.")
+                    break
+            else:
+                empty_streak = 0
+            if current_count >= 250:
+                log(f"   ✅ All {current_count} items loaded.")
+                break
+
+        items = await p.locator('.ipc-metadata-list-summary-item').all()
+        log(f"   Extracting details from {len(items)} items...")
+
+        results = []
+        if items:
+            if limit and len(items) > limit:
+                items = items[:limit]
+            for idx, item in enumerate(items):
+                try:
+                    if (idx + 1) % 50 == 0:
+                        log(f"   ✍️  Processing {idx + 1}/{len(items)}...")
+                    link_el = item.locator('a.ipc-title-link-wrapper')
+                    title = await link_el.inner_text()
+                    href = await link_el.get_attribute('href')
+                    title = re.sub(r'^\d+[\.\s]+', '', title).strip()
+
+                    meta_elements = await item.locator('.cli-title-metadata-item').all()
+                    year = ""
+                    runtime = ""
+                    rating = ""
+                    for m_el in meta_elements:
+                        text = (await m_el.inner_text()).strip()
+                        if re.search(r'^\d{4}$', text):
+                            year = text
+                        elif 'h' in text or 'm' in text:
+                            runtime = text
+                        else:
+                            rating = text
+
+                    stars = ""
+                    try:
+                        star_el = item.locator('.ipc-rating-star--imdb')
+                        star_text = await star_el.inner_text()
+                        stars_match = re.search(r'(\d+\.\d+)', star_text)
+                        if stars_match:
+                            stars = stars_match.group(1)
+                    except:
+                        pass
+
+                    formatted_title = title
+                    if year:
+                        formatted_title = f"{formatted_title} ({year})"
+                    if runtime:
+                        formatted_title = f"{formatted_title} - [{runtime}]"
+                    if rating:
+                        formatted_title = f"{formatted_title} - [{rating}]"
+                    if stars:
+                        formatted_title = f"{formatted_title} - ★{stars}"
+
+                    if href:
+                        clean_url = "https://www.imdb.com" + href.split('?')[0]
+                        results.append({'title': formatted_title, 'url': clean_url})
+                except:
+                    continue
+            log(f"✅ IMDb browser scraper returned {len(results)} items.")
+        return results
 
     if page:
         return await _extract(page)
 
+    ensure_playwright_browsers()
     async with async_playwright() as p:
         if sys.platform.startswith('linux'):
             exec_path = get_browser_executable("firefox")
@@ -2961,15 +3686,46 @@ async def scrape_imdb_chart(chart_type, limit=250, page=None):
             exec_path = get_browser_executable("chromium")
             if not exec_path: return []
             browser = await p.chromium.launch(headless=True, executable_path=exec_path)
-        
+
         new_page = await browser.new_page(user_agent=USER_AGENT)
+        await _apply_stealth(new_page)
         try:
             results = await _extract(new_page)
             await browser.close()
             return results
-        except:
+        except Exception as e:
+            log(f"   ⚠️ IMDb browser chart scrape failed: {str(e)[:120]}")
             await browser.close()
             return []
+
+
+async def scrape_imdb_chart(chart_type, limit=250, page=None):
+    """
+    Returns a list of top-rated titles for chart scraping.
+    First tries a browser-based scrape with playwright-stealth. If IMDb still
+    blocks it (WAF/bot verification), falls back to TMDB's top-rated list.
+    """
+    if chart_type == 'movie':
+        url = "https://www.imdb.com/chart/top/"
+        label = "Top 250 Movies"
+    else:
+        url = "https://www.imdb.com/chart/toptv/"
+        label = "Top 250 TV Shows"
+
+    log(f"🚀 Starting scrape of: {label}")
+    log(f"   URL: {url}")
+
+    # Try IMDb with browser + stealth first
+    try:
+        browser_results = await _scrape_imdb_chart_browser(chart_type, limit, page)
+        if browser_results:
+            return browser_results
+    except Exception as e:
+        log(f"   ⚠️ IMDb chart scrape attempt failed: {str(e)[:120]}")
+
+    # Fall back to TMDB top-rated
+    log(f"   ℹ️ IMDb chart page blocked by bot detection; using TMDB top-rated fallback.")
+    return await scrape_imdb_chart_api(chart_type, limit)
             
 async def main():
     """
